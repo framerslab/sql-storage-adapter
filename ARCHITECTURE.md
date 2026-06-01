@@ -680,4 +680,4 @@ src/
 
 ---
 
-For more examples and patterns, see the [GitHub repository](https://github.com/framersai/sql-storage-adapter).
+For more examples and patterns, see the [GitHub repository](https://github.com/framerslab/sql-storage-adapter).

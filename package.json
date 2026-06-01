@@ -86,10 +86,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/framersai/sql-storage-adapter.git"
+    "url": "https://github.com/framerslab/sql-storage-adapter.git"
   },
   "bugs": {
-    "url": "https://github.com/framersai/sql-storage-adapter/issues",
+    "url": "https://github.com/framerslab/sql-storage-adapter/issues",
     "email": "team@frame.dev"
   },
   "homepage": "https://framersai.github.io/sql-storage-adapter/",

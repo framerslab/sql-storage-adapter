@@ -50,7 +50,7 @@ By participating in this project, you agree to abide by our code of conduct: be 
 
 ```bash
 # Clone the repository
-git clone https://github.com/framersai/sql-storage-adapter.git
+git clone https://github.com/framerslab/sql-storage-adapter.git
 cd sql-storage-adapter
 
 # Install dependencies

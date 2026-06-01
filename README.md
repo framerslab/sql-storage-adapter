@@ -10,7 +10,7 @@
 </p>
 
 [![npm version](https://img.shields.io/npm/v/@framers/sql-storage-adapter.svg?logo=npm&label=npm)](https://www.npmjs.com/package/@framers/sql-storage-adapter)
-[![CI](https://github.com/framersai/sql-storage-adapter/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/framersai/sql-storage-adapter/actions/workflows/ci.yml)
+[![CI](https://github.com/framerslab/sql-storage-adapter/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/framerslab/sql-storage-adapter/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/framersai/sql-storage-adapter/branch/master/graph/badge.svg)](https://codecov.io/gh/framersai/sql-storage-adapter)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-blue.svg)](https://www.typescriptlang.org/)
 [![License](https://img.shields.io/npm/l/@framers/sql-storage-adapter.svg)](./LICENSE)
@@ -536,7 +536,7 @@ On Postgres, `features.exporter` requires a Node runtime plus an adapter that wa
 - Website: https://frame.dev
 - AgentOS: https://agentos.sh
 - Marketplace: https://vca.chat
-- GitHub: https://github.com/framersai/sql-storage-adapter
+- GitHub: https://github.com/framerslab/sql-storage-adapter
 - npm: https://www.npmjs.com/package/@framers/sql-storage-adapter
 ## Contributing & Security
 - Contributing: ./\.github/CONTRIBUTING.md

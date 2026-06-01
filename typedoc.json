@@ -11,7 +11,7 @@
   "name": "SQL Storage Adapter",
   "navigationLinks": {
     "Frame.dev": "https://frame.dev",
-    "GitHub": "https://github.com/framersai/sql-storage-adapter",
+    "GitHub": "https://github.com/framerslab/sql-storage-adapter",
     "NPM": "https://www.npmjs.com/package/@framers/sql-storage-adapter"
   },
   "sort": ["source-order", "required-first"],
@@ -33,7 +33,7 @@
     "*"
   ],
   "gitRevision": "master",
-  "sourceLinkTemplate": "https://github.com/framersai/sql-storage-adapter/blob/{gitRevision}/{path}#L{line}",
+  "sourceLinkTemplate": "https://github.com/framerslab/sql-storage-adapter/blob/{gitRevision}/{path}#L{line}",
   "cleanOutputDir": true,
   "hideGenerator": false,
   "searchInComments": true
