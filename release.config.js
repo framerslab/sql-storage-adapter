@@ -1,6 +1,6 @@
 module.exports = {
   branches: ['master'],
-  repositoryUrl: 'https://github.com/framersai/sql-storage-adapter',
+  repositoryUrl: 'https://github.com/framerslab/sql-storage-adapter',
   tagFormat: 'v${version}',
   plugins: [
     ['@semantic-release/commit-analyzer', { preset: 'conventionalcommits' }],
