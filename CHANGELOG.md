@@ -223,4 +223,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-For more information, see the [README](README.md) or visit our [GitHub repository](https://github.com/framersai/sql-storage-adapter).
+For more information, see the [README](README.md) or visit our [GitHub repository](https://github.com/framerslab/sql-storage-adapter).
