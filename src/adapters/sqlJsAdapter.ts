@@ -4,6 +4,10 @@ import fs from 'fs';
 import path from 'path';
 import type { StorageAdapter, StorageCapability, StorageOpenOptions, StorageParameters, StorageRunResult } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
+import {
+  createSerializedTransactionRunner,
+  createSharedConnectionTransactionAdapter,
+} from '../shared/serializedTransaction';
 
 type SqlJsAdapterOptions = SqlJsConfig;
 
@@ -52,6 +56,7 @@ export class SqlJsAdapter implements StorageAdapter {
   private SQL: SqlJsStatic | null = null;
   private db: SqlJsDatabase | null = null;
   private filePath?: string;
+  private readonly runSerializedTransaction = createSerializedTransactionRunner();
   /**
    * Open transaction depth. > 0 means a SQLite-level transaction is in
    * flight on this connection and {@link persistIfNeeded} MUST be
@@ -209,43 +214,45 @@ export class SqlJsAdapter implements StorageAdapter {
 
   public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
     this.ensureOpen();
-    // BEGIN goes through raw sql.js (`this.db!.run`) to avoid the
-    // adapter-level run() pre-bump + persist-skip machinery — we
-    // manage the depth flag explicitly here so the inner fn()'s
-    // adapter.run() calls correctly see depth > 0 and skip persist.
-    this.db!.run('BEGIN TRANSACTION;');
-    this.transactionDepth += 1;
-    let committed = false;
-    try {
-      const result = await fn(this);
-      this.db!.run('COMMIT;');
-      committed = true;
-      return result;
-    } catch (error) {
-      if (!committed) {
-        try {
-          this.db!.run('ROLLBACK;');
-        } catch (rollbackError) {
-          const message =
-            rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
-          // SQL.js may auto-close the transaction during certain DDL
-          // failures. Preserve the original error rather than mask it
-          // with a rollback hiccup.
-          if (!message.includes('no transaction is active')) {
-            throw rollbackError;
+    return this.runSerializedTransaction(async () => {
+      this.ensureOpen();
+      // BEGIN goes through raw sql.js (`this.db!.run`) to avoid the
+      // adapter-level run() pre-bump + persist-skip machinery. The FIFO
+      // runner is required because every callback shares this connection.
+      this.db!.run('BEGIN TRANSACTION;');
+      this.transactionDepth += 1;
+      const transactionAdapter = createSharedConnectionTransactionAdapter(this);
+      let committed = false;
+      try {
+        const result = await fn(transactionAdapter);
+        this.db!.run('COMMIT;');
+        committed = true;
+        return result;
+      } catch (error) {
+        if (!committed) {
+          try {
+            this.db!.run('ROLLBACK;');
+          } catch (rollbackError) {
+            const message =
+              rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+            // SQL.js may auto-close the transaction during certain DDL
+            // failures. Preserve the original error rather than mask it
+            // with a rollback hiccup.
+            if (!message.includes('no transaction is active')) {
+              throw rollbackError;
+            }
           }
         }
+        throw error;
+      } finally {
+        this.transactionDepth = Math.max(0, this.transactionDepth - 1);
+        // Only the outermost transaction triggers a flush to disk. Nested
+        // callbacks reuse the scoped view and do not change this depth.
+        if (this.transactionDepth === 0) {
+          await this.persistIfNeeded();
+        }
       }
-      throw error;
-    } finally {
-      this.transactionDepth = Math.max(0, this.transactionDepth - 1);
-      // Only the outermost transaction triggers a flush to disk —
-      // nested savepoints inside would keep depth > 0 and rely on
-      // the eventual outer COMMIT to land.
-      if (this.transactionDepth === 0) {
-        await this.persistIfNeeded();
-      }
-    }
+    });
   }
 
   public async close(): Promise<void> {

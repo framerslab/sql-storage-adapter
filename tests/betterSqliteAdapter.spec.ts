@@ -95,4 +95,75 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter', () => {
       await adapter.close();
     });
   });
+
+  describe('transaction serialization', () => {
+    it('runs overlapping top-level transaction callbacks in FIFO order', async () => {
+      const { createBetterSqliteAdapter } = await import('../src/index.js');
+      const adapter = createBetterSqliteAdapter(':memory:');
+      await adapter.open();
+      await adapter.exec('CREATE TABLE events (id INTEGER PRIMARY KEY, label TEXT NOT NULL)');
+
+      let signalFirstStarted!: () => void;
+      const firstStarted = new Promise<void>((resolve) => {
+        signalFirstStarted = resolve;
+      });
+      let releaseFirst!: () => void;
+      const firstCanFinish = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const callbackOrder: string[] = [];
+
+      const first = adapter.transaction(async (trx) => {
+        callbackOrder.push('first:start');
+        signalFirstStarted();
+        await trx.run('INSERT INTO events (label) VALUES (?)', ['first']);
+        await firstCanFinish;
+        callbackOrder.push('first:end');
+      });
+
+      await firstStarted;
+      const second = adapter.transaction(async (trx) => {
+        callbackOrder.push('second:start');
+        await trx.run('INSERT INTO events (label) VALUES (?)', ['second']);
+        callbackOrder.push('second:end');
+      });
+
+      await Promise.resolve();
+      expect(callbackOrder).toEqual(['first:start']);
+
+      releaseFirst();
+      await Promise.all([first, second]);
+
+      expect(callbackOrder).toEqual([
+        'first:start',
+        'first:end',
+        'second:start',
+        'second:end',
+      ]);
+      const rows = await adapter.all<{ label: string }>('SELECT label FROM events ORDER BY id');
+      expect(rows.map((row) => row.label)).toEqual(['first', 'second']);
+      await adapter.close();
+    });
+
+    it('reuses the outer transaction for nested transaction callbacks', async () => {
+      const { createBetterSqliteAdapter } = await import('../src/index.js');
+      const adapter = createBetterSqliteAdapter(':memory:');
+      await adapter.open();
+      await adapter.exec('CREATE TABLE events (id INTEGER PRIMARY KEY, label TEXT NOT NULL)');
+
+      await expect(
+        adapter.transaction(async (trx) => {
+          await trx.run('INSERT INTO events (label) VALUES (?)', ['outer']);
+          await trx.transaction(async (nestedTrx) => {
+            await nestedTrx.run('INSERT INTO events (label) VALUES (?)', ['nested']);
+            throw new Error('nested failure');
+          });
+        }),
+      ).rejects.toThrow('nested failure');
+
+      const rows = await adapter.all('SELECT * FROM events');
+      expect(rows).toHaveLength(0);
+      await adapter.close();
+    });
+  });
 });

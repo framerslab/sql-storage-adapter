@@ -177,6 +177,105 @@ describe('SqlJsAdapter', () => {
     expect(rows).toHaveLength(0);
   });
 
+  it('runs overlapping top-level transaction callbacks in FIFO order', async () => {
+    await adapter.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)');
+
+    let signalFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      signalFirstStarted = resolve;
+    });
+    let releaseFirst!: () => void;
+    const firstCanFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const callbackOrder: string[] = [];
+
+    const first = adapter.transaction(async (trx) => {
+      callbackOrder.push('first:start');
+      signalFirstStarted();
+      await trx.run('INSERT INTO t (v) VALUES (?)', ['first']);
+      await firstCanFinish;
+      callbackOrder.push('first:end');
+    });
+
+    await firstStarted;
+    const second = adapter.transaction(async (trx) => {
+      callbackOrder.push('second:start');
+      await trx.run('INSERT INTO t (v) VALUES (?)', ['second']);
+      callbackOrder.push('second:end');
+    });
+
+    await Promise.resolve();
+    expect(callbackOrder).toEqual(['first:start']);
+
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(callbackOrder).toEqual([
+      'first:start',
+      'first:end',
+      'second:start',
+      'second:end',
+    ]);
+    const rows = await adapter.all<{ v: string }>('SELECT v FROM t ORDER BY id');
+    expect(rows.map((row) => row.v)).toEqual(['first', 'second']);
+  });
+
+  it('starts the next queued transaction after an overlapping callback rolls back', async () => {
+    await adapter.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)');
+
+    let signalFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      signalFirstStarted = resolve;
+    });
+    let releaseFirst!: () => void;
+    const firstCanFail = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const firstResult = adapter
+      .transaction(async (trx) => {
+        signalFirstStarted();
+        await trx.run('INSERT INTO t (v) VALUES (?)', ['rolled-back']);
+        await firstCanFail;
+        throw new Error('first transaction failed');
+      })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+    await firstStarted;
+    const second = adapter.transaction(async (trx) => {
+      await trx.run('INSERT INTO t (v) VALUES (?)', ['committed']);
+    });
+
+    releaseFirst();
+    const [firstError] = await Promise.all([firstResult, second]);
+
+    expect(firstError).toBeInstanceOf(Error);
+    expect((firstError as Error).message).toBe('first transaction failed');
+    const rows = await adapter.all<{ v: string }>('SELECT v FROM t ORDER BY id');
+    expect(rows.map((row) => row.v)).toEqual(['committed']);
+  });
+
+  it('reuses the outer transaction for nested transaction callbacks', async () => {
+    await adapter.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)');
+
+    await expect(
+      adapter.transaction(async (trx) => {
+        await trx.run('INSERT INTO t (v) VALUES (?)', ['outer']);
+        await trx.transaction(async (nestedTrx) => {
+          await nestedTrx.run('INSERT INTO t (v) VALUES (?)', ['nested']);
+          throw new Error('nested failure');
+        });
+      }),
+    ).rejects.toThrow('nested failure');
+
+    const rows = await adapter.all('SELECT * FROM t');
+    expect(rows).toHaveLength(0);
+  });
+
   it('close() prevents further operations', async () => {
     await adapter.close();
     await expect(adapter.all('SELECT 1')).rejects.toThrow();

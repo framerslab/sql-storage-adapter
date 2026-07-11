@@ -15,6 +15,10 @@ const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'u
 
 import type { StorageAdapter, StorageOpenOptions, StorageParameters, StorageRunResult, StorageCapability, BatchOperation, BatchResult } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
+import {
+  createSerializedTransactionRunner,
+  createSharedConnectionTransactionAdapter,
+} from '../shared/serializedTransaction';
 
 type BetterSqliteModule = typeof import('better-sqlite3');
 type BetterSqliteDatabase = import('better-sqlite3').Database;
@@ -113,6 +117,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
   private module: BetterSqliteModule | null = null;
   private db: BetterSqliteDatabase | null = null;
   private preparedStatements = new Map<string, BetterSqliteStatement>();
+  private readonly runSerializedTransaction = createSerializedTransactionRunner();
 
   /**
    * Creates a new better-sqlite3 adapter instance.
@@ -187,17 +192,21 @@ export class BetterSqliteAdapter implements StorageAdapter {
 
   public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
     this.ensureOpen();
-    // Manual transactional control to support async callback semantics
-    // without violating better-sqlite3's sync transaction callback contract.
-    this.db!.exec('BEGIN');
-    try {
-      const result = await fn(this);
-      this.db!.exec('COMMIT');
-      return result;
-    } catch (error) {
-      try { this.db!.exec('ROLLBACK'); } catch { /* ignore rollback errors */ }
-      throw error;
-    }
+    return this.runSerializedTransaction(async () => {
+      // The adapter has one physical connection. Queue top-level callbacks so
+      // overlapping callers cannot issue a second BEGIN inside the first tx.
+      this.ensureOpen();
+      this.db!.exec('BEGIN');
+      const transactionAdapter = createSharedConnectionTransactionAdapter(this);
+      try {
+        const result = await fn(transactionAdapter);
+        this.db!.exec('COMMIT');
+        return result;
+      } catch (error) {
+        try { this.db!.exec('ROLLBACK'); } catch { /* ignore rollback errors */ }
+        throw error;
+      }
+    });
   }
 
   public async close(): Promise<void> {
