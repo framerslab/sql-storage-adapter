@@ -3,11 +3,19 @@ import { createPostgresAdapter } from '../src/adapters/postgresAdapter.js';
 import { type StorageAdapter } from '../src/types.js';
 
 vi.mock('pg', () => {
-  const queries: Array<{ source: 'pool' | 'client'; text: string; values?: unknown[] }> = [];
+  const queries: Array<{
+    source: 'pool' | 'client';
+    clientId?: number;
+    text: string;
+    values?: unknown[];
+  }> = [];
+  let nextClientId = 0;
 
   class FakeClient {
+    readonly id = ++nextClientId;
+
     async query(text: string, values?: unknown[]) {
-      queries.push({ source: 'client', text, values });
+      queries.push({ source: 'client', clientId: this.id, text, values });
       if (/SELECT/.test(text)) {
         return { rowCount: 1, rows: [{ id: 321, text, values }] };
       }
@@ -41,7 +49,12 @@ vi.mock('pg', () => {
 
 const getQueries = async () => {
   const mod: any = await import('pg');
-  return mod.__queries as Array<{ source: 'pool' | 'client'; text: string; values?: unknown[] }>;
+  return mod.__queries as Array<{
+    source: 'pool' | 'client';
+    clientId?: number;
+    text: string;
+    values?: unknown[];
+  }>;
 };
 
 describe('PostgresAdapter', () => {
@@ -137,6 +150,41 @@ describe('PostgresAdapter', () => {
       expect(commitIndex).toBeGreaterThan(updateIndex);
       const update = queries[updateIndex];
       expect(update.values).toEqual(['updated', 7]);
+    });
+  });
+
+  it('keeps overlapping transaction callbacks bound to their own clients', async () => {
+    await withAdapter(async (adapter) => {
+      let arrivals = 0;
+      let release: () => void = () => {};
+      const bothReady = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const rendezvous = async () => {
+        arrivals += 1;
+        if (arrivals === 2) release();
+        await bothReady;
+      };
+
+      await Promise.all([
+        adapter.transaction(async (trx) => {
+          await rendezvous();
+          await trx.run('UPDATE example SET foo = ? WHERE id = ?', ['first', 1]);
+        }),
+        adapter.transaction(async (trx) => {
+          await rendezvous();
+          await trx.run('UPDATE example SET foo = ? WHERE id = ?', ['second', 2]);
+        }),
+      ]);
+
+      const queries = await getQueries();
+      const first = queries.find((entry) => entry.values?.[0] === 'first');
+      const second = queries.find((entry) => entry.values?.[0] === 'second');
+      expect(first?.source).toBe('client');
+      expect(second?.source).toBe('client');
+      expect(first?.clientId).toBeDefined();
+      expect(second?.clientId).toBeDefined();
+      expect(first?.clientId).not.toBe(second?.clientId);
     });
   });
 });

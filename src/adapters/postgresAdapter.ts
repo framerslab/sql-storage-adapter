@@ -88,6 +88,99 @@ const prepareStatement = (statement: string, parameters?: StorageParameters): Pr
   return { text: statement, values: [] };
 };
 
+/** Execute a mutation through a specific pool or transaction client. */
+const runWithExecutor = async (
+  executor: Pool | PoolClient,
+  statement: string,
+  parameters?: StorageParameters
+): Promise<StorageRunResult> => {
+  const { text, values } = prepareStatement(statement, parameters);
+  const result = await executor.query(text, values);
+  const firstRow: unknown = result.rows?.[0];
+  const lastInsertRowid =
+    firstRow && typeof firstRow === 'object' && 'id' in (firstRow as Record<string, unknown>)
+      ? ((firstRow as Record<string, unknown>).id as number | string | null)
+      : null;
+  return { changes: result.rowCount ?? 0, lastInsertRowid };
+};
+
+/** Read one row through a specific pool or transaction client. */
+const getWithExecutor = async <T>(
+  executor: Pool | PoolClient,
+  statement: string,
+  parameters?: StorageParameters
+): Promise<T | null> => {
+  const { text, values } = prepareStatement(statement, parameters);
+  const result = await executor.query(text, values);
+  return (result.rows?.[0] as T) ?? null;
+};
+
+/** Read every matching row through a specific pool or transaction client. */
+const allWithExecutor = async <T>(
+  executor: Pool | PoolClient,
+  statement: string,
+  parameters?: StorageParameters
+): Promise<T[]> => {
+  const { text, values } = prepareStatement(statement, parameters);
+  const result = await executor.query(text, values);
+  return (result.rows as T[]) ?? [];
+};
+
+/** Execute a statement script through a specific pool or transaction client. */
+const execWithExecutor = async (executor: Pool | PoolClient, script: string): Promise<void> => {
+  const statements = splitSqlStatements(script);
+  for (const text of statements) {
+    await executor.query(text);
+  }
+};
+
+/**
+ * Adapter view permanently bound to one checked-out transaction client.
+ * Each concurrent transaction receives its own instance, so callback queries
+ * cannot leak onto another callback's client through shared mutable state.
+ */
+class PostgresTransactionAdapter implements StorageAdapter {
+  public readonly kind = 'postgres';
+
+  constructor(
+    private readonly client: PoolClient,
+    public readonly capabilities: ReadonlySet<StorageCapability>
+  ) {}
+
+  public async open(): Promise<void> {
+    // The owning PostgresAdapter opens the pool before creating this view.
+  }
+
+  public async run(
+    statement: string,
+    parameters?: StorageParameters
+  ): Promise<StorageRunResult> {
+    return runWithExecutor(this.client, statement, parameters);
+  }
+
+  public async get<T>(statement: string, parameters?: StorageParameters): Promise<T | null> {
+    return getWithExecutor<T>(this.client, statement, parameters);
+  }
+
+  public async all<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
+    return allWithExecutor<T>(this.client, statement, parameters);
+  }
+
+  public async exec(script: string): Promise<void> {
+    await execWithExecutor(this.client, script);
+  }
+
+  public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
+    // Nested callbacks share the outer transaction. Errors still reach the
+    // owning adapter, which rolls the entire transaction back.
+    return fn(this);
+  }
+
+  public async close(): Promise<void> {
+    // The owning transaction releases the checked-out client after completion.
+  }
+}
+
 /**
  * PostgreSQL adapter for production-grade SQL operations.
  *
@@ -207,7 +300,6 @@ export class PostgresAdapter implements StorageAdapter {
 
   private options: PostgresAdapterOptions;
   private pool: Pool | null = null;
-  private transactionalClient: PoolClient | null = null;
   private pgModule: PgModule | null = null;
 
   constructor(options: PostgresAdapterOptions | string) {
@@ -301,35 +393,22 @@ export class PostgresAdapter implements StorageAdapter {
 
   public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
     const executor = await this.getExecutor();
-    const { text, values } = prepareStatement(statement, parameters);
-    const result = await executor.query(text, values);
-    const firstRow: unknown = result.rows?.[0];
-    const lastInsertRowid = (firstRow && typeof firstRow === 'object' && 'id' in (firstRow as Record<string, unknown>))
-      ? (firstRow as Record<string, unknown>).id as number | string | null
-      : null;
-    return { changes: result.rowCount ?? 0, lastInsertRowid };
+    return runWithExecutor(executor, statement, parameters);
   }
 
   public async get<T>(statement: string, parameters?: StorageParameters): Promise<T | null> {
     const executor = await this.getExecutor();
-    const { text, values } = prepareStatement(statement, parameters);
-    const result = await executor.query(text, values);
-    return (result.rows?.[0] as T) ?? null;
+    return getWithExecutor<T>(executor, statement, parameters);
   }
 
   public async all<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
     const executor = await this.getExecutor();
-    const { text, values } = prepareStatement(statement, parameters);
-    const result = await executor.query(text, values);
-    return (result.rows as T[]) ?? [];
+    return allWithExecutor<T>(executor, statement, parameters);
   }
 
   public async exec(script: string): Promise<void> {
     const executor = await this.getExecutor();
-    const statements = splitSqlStatements(script);
-    for (const text of statements) {
-      await executor.query(text);
-    }
+    await execWithExecutor(executor, script);
   }
 
   public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
@@ -339,15 +418,14 @@ export class PostgresAdapter implements StorageAdapter {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      this.transactionalClient = client;
-      const result = await fn(this);
+      const transactionAdapter = new PostgresTransactionAdapter(client, this.capabilities);
+      const result = await fn(transactionAdapter);
       await client.query('COMMIT');
       return result;
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
     } finally {
-      this.transactionalClient = null;
       client.release();
     }
   }
@@ -360,9 +438,6 @@ export class PostgresAdapter implements StorageAdapter {
   }
 
   private async getExecutor(): Promise<Pool | PoolClient> {
-    if (this.transactionalClient) {
-      return this.transactionalClient;
-    }
     if (!this.pool) {
       throw new Error('Postgres adapter not opened.');
     }
