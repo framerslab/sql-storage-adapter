@@ -1,3 +1,8 @@
+## [0.6.7] - 2026-07-11
+
+### Fixed
+- PostgreSQL transaction callbacks now remain bound to their own checked-out clients during overlapping transactions.
+
 ## [0.6.5] - 2026-05-12
 
 ### Fixed
