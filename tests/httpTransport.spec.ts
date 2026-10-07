@@ -668,14 +668,19 @@ describe('HttpTransport', () => {
       expect(errorListener).toHaveBeenCalled();
     });
 
-    it('should handle missing fetch implementation', () => {
-      transport = new HttpTransport({
-        endpoint: 'https://sync.example.com',
-        fetchImplementation: undefined as unknown as typeof fetch,
-      });
+    it('should handle missing fetch implementation', async () => {
+      // Without a global fetch either, the transport has nothing to call.
+      vi.stubGlobal('fetch', undefined);
+      try {
+        transport = new HttpTransport({
+          endpoint: 'https://sync.example.com',
+          fetchImplementation: undefined as unknown as typeof fetch,
+        });
 
-      // Connect should fail due to missing fetch
-      expect(transport.connect()).rejects.toThrow();
+        await expect(transport.connect()).rejects.toThrow('Fetch not available');
+      } finally {
+        vi.unstubAllGlobals();
+      }
     });
   });
 
