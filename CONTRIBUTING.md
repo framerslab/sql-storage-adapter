@@ -42,7 +42,7 @@ By participating in this project, you agree to abide by our code of conduct: be 
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 22+ (the `better-sqlite3` 13 dev dependency needs it)
 - pnpm 8+
 - Git
 
