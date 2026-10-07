@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 describe('PostgresAdapter - Browser-Friendly', () => {
+  // The adapter decides it is in a browser from window.document alone, so these
+  // specs set or remove window and leave process alone: the Vitest worker reads
+  // the global process itself and dies when a spec deletes it.
   const originalWindow = global.window;
-  const originalProcess = global.process;
 
   beforeEach(() => {
     vi.resetModules();
@@ -10,13 +12,11 @@ describe('PostgresAdapter - Browser-Friendly', () => {
 
   afterEach(() => {
     global.window = originalWindow;
-    global.process = originalProcess;
   });
 
   it('should not import pg at module load time (browser-safe)', async () => {
     // Mock browser environment
     global.window = { document: {} } as any;
-    delete (global as any).process;
 
     // Import should not fail even though pg is not available
     const { PostgresAdapter: Adapter } = await import('../src/adapters/postgresAdapter');
@@ -29,12 +29,7 @@ describe('PostgresAdapter - Browser-Friendly', () => {
   });
 
   it('should use dynamic import for pg module', async () => {
-    // Mock Node.js environment
-    global.process = {
-      versions: { node: '18.0.0' },
-      env: {},
-      cwd: () => '/test'
-    } as any;
+    // Node.js environment: no window
     delete (global as any).window;
 
     const { PostgresAdapter: Adapter } = await import('../src/adapters/postgresAdapter');
@@ -47,6 +42,6 @@ describe('PostgresAdapter - Browser-Friendly', () => {
     // Opening will fail because pg connection fails, but it should fail gracefully
     // (not with a module import error)
     await expect(adapter.open()).rejects.toThrow();
-  }, { timeout: 10000 });
+  }, 10000);
 });
 

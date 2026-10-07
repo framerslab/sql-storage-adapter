@@ -5,11 +5,6 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
-    // The *.browser.spec files delete globalThis.process to imitate a browser.
-    // A forks-pool worker (the default since Vitest 2) talks to the runner
-    // through process.send and dies when process is gone; a thread worker uses
-    // a MessagePort, so these specs run in threads, as they did on Vitest 1.
-    pool: 'threads',
     coverage: {
       enabled: true,
       provider: 'v8',
