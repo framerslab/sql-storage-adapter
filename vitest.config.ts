@@ -31,12 +31,10 @@ export default defineConfig({
     exclude: [
       'node_modules',
       'dist',
-      'coverage',
-      // Tests requiring better-sqlite3 native bindings (skipped in CI)
-      'tests/dataExport.spec.ts',
-      'tests/dataImport.spec.ts',
-      'tests/migration.spec.ts',
-      'tests/betterSqliteAdapter.spec.ts'
+      'coverage'
+      // better-sqlite3 is a dev dependency, so its suites run here. Without the
+      // native module, betterSqliteAdapter.spec skips itself and the dataExport,
+      // dataImport and migration specs fall back to sql.js.
     ]
   },
   resolve: {

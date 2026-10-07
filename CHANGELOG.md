@@ -1,3 +1,9 @@
+## [0.6.9] - 2026-10-07
+
+### Changed
+- `better-sqlite3` 13 is accepted as a peer (`^12.0.0 || ^13.0.0`). Version 13 moved to Node-API and ships its prebuilt binaries inside the package; it needs Node.js 22 or later.
+- CI installs `better-sqlite3` 13 as a dev dependency, so the native adapter suites run instead of skipping, and the workflows run on Node.js 22.
+
 ## [0.6.7] - 2026-07-11
 
 ### Fixed
