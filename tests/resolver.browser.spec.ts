@@ -4,9 +4,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // empty `env` and `versions` (webpack's process/browser, for one). These specs
 // use the shim. Deleting globalThis.process is not an option: the Vitest worker
 // reads the global process itself and dies without it. The shim inherits
-// everything else from the real process so the runner keeps working.
+// everything else from the real process so the runner keeps working; its two
+// own properties are defined, since process.versions is read-only and plain
+// assignment through the prototype chain throws.
 const browserProcess = (): NodeJS.Process =>
-  Object.assign(Object.create(process), { env: {}, versions: {} }) as NodeJS.Process;
+  Object.create(process, {
+    env: { value: {}, enumerable: true },
+    versions: { value: {}, enumerable: true },
+  }) as NodeJS.Process;
 
 describe('Resolver - Browser-Friendly', () => {
   const originalWindow = global.window;
