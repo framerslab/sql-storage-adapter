@@ -189,55 +189,16 @@ docs: update README with Capacitor examples
 
 ## Release Process
 
-Releases are automated through GitHub Actions when a new release is published:
+A release is a version bump merged to `master`. The [release workflow](https://github.com/framerslab/sql-storage-adapter/blob/master/.github/workflows/release.yml) runs on every push to `master` that changes `package.json`, a file under `src/` or the workflow itself. It installs, runs the tests and builds; when `package.json`'s version is not npm's latest, it publishes to npm, then creates the GitHub release `v<version>` with the notes of that version's section in `CHANGELOG.md`. The release creates the tag.
 
-### Manual Release Steps
+1. **Update the version** in `package.json` following [semantic versioning](https://semver.org/):
+   - **MAJOR**: breaking changes (1.0.0 to 2.0.0)
+   - **MINOR**: new features, backward compatible (1.0.0 to 1.1.0)
+   - **PATCH**: bug fixes, backward compatible (1.0.0 to 1.0.1)
+2. **Add a section to `CHANGELOG.md`** headed `## [x.y.z]`, with what was added, changed, deprecated, removed and fixed.
+3. **Open a pull request** with both changes and merge it to `master` when CI is green. The merge publishes the version.
 
-1. **Update version** in package.json following [semantic versioning](https://semver.org/):
-   - **MAJOR**: Breaking changes (e.g., 1.0.0 → 2.0.0)
-   - **MINOR**: New features, backward compatible (e.g., 1.0.0 → 1.1.0)
-   - **PATCH**: Bug fixes, backward compatible (e.g., 1.0.0 → 1.0.1)
-
-2. **Update CHANGELOG.md** with:
-   - Version number and date
-   - Added features
-   - Changed functionality
-   - Deprecated features
-   - Removed features
-   - Fixed bugs
-   - Security updates
-
-3. **Create and merge PR**:
-   ```bash
-   git checkout -b release/v1.2.3
-   # Update version and changelog
-   git commit -m "chore: prepare release v1.2.3"
-   git push origin release/v1.2.3
-   # Create PR and merge to main
-   ```
-
-4. **Tag and publish release**:
-   ```bash
-   git checkout main
-   git pull origin main
-   git tag -a v1.2.3 -m "Release v1.2.3"
-   git push origin v1.2.3
-   ```
-
-5. **Create GitHub Release**:
-   - Go to GitHub Releases
-   - Click "Create a new release"
-   - Select the tag (v1.2.3)
-   - Add release notes from CHANGELOG
-   - Publish release
-
-6. **Automated Publishing**:
-   - GitHub Actions will automatically:
-     - Run tests
-     - Build the package
-     - Publish to NPM
-     - Deploy documentation to GitHub Pages
-     - Create release assets
+Do not push a version tag by hand: the workflow creates it with the GitHub release.
 
 ### Local Testing Before Release
 

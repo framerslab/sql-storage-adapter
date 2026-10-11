@@ -1,47 +1,30 @@
 # Release Process
 
-`@framers/sql-storage-adapter` publishes through [semantic-release](https://semantic-release.gitbook.io) and the workflow at `.github/workflows/release.yml`.
+`@framers/sql-storage-adapter` publishes through the workflow at [`.github/workflows/release.yml`](https://github.com/framerslab/sql-storage-adapter/blob/master/.github/workflows/release.yml).
 
-## Branch strategy
+## What starts a release
 
-- `master` is the only release branch.
-- Each merge to `master` triggers the workflow; semantic-release decides whether a release is required based on commit messages.
-- Commit messages **must** follow the [Conventional Commits](https://www.conventionalcommits.org) specification. Examples:
-  - `fix: correct sqlite fallback logic` → patch release.
-  - `feat: add postgres connection pooling` → minor release.
-  - `feat!: drop deprecated Sync API` or a `BREAKING CHANGE:` footer → major release.
-  - `docs: update README` → no release (unless combined with breaking change).
+A push to `master` that changes `package.json`, a file under `src/` or the workflow. A maintainer can also start the workflow by hand.
 
-## What the pipeline does
+## What the workflow does
 
-1. Installs dependencies (`pnpm install --no-frozen-lockfile`).
-2. Builds the package (`pnpm run build`).
-3. Runs `semantic-release`, which:
-   - Computes the next semantic version.
-   - Updates `CHANGELOG.md` automatically.
-   - Publishes the package to npm.
-   - Tags the commit (`vX.Y.Z`) and creates a GitHub release with generated notes.
-   - Commits `chore(release): X.Y.Z [skip ci]` back to `master` containing the changelog & package.json updates.
+1. Installs the dependencies, runs the tests and builds the package.
+2. Reads the version in `package.json` and compares it with npm's latest version of the package.
+3. When they differ, publishes the package to npm.
+4. Creates the GitHub release `v<version>`, with the notes of that version's `## [<version>]` section in `CHANGELOG.md`, unless a release with that tag exists. The release creates the tag.
 
-If no release-worthy commits are present since the previous tag, semantic-release exits without publishing.
+A push whose version npm already has publishes nothing.
+
+## Releasing a version
+
+1. Raise `version` in `package.json` (semantic versioning: a breaking change raises the major version, a new feature the minor version, a fix the patch version).
+2. Add the version's section to `CHANGELOG.md`, headed `## [x.y.z]`.
+3. Merge both to `master` through a pull request with green CI.
+
+Do not push a version tag by hand.
 
 ## Required secrets
 
-Store the following under **Settings → Secrets and variables → Actions**:
+- `NPM_TOKEN`: an npm token with publish access to `@framers/sql-storage-adapter`.
 
-- `NPM_TOKEN` – npm automation token with `publish` scope for `@framers/sql-storage-adapter`.
-
-`GITHUB_TOKEN` is provided automatically by Actions for tagging and releases.
-
-## Manual retry (rare)
-
-If you must run a release locally:
-
-```bash
-pnpm install
-pnpm run build
-npx semantic-release --dry-run  # inspect
-npx semantic-release            # publish
-```
-
-Run this only from a clean checkout of `master` with the same `NPM_TOKEN` available in the environment. The automated GitHub workflow should be preferred.
+`GITHUB_TOKEN`, which GitHub Actions provides, creates the tag and the release.
