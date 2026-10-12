@@ -1,3 +1,8 @@
+## [0.6.11] - 2026-10-12
+
+### Fixed
+- The Node-API check of 0.6.10 reads the version of the better-sqlite3 the adapter loaded. When the import from the package's own directory failed and the fallback loaded better-sqlite3 from the working directory, the check could read the other install's version, refusing a better-sqlite3 12 that runs or passing a 13 that crashes.
+
 ## [0.6.10] - 2026-10-12
 
 ### Fixed
