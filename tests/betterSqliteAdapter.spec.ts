@@ -254,6 +254,20 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter', () => {
       await adapter.close();
     });
 
+    it("admits the handle's statements whatever async context runs them", async () => {
+      const adapter = await openWithLedger();
+      const { AsyncResource } = await import('async_hooks');
+      // Made before the transaction, so code it runs carries no transaction context.
+      const outsideResource = new AsyncResource('outside-work');
+      await adapter.transaction(async (trx) => {
+        await outsideResource.runInAsyncScope(() =>
+          trx.run('INSERT INTO ledger (label) VALUES (?)', ['through the handle']),
+        );
+      });
+      expect(await labels(adapter)).toEqual(['through the handle']);
+      await adapter.close();
+    });
+
     it('joins the open transaction when the callback calls transaction() on the adapter', async () => {
       const adapter = await openWithLedger();
       await adapter.transaction(async (trx) => {

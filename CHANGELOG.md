@@ -1,7 +1,7 @@
 ## [0.6.12] - 2026-10-12
 
 ### Fixed
-- The better-sqlite3 adapter keeps another caller's statements out of an open transaction. The adapter runs every transaction on its one connection, and a statement issued while a transaction's callback awaited ran at once on that connection, inside the transaction: a write was undone when the transaction rolled back, and a read saw rows the transaction had not committed. Such a statement now waits until the transaction commits or rolls back. The transaction's own statements run in it, through the callback's handle or through the adapter from code the callback runs; the callback's async context (Node's `AsyncLocalStorage`, loaded when the adapter opens) tells the two apart.
+- The better-sqlite3 adapter keeps another caller's statements out of an open transaction. The adapter runs every transaction on its one connection, and a statement issued while a transaction's callback awaited ran at once on that connection, inside the transaction: a write was undone when the transaction rolled back, and a read saw rows the transaction had not committed. Such a statement now waits until the transaction commits or rolls back. The transaction's own statements run in it: those through the callback's handle carry the transaction's token and are admitted whatever async context runs them, and those through the adapter from code the callback runs are told apart by the callback's async context (Node's `AsyncLocalStorage`, loaded when the adapter opens). A handle used after its transaction ended waits like any other caller.
 - A transaction callback that calls `transaction()` on the adapter itself, not on its handle, joins the open transaction instead of queueing behind it and never running.
 
 ### Changed

@@ -244,37 +244,68 @@ export class BetterSqliteAdapter implements StorageAdapter {
   }
 
   public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
-    return whenAdmitted(this.gate, () => {
-      const stmt = this.prepareInternal(statement);
-      const { named, positional } = normaliseParameters(parameters);
-      const result = named ? stmt.run(named) : stmt.run(positional ?? []);
-      return { changes: result.changes, lastInsertRowid: normaliseRowId(result.lastInsertRowid) };
-    });
+    return whenAdmitted(this.gate, () => this.runNow(statement, parameters));
   }
 
   public async get<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T | null> {
-    return whenAdmitted(this.gate, () => {
-      const stmt = this.prepareInternal(statement);
-      const { named, positional } = normaliseParameters(parameters);
-      const row = named ? stmt.get(named) : stmt.get(positional ?? []);
-      return (row as T) ?? null;
-    });
+    return whenAdmitted(this.gate, () => this.getNow<T>(statement, parameters));
   }
 
   public async all<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
-    return whenAdmitted(this.gate, () => {
-      const stmt = this.prepareInternal(statement);
-      const { named, positional } = normaliseParameters(parameters);
-      const rows = named ? stmt.all(named) : stmt.all(positional ?? []);
-      return rows as T[];
-    });
+    return whenAdmitted(this.gate, () => this.allNow<T>(statement, parameters));
   }
 
   public async exec(script: string): Promise<void> {
-    return whenAdmitted(this.gate, () => {
-      this.ensureOpen();
-      this.db!.exec(script);
-    });
+    return whenAdmitted(this.gate, () => this.execNow(script));
+  }
+
+  private runNow(statement: string, parameters?: StorageParameters): StorageRunResult {
+    const stmt = this.prepareInternal(statement);
+    const { named, positional } = normaliseParameters(parameters);
+    const result = named ? stmt.run(named) : stmt.run(positional ?? []);
+    return { changes: result.changes, lastInsertRowid: normaliseRowId(result.lastInsertRowid) };
+  }
+
+  private getNow<T>(statement: string, parameters?: StorageParameters): T | null {
+    const stmt = this.prepareInternal(statement);
+    const { named, positional } = normaliseParameters(parameters);
+    const row = named ? stmt.get(named) : stmt.get(positional ?? []);
+    return (row as T) ?? null;
+  }
+
+  private allNow<T>(statement: string, parameters?: StorageParameters): T[] {
+    const stmt = this.prepareInternal(statement);
+    const { named, positional } = normaliseParameters(parameters);
+    const rows = named ? stmt.all(named) : stmt.all(positional ?? []);
+    return rows as T[];
+  }
+
+  private execNow(script: string): void {
+    this.ensureOpen();
+    this.db!.exec(script);
+  }
+
+  /**
+   * The statements of one transaction's handle: they carry the transaction's
+   * token, so the gate admits them whatever async context runs them (a callback
+   * may reach its handle through an AsyncResource made before the transaction).
+   */
+  private handleStatements(token: symbol): StorageAdapter {
+    return {
+      kind: this.kind,
+      capabilities: this.capabilities,
+      open: async () => {},
+      close: async () => {},
+      run: (statement, parameters) => whenAdmitted(this.gate, () => this.runNow(statement, parameters), token),
+      get: <T>(statement: string, parameters?: StorageParameters) =>
+        whenAdmitted(this.gate, () => this.getNow<T>(statement, parameters), token),
+      all: <T>(statement: string, parameters?: StorageParameters) =>
+        whenAdmitted(this.gate, () => this.allNow<T>(statement, parameters), token),
+      exec: (script) => whenAdmitted(this.gate, () => this.execNow(script), token),
+      batch: (operations) => whenAdmitted(this.gate, () => this.batchNow(operations), token),
+      // The handle answers a nested transaction() itself and never calls this.
+      transaction: (fn) => fn(this),
+    };
   }
 
   public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
@@ -289,10 +320,10 @@ export class BetterSqliteAdapter implements StorageAdapter {
     // overlapping callers cannot issue a second BEGIN inside the first tx, and
     // hold the gate so other callers' statements wait for its end.
     return this.runSerializedTransaction(() =>
-      this.gate.hold(async () => {
+      this.gate.hold(async (token) => {
         this.ensureOpen();
         this.db!.exec('BEGIN');
-        const transactionAdapter = createSharedConnectionTransactionAdapter(this);
+        const transactionAdapter = createSharedConnectionTransactionAdapter(this.handleStatements(token));
         try {
           const result = await fn(transactionAdapter);
           this.db!.exec('COMMIT');

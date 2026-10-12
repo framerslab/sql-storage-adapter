@@ -8,11 +8,13 @@
  * transaction rolled back, and a read would see rows the transaction has not
  * committed. The gate makes such a statement wait until the transaction ends.
  *
- * A statement issued from inside the transaction runs in it, whether it goes
- * through the callback's handle or through the adapter from code the callback
- * runs. The callback's async context tells the two apart, so the gate needs a
- * context store (Node's AsyncLocalStorage). Without one it admits every
- * statement at once, which is how the adapters behaved before the gate.
+ * A statement issued from inside the transaction runs in it. Through the
+ * callback's handle it carries the transaction's token, so it is admitted
+ * whatever async context runs it. Through the adapter itself, from code the
+ * callback runs, the callback's async context tells it apart, so the gate needs
+ * a context store (Node's AsyncLocalStorage); without one it admits every
+ * statement that carries no token at once, which is how the adapters behaved
+ * before the gate.
  *
  * This module imports nothing from Node, so browser bundles can include it;
  * the adapter that runs on Node passes the store in.
@@ -26,18 +28,23 @@ export interface TransactionContextStore {
 
 /** The gate of one shared connection. */
 export interface ConnectionGate {
-  /** True when a transaction is open and the caller is outside it, so a statement must wait. */
-  blocks(): boolean;
+  /**
+   * True when a statement must wait: a transaction is open and the statement
+   * is not its own. A transaction handle passes its token; any other caller is
+   * judged by its async context.
+   */
+  blocks(token?: symbol): boolean;
   /** True when a transaction is open and the caller runs inside it. */
   inside(): boolean;
   /** Settles when the open transaction ends; at once when none is open. */
   ended(): Promise<void>;
   /**
    * Runs one transaction's body with the gate closed to callers outside it.
-   * The body runs in its own context, so its statements are admitted. The
-   * caller runs one body at a time (the adapter's transaction queue).
+   * The body receives the transaction's token for its handle, and runs in its
+   * own async context, so code it runs is admitted too. The caller runs one
+   * body at a time (the adapter's transaction queue).
    */
-  hold<T>(body: () => Promise<T>): Promise<T>;
+  hold<T>(body: (token: symbol) => Promise<T>): Promise<T>;
 }
 
 /**
@@ -50,10 +57,14 @@ export const createConnectionGate = (context: TransactionContextStore | null): C
   let open: { id: symbol; done: Promise<void> } | null = null;
 
   return {
-    blocks: () => open !== null && context !== null && context.getStore() !== open.id,
+    blocks: (token) => {
+      if (open === null) return false;
+      if (token !== undefined) return token !== open.id;
+      return context !== null && context.getStore() !== open.id;
+    },
     inside: () => open !== null && context !== null && context.getStore() === open.id,
     ended: () => open?.done ?? Promise.resolve(),
-    async hold<T>(body: () => Promise<T>): Promise<T> {
+    async hold<T>(body: (token: symbol) => Promise<T>): Promise<T> {
       const id = Symbol('transaction');
       let release!: () => void;
       const done = new Promise<void>((resolve) => {
@@ -61,7 +72,7 @@ export const createConnectionGate = (context: TransactionContextStore | null): C
       });
       open = { id, done };
       try {
-        return await (context ? context.run(id, body) : body());
+        return await (context ? context.run(id, () => body(id)) : body(id));
       } finally {
         open = null;
         release();
@@ -71,13 +82,17 @@ export const createConnectionGate = (context: TransactionContextStore | null): C
 };
 
 /**
- * Runs `work`, a synchronous statement, once the gate admits the caller. The
- * last check and the work happen in the same turn, so no transaction can open
- * between them; a caller woken when a transaction ends checks again, since the
- * next transaction may already be open.
+ * Runs `work`, a synchronous statement, once the gate admits it. The last check
+ * and the work happen in the same turn, so no transaction can open between
+ * them; a caller woken when a transaction ends checks again, since the next
+ * transaction may already be open.
+ *
+ * @param token - The transaction's token when the statement comes through a
+ *   transaction handle; a handle whose transaction has ended waits like any
+ *   outside caller.
  */
-export const whenAdmitted = async <T>(gate: ConnectionGate, work: () => T): Promise<T> => {
-  while (gate.blocks()) {
+export const whenAdmitted = async <T>(gate: ConnectionGate, work: () => T, token?: symbol): Promise<T> => {
+  while (gate.blocks(token)) {
     await gate.ended();
   }
   return work();
