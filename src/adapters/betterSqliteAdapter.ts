@@ -24,6 +24,22 @@ type BetterSqliteModule = typeof import('better-sqlite3');
 type BetterSqliteDatabase = import('better-sqlite3').Database;
 type BetterSqliteStatement = import('better-sqlite3').Statement<unknown[], unknown>;
 
+/** The loaded better-sqlite3, with the version of the package it was loaded from. */
+interface LoadedBetterSqlite {
+  module: BetterSqliteModule;
+  version: string | undefined;
+}
+
+/** The version of the better-sqlite3 that `require` resolves; undefined when it cannot be read. */
+const versionOf = (require: NodeRequire): string | undefined => {
+  try {
+    const pkg = require('better-sqlite3/package.json') as { version?: unknown };
+    return typeof pkg.version === 'string' ? pkg.version : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 /**
  * Lazy loader for better-sqlite3 to keep the dependency optional.
  *
@@ -41,17 +57,20 @@ type BetterSqliteStatement = import('better-sqlite3').Statement<unknown[], unkno
  * 3. On failure, return null so the resolver can gracefully fall back to a
  *    different adapter (e.g., sql.js) instead of crashing.
  */
-const loadBetterSqlite = async (): Promise<BetterSqliteModule | null> => {
+const loadBetterSqlite = async (): Promise<LoadedBetterSqlite | null> => {
+  const { createRequire } = await import('module');
   try {
-    // Attempt ESM import first (pnpm hoists as ESM-compatible).
-    return (await import('better-sqlite3')) as unknown as BetterSqliteModule;
+    // Attempt ESM import first (pnpm hoists as ESM-compatible). Its version is
+    // read from the same place, this module's directory.
+    const imported = (await import('better-sqlite3')) as unknown as BetterSqliteModule;
+    return { module: imported, version: versionOf(createRequire(import.meta.url)) };
   } catch {
     try {
       // Fallback to CJS require. Use createRequire relative to process.cwd()
-      // to avoid depending on url.fileURLToPath in browser bundles.
-      const { createRequire } = await import('module');
+      // to avoid depending on url.fileURLToPath in browser bundles; the
+      // version comes from the package this require loaded.
       const require = createRequire(path.join(process.cwd(), 'noop.js'));
-      return require('better-sqlite3') as unknown as BetterSqliteModule;
+      return { module: require('better-sqlite3') as unknown as BetterSqliteModule, version: versionOf(require) };
     } catch (error) {
       // Intentionally silent — the resolver handles fallback logging.
       return null;
@@ -84,26 +103,6 @@ const betterSqliteRuntimeRefusal = (version: string | undefined, nodeApi: string
     `better-sqlite3 ${version} needs Node-API 10 (Node.js 22.14+ or 23.6+, Electron 35+), and this runtime has ${has}. ` +
     'Install better-sqlite3 12 for this runtime, or choose another adapter.'
   );
-};
-
-/**
- * The installed better-sqlite3's version, resolved from this module as the
- * loader's import resolves it, then from the working directory as its
- * CommonJS fallback does; undefined when neither resolves.
- */
-const installedBetterSqliteVersion = async (): Promise<string | undefined> => {
-  const { createRequire } = await import('module');
-  for (const base of [import.meta.url, path.join(process.cwd(), 'noop.js')]) {
-    try {
-      const pkg = createRequire(base)('better-sqlite3/package.json') as { version?: unknown };
-      if (typeof pkg.version === 'string') {
-        return pkg.version;
-      }
-    } catch {
-      // Not resolvable from this base; try the next.
-    }
-  }
-  return undefined;
 };
 
 const normaliseRowId = (rowId: number | bigint | null | undefined): string | number | null => {
@@ -188,15 +187,15 @@ export class BetterSqliteAdapter implements StorageAdapter {
       throw new Error('[StorageAdapter] better-sqlite3 adapter cannot be opened in a browser environment.');
     }
 
-    this.module = await loadBetterSqlite();
-    if (!this.module) {
+    const loaded = await loadBetterSqlite();
+    if (!loaded) {
       throw new Error('better-sqlite3 module is not available. Install it or choose another adapter.');
     }
-    const refusal = betterSqliteRuntimeRefusal(await installedBetterSqliteVersion(), process.versions?.napi);
+    const refusal = betterSqliteRuntimeRefusal(loaded.version, process.versions?.napi);
     if (refusal) {
-      this.module = null;
       throw new Error(refusal);
     }
+    this.module = loaded.module;
 
     // Handle ESM/CJS interop for better-sqlite3 constructor
     const moduleReference = this.module as BetterSqliteModule & { default?: BetterSqliteModule };
