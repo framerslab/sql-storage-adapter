@@ -59,6 +59,53 @@ const loadBetterSqlite = async (): Promise<BetterSqliteModule | null> => {
   }
 };
 
+/**
+ * Why the installed better-sqlite3 cannot run on this runtime, or null when it
+ * can. better-sqlite3 13 and later are built for Node-API 10, which Node.js
+ * 22.14+ and 23.6+ provide (Electron 35+, whose Node is 22.14). On an older
+ * runtime the binding loads inside `new Database()` and the process crashes
+ * (https://github.com/WiseLibs/better-sqlite3/issues/1514), which no catch can
+ * stop, so the adapter refuses to open instead and the resolver moves on.
+ *
+ * @param version - The installed better-sqlite3 version, when it is known.
+ * @param nodeApi - The runtime's `process.versions.napi`.
+ */
+const betterSqliteRuntimeRefusal = (version: string | undefined, nodeApi: string | undefined): string | null => {
+  const major = Number(version?.split('.')[0]);
+  if (!(major >= 13)) {
+    return null;
+  }
+  const api = Number(nodeApi);
+  if (api >= 10) {
+    return null;
+  }
+  const has = Number.isFinite(api) && api > 0 ? `Node-API ${api}` : 'no Node-API version';
+  return (
+    `better-sqlite3 ${version} needs Node-API 10 (Node.js 22.14+ or 23.6+, Electron 35+), and this runtime has ${has}. ` +
+    'Install better-sqlite3 12 for this runtime, or choose another adapter.'
+  );
+};
+
+/**
+ * The installed better-sqlite3's version, resolved from this module as the
+ * loader's import resolves it, then from the working directory as its
+ * CommonJS fallback does; undefined when neither resolves.
+ */
+const installedBetterSqliteVersion = async (): Promise<string | undefined> => {
+  const { createRequire } = await import('module');
+  for (const base of [import.meta.url, path.join(process.cwd(), 'noop.js')]) {
+    try {
+      const pkg = createRequire(base)('better-sqlite3/package.json') as { version?: unknown };
+      if (typeof pkg.version === 'string') {
+        return pkg.version;
+      }
+    } catch {
+      // Not resolvable from this base; try the next.
+    }
+  }
+  return undefined;
+};
+
 const normaliseRowId = (rowId: number | bigint | null | undefined): string | number | null => {
   if (rowId === null || rowId === undefined) {
     return null;
@@ -144,6 +191,11 @@ export class BetterSqliteAdapter implements StorageAdapter {
     this.module = await loadBetterSqlite();
     if (!this.module) {
       throw new Error('better-sqlite3 module is not available. Install it or choose another adapter.');
+    }
+    const refusal = betterSqliteRuntimeRefusal(await installedBetterSqliteVersion(), process.versions?.napi);
+    if (refusal) {
+      this.module = null;
+      throw new Error(refusal);
     }
 
     // Handle ESM/CJS interop for better-sqlite3 constructor
