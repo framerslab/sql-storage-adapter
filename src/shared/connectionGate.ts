@@ -24,6 +24,8 @@
 export interface TransactionContextStore {
   run<R>(store: symbol, callback: () => R): R;
   getStore(): symbol | undefined;
+  /** Releases the store; Node collects an enabled store only after this. */
+  disable(): void;
 }
 
 /** The gate of one shared connection. */
@@ -36,6 +38,8 @@ export interface ConnectionGate {
   blocks(token?: symbol): boolean;
   /** True when a transaction is open and the caller runs inside it. */
   inside(): boolean;
+  /** The open transaction's token, for a handle made inside it; null when none is open. */
+  openToken(): symbol | null;
   /** Settles when the open transaction ends; at once when none is open. */
   ended(): Promise<void>;
   /**
@@ -45,6 +49,8 @@ export interface ConnectionGate {
    * body at a time (the adapter's transaction queue).
    */
   hold<T>(body: (token: symbol) => Promise<T>): Promise<T>;
+  /** Releases the context store when the connection closes. */
+  dispose(): void;
 }
 
 /**
@@ -63,6 +69,7 @@ export const createConnectionGate = (context: TransactionContextStore | null): C
       return context !== null && context.getStore() !== open.id;
     },
     inside: () => open !== null && context !== null && context.getStore() === open.id,
+    openToken: () => open?.id ?? null,
     ended: () => open?.done ?? Promise.resolve(),
     async hold<T>(body: (token: symbol) => Promise<T>): Promise<T> {
       const id = Symbol('transaction');
@@ -77,6 +84,9 @@ export const createConnectionGate = (context: TransactionContextStore | null): C
         open = null;
         release();
       }
+    },
+    dispose: () => {
+      context?.disable();
     },
   };
 };

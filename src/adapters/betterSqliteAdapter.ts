@@ -310,11 +310,13 @@ export class BetterSqliteAdapter implements StorageAdapter {
 
   public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
     this.ensureOpen();
-    if (this.gate.inside()) {
+    const openToken = this.gate.inside() ? this.gate.openToken() : null;
+    if (openToken) {
       // Code the open transaction runs called the adapter itself: the callback
       // joins the open transaction, as one given to the handle's transaction()
-      // does, instead of queueing behind the transaction it belongs to.
-      return fn(createSharedConnectionTransactionAdapter(this));
+      // does, instead of queueing behind the transaction it belongs to. Its
+      // handle carries the open transaction's token, as the outer one does.
+      return fn(createSharedConnectionTransactionAdapter(this.handleStatements(openToken)));
     }
     // The adapter has one physical connection. Queue top-level callbacks so
     // overlapping callers cannot issue a second BEGIN inside the first tx, and
@@ -337,6 +339,8 @@ export class BetterSqliteAdapter implements StorageAdapter {
   }
 
   public async close(): Promise<void> {
+    this.gate.dispose();
+    this.gate = createConnectionGate(null);
     if (this.db) {
       // Finalize all prepared statements
       this.preparedStatements.clear();

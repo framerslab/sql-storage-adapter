@@ -268,6 +268,21 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter', () => {
       await adapter.close();
     });
 
+    it("admits a nested handle's statements whatever async context runs them", async () => {
+      const adapter = await openWithLedger();
+      const { AsyncResource } = await import('async_hooks');
+      const outsideResource = new AsyncResource('outside-work');
+      await adapter.transaction(async () => {
+        await adapter.transaction(async (inner) => {
+          await outsideResource.runInAsyncScope(() =>
+            inner.run('INSERT INTO ledger (label) VALUES (?)', ['nested, through the handle']),
+          );
+        });
+      });
+      expect(await labels(adapter)).toEqual(['nested, through the handle']);
+      await adapter.close();
+    });
+
     it('joins the open transaction when the callback calls transaction() on the adapter', async () => {
       const adapter = await openWithLedger();
       await adapter.transaction(async (trx) => {
