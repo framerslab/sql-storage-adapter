@@ -1,3 +1,9 @@
+## [0.6.10] - 2026-10-12
+
+### Fixed
+- The better-sqlite3 adapter refuses to open better-sqlite3 13 or later on a runtime without Node-API 10 (Node.js older than 22.14 or 23.6, Electron older than 35), where its binding crashes the process inside `new Database()`, and `resolveStorageAdapter` goes on to the next adapter, sql.js by default. 0.6.9 said that version 13 needs Node.js 22 or later; it needs Node-API 10: Node.js 22.14+ or 23.6+, or Electron 35+.
+- The README says that npm can run `node-gyp rebuild` for better-sqlite3 13 although it ships prebuilt binaries: always when it installs from a lockfile, and on some platforms on a fresh install too.
+
 ## [0.6.9] - 2026-10-07
 
 ### Changed
