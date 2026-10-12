@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import { createRequire } from 'module';
 import * as path from 'path';
 import * as os from 'os';
+import type { StorageAdapter } from '../src/core/contracts';
 
 // Check if better-sqlite3 native bindings are available
 const checkBetterSqliteAvailable = (): boolean => {
@@ -164,6 +165,104 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter', () => {
 
       const rows = await adapter.all('SELECT * FROM events');
       expect(rows).toHaveLength(0);
+      await adapter.close();
+    });
+  });
+
+  // The adapter has one connection, so a statement another caller issues while
+  // a transaction's callback awaits would run inside that transaction.
+  describe('statements from outside an open transaction', () => {
+    const openWithLedger = async (): Promise<StorageAdapter> => {
+      const { createBetterSqliteAdapter } = await import('../src/index.js');
+      const adapter = createBetterSqliteAdapter(':memory:');
+      await adapter.open();
+      await adapter.exec('CREATE TABLE ledger (id INTEGER PRIMARY KEY, label TEXT NOT NULL)');
+      return adapter;
+    };
+
+    /** A promise and the function that settles it. */
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((settle) => {
+        resolve = settle;
+      });
+      return { promise, resolve };
+    };
+
+    const labels = async (adapter: StorageAdapter): Promise<string[]> =>
+      (await adapter.all<{ label: string }>('SELECT label FROM ledger ORDER BY id')).map((row) => row.label);
+
+    it('waits for the transaction to end and survives its rollback', async () => {
+      const adapter = await openWithLedger();
+      const started = deferred();
+      const outsideWork = deferred();
+      const transaction = adapter
+        .transaction(async (trx) => {
+          await trx.run('INSERT INTO ledger (label) VALUES (?)', ['inside']);
+          started.resolve();
+          // The callback waits on work outside the database.
+          await outsideWork.promise;
+          throw new Error('roll back');
+        })
+        .catch((error: Error) => error.message);
+
+      await started.promise;
+      let written = false;
+      const write = adapter.run('INSERT INTO ledger (label) VALUES (?)', ['outside']).then(() => {
+        written = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(written).toBe(false);
+
+      outsideWork.resolve();
+      expect(await transaction).toBe('roll back');
+      await write;
+      expect(await labels(adapter)).toEqual(['outside']);
+      await adapter.close();
+    });
+
+    it('does not read rows the transaction has not committed', async () => {
+      const adapter = await openWithLedger();
+      const started = deferred();
+      const finish = deferred();
+      const transaction = adapter
+        .transaction(async (trx) => {
+          await trx.run('INSERT INTO ledger (label) VALUES (?)', ['uncommitted']);
+          started.resolve();
+          await finish.promise;
+          throw new Error('roll back');
+        })
+        .catch(() => undefined);
+
+      await started.promise;
+      const read = labels(adapter);
+      finish.resolve();
+      await transaction;
+      expect(await read).toEqual([]);
+      await adapter.close();
+    });
+
+    it('runs a statement the callback issues through the adapter inside the transaction', async () => {
+      const adapter = await openWithLedger();
+      await expect(
+        adapter.transaction(async () => {
+          await adapter.run('INSERT INTO ledger (label) VALUES (?)', ['through the adapter']);
+          throw new Error('roll back');
+        }),
+      ).rejects.toThrow('roll back');
+      expect(await labels(adapter)).toEqual([]);
+      await adapter.close();
+    });
+
+    it('joins the open transaction when the callback calls transaction() on the adapter', async () => {
+      const adapter = await openWithLedger();
+      await adapter.transaction(async (trx) => {
+        await trx.run('INSERT INTO ledger (label) VALUES (?)', ['outer']);
+        await adapter.transaction(async (inner) => {
+          await inner.run('INSERT INTO ledger (label) VALUES (?)', ['inner']);
+        });
+      });
+      expect(await labels(adapter)).toEqual(['outer', 'inner']);
       await adapter.close();
     });
   });

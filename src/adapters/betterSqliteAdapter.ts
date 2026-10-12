@@ -19,6 +19,12 @@ import {
   createSerializedTransactionRunner,
   createSharedConnectionTransactionAdapter,
 } from '../shared/serializedTransaction';
+import {
+  createConnectionGate,
+  whenAdmitted,
+  type ConnectionGate,
+  type TransactionContextStore,
+} from '../shared/connectionGate';
 
 type BetterSqliteModule = typeof import('better-sqlite3');
 type BetterSqliteDatabase = import('better-sqlite3').Database;
@@ -105,6 +111,21 @@ const betterSqliteRuntimeRefusal = (version: string | undefined, nodeApi: string
   );
 };
 
+/**
+ * Node's AsyncLocalStorage for the connection gate, or null where it cannot be
+ * loaded (the gate then admits every statement at once). Loaded when the
+ * adapter opens, like the native module, so that browser bundles never import
+ * a Node built-in.
+ */
+const loadTransactionContext = async (): Promise<TransactionContextStore | null> => {
+  try {
+    const { AsyncLocalStorage } = await import('async_hooks');
+    return new AsyncLocalStorage<symbol>();
+  } catch {
+    return null;
+  }
+};
+
 const normaliseRowId = (rowId: number | bigint | null | undefined): string | number | null => {
   if (rowId === null || rowId === undefined) {
     return null;
@@ -164,6 +185,12 @@ export class BetterSqliteAdapter implements StorageAdapter {
   private db: BetterSqliteDatabase | null = null;
   private preparedStatements = new Map<string, BetterSqliteStatement>();
   private readonly runSerializedTransaction = createSerializedTransactionRunner();
+  /**
+   * Holds statements from outside an open transaction until it ends, so they
+   * neither join it nor read what it has not committed. open() gives it Node's
+   * AsyncLocalStorage, which tells the transaction's own statements apart.
+   */
+  private gate: ConnectionGate = createConnectionGate(null);
 
   /**
    * Creates a new better-sqlite3 adapter instance.
@@ -212,52 +239,70 @@ export class BetterSqliteAdapter implements StorageAdapter {
     }
 
     const databaseOptions = options?.readOnly ? { readonly: true } : undefined;
+    this.gate = createConnectionGate(await loadTransactionContext());
     this.db = new DatabaseCtor(resolvedPath, databaseOptions);
   }
 
   public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
-    const stmt = this.prepareInternal(statement);
-    const { named, positional } = normaliseParameters(parameters);
-    const result = named ? stmt.run(named) : stmt.run(positional ?? []);
-    return { changes: result.changes, lastInsertRowid: normaliseRowId(result.lastInsertRowid) };
+    return whenAdmitted(this.gate, () => {
+      const stmt = this.prepareInternal(statement);
+      const { named, positional } = normaliseParameters(parameters);
+      const result = named ? stmt.run(named) : stmt.run(positional ?? []);
+      return { changes: result.changes, lastInsertRowid: normaliseRowId(result.lastInsertRowid) };
+    });
   }
 
   public async get<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T | null> {
-    const stmt = this.prepareInternal(statement);
-    const { named, positional } = normaliseParameters(parameters);
-    const row = named ? stmt.get(named) : stmt.get(positional ?? []);
-    return (row as T) ?? null;
+    return whenAdmitted(this.gate, () => {
+      const stmt = this.prepareInternal(statement);
+      const { named, positional } = normaliseParameters(parameters);
+      const row = named ? stmt.get(named) : stmt.get(positional ?? []);
+      return (row as T) ?? null;
+    });
   }
 
   public async all<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
-    const stmt = this.prepareInternal(statement);
-    const { named, positional } = normaliseParameters(parameters);
-    const rows = named ? stmt.all(named) : stmt.all(positional ?? []);
-    return rows as T[];
+    return whenAdmitted(this.gate, () => {
+      const stmt = this.prepareInternal(statement);
+      const { named, positional } = normaliseParameters(parameters);
+      const rows = named ? stmt.all(named) : stmt.all(positional ?? []);
+      return rows as T[];
+    });
   }
 
   public async exec(script: string): Promise<void> {
-    this.ensureOpen();
-    this.db!.exec(script);
+    return whenAdmitted(this.gate, () => {
+      this.ensureOpen();
+      this.db!.exec(script);
+    });
   }
 
   public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
     this.ensureOpen();
-    return this.runSerializedTransaction(async () => {
-      // The adapter has one physical connection. Queue top-level callbacks so
-      // overlapping callers cannot issue a second BEGIN inside the first tx.
-      this.ensureOpen();
-      this.db!.exec('BEGIN');
-      const transactionAdapter = createSharedConnectionTransactionAdapter(this);
-      try {
-        const result = await fn(transactionAdapter);
-        this.db!.exec('COMMIT');
-        return result;
-      } catch (error) {
-        try { this.db!.exec('ROLLBACK'); } catch { /* ignore rollback errors */ }
-        throw error;
-      }
-    });
+    if (this.gate.inside()) {
+      // Code the open transaction runs called the adapter itself: the callback
+      // joins the open transaction, as one given to the handle's transaction()
+      // does, instead of queueing behind the transaction it belongs to.
+      return fn(createSharedConnectionTransactionAdapter(this));
+    }
+    // The adapter has one physical connection. Queue top-level callbacks so
+    // overlapping callers cannot issue a second BEGIN inside the first tx, and
+    // hold the gate so other callers' statements wait for its end.
+    return this.runSerializedTransaction(() =>
+      this.gate.hold(async () => {
+        this.ensureOpen();
+        this.db!.exec('BEGIN');
+        const transactionAdapter = createSharedConnectionTransactionAdapter(this);
+        try {
+          const result = await fn(transactionAdapter);
+          this.db!.exec('COMMIT');
+          return result;
+        } catch (error) {
+          try { this.db!.exec('ROLLBACK'); } catch { /* ignore rollback errors */ }
+          throw error;
+        }
+      }),
+    );
   }
 
   public async close(): Promise<void> {
@@ -279,6 +324,10 @@ export class BetterSqliteAdapter implements StorageAdapter {
    * @returns Results of the batch operation
    */
   public async batch(operations: BatchOperation[]): Promise<BatchResult> {
+    return whenAdmitted(this.gate, () => this.batchNow(operations));
+  }
+
+  private batchNow(operations: BatchOperation[]): BatchResult {
     this.ensureOpen();
 
     const results: StorageRunResult[] = [];
