@@ -73,6 +73,8 @@ npm install sql.js                    # WASM SQLite (auto-included for IndexedDB
 
 > Note: If `better-sqlite3` cannot be required, install native build tools before `npm install`, ensure your Node version matches available prebuilt binaries, or fall back to `sql.js` or `indexeddb` by setting `STORAGE_ADAPTER=sqljs` or `STORAGE_ADAPTER=indexeddb`.
 
+> `better-sqlite3` 13 needs Node-API 10: Node.js 22.14+ or 23.6+, or Electron 35+ (whose Node is 22.14). On an older runtime (Node.js 20, Node.js 22.13 and earlier, Electron 34 and earlier) install `better-sqlite3@12`; with 13 installed there, the adapter refuses to open, so the resolver falls back to `sql.js`, rather than letting the native binding crash the process. `better-sqlite3` 13 ships prebuilt binaries, but an install from a lockfile (`npm ci`, or `npm install` with a `package-lock.json`) still runs `node-gyp rebuild` for it, which needs Python and make on the host.
+
 ## Quick Start
 
 ```typescript
@@ -131,7 +133,7 @@ See [Platform Strategy Guide](./PLATFORM_STRATEGY.md) for detailed pros/cons and
 | --- | --- | --- | --- | --- |
 | **🆕 `electron`** | bundled | **Electron desktop apps** | IPC bridge, multi-window, WAL, auto-migrations, crash recovery | Requires Electron runtime |
 | **🆕 `indexeddb`** | bundled (sql.js) | **Browsers, PWAs** | sql.js + IndexedDB persistence wrapper, browser-native storage, 50MB-1GB+ quota, offline-first | IndexedDB quotas vary, WASM overhead (sql.js), not a separate SQL engine |
-| `better-sqlite3` | `better-sqlite3` | Node/Electron, CLI, CI | Native performance, transactional semantics, WAL support | Needs native toolchain; version must match Node ABI |
+| `better-sqlite3` | `better-sqlite3` | Node/Electron, CLI, CI | Native performance, transactional semantics, WAL support | Needs native toolchain; version must match Node ABI; 13.x needs Node-API 10 (Node.js 22.14+, Electron 35+) |
 | `postgres` | `pg` | Hosted or on-prem PostgreSQL | Connection pooling, rich SQL features, cloud friendly | Requires `DATABASE_URL`/credentials |
 | `sqljs` | bundled | Browsers, serverless edge, native fallback | Pure WASM SQLite, no native deps, optional filesystem persistence | Write performance limited vs native, in-memory by default |
 | `capacitor` | `@capacitor-community/sqlite` | Mobile (iOS/Android, Capacitor) | Native SQLite on mobile, encryption | Requires Capacitor runtime |

@@ -1,5 +1,6 @@
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
+import { createRequire } from 'module';
 import * as path from 'path';
 import * as os from 'os';
 
@@ -163,6 +164,56 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter', () => {
 
       const rows = await adapter.all('SELECT * FROM events');
       expect(rows).toHaveLength(0);
+      await adapter.close();
+    });
+  });
+
+  // better-sqlite3 13 is built for Node-API 10. On a runtime without it the binding
+  // loads inside `new Database()` and the process crashes, which no catch can stop,
+  // so the adapter refuses to open and the resolver goes on to the next adapter.
+  describe('on a runtime without Node-API 10', () => {
+    const installedMajor = (() => {
+      try {
+        const pkg = createRequire(import.meta.url)('better-sqlite3/package.json') as { version: string };
+        return Number(pkg.version.split('.')[0]);
+      } catch {
+        return 0;
+      }
+    })();
+    const runtimeWithNodeApi = (napi: string): NodeJS.Process =>
+      Object.create(process, {
+        versions: { value: { ...process.versions, napi }, enumerable: true },
+      }) as NodeJS.Process;
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it.skipIf(installedMajor < 13)('refuses to open better-sqlite3 13, and the resolver falls back to sql.js', async () => {
+      const { createBetterSqliteAdapter, resolveStorageAdapter } = await import('../src/index.js');
+      const tempDir = path.join(os.tmpdir(), `sql-adapter-napi-${Date.now()}`);
+      testDirs.push(tempDir);
+      vi.stubGlobal('process', runtimeWithNodeApi('9'));
+
+      await expect(createBetterSqliteAdapter(':memory:').open()).rejects.toThrow('needs Node-API 10');
+
+      const adapter = await resolveStorageAdapter({
+        priority: ['better-sqlite3', 'sqljs'],
+        filePath: path.join(tempDir, 'app.sqlite3'),
+        quiet: true,
+      });
+      expect(adapter.kind).toBe('sqljs');
+      await adapter.exec('CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      await adapter.close();
+    });
+
+    it.skipIf(!(Number(process.versions.napi) >= 10))('opens better-sqlite3 on a runtime with Node-API 10', async () => {
+      const { createBetterSqliteAdapter } = await import('../src/index.js');
+      vi.stubGlobal('process', runtimeWithNodeApi('10'));
+
+      const adapter = createBetterSqliteAdapter(':memory:');
+      await adapter.open();
+      expect(await adapter.get<{ one: number }>('SELECT 1 AS one')).toEqual({ one: 1 });
       await adapter.close();
     });
   });
