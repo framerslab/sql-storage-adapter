@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'The version to deprecate, such as 0.6.9'
+        description: 'The version to deprecate, such as 0.6.9 or 0.7.0-beta.1'
         required: true
       message:
         description: 'Why, and which version to use instead; empty clears the deprecation'
@@ -36,8 +36,8 @@ jobs:
           VERSION: ${{ inputs.version }}
           MESSAGE: ${{ inputs.message }}
         run: |
-          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::'$VERSION' is not a version such as 0.6.9."
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+            echo "::error::'$VERSION' is not a version such as 0.6.9 or 0.7.0-beta.1."
             exit 1
           fi
           npm view "@framers/sql-storage-adapter@${VERSION}" version >/dev/null
