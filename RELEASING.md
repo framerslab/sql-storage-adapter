@@ -23,6 +23,10 @@ A push whose version npm already has publishes nothing.
 
 Do not push a version tag by hand.
 
+## Deprecating a version
+
+To deprecate a published version, such as one that fails on a runtime it accepts, run the [Deprecate a version](https://github.com/framerslab/sql-storage-adapter/blob/master/.github/workflows/deprecate.yml) workflow by hand with the version and a message that says why and which version to use instead; an empty message clears the mark. A published version is never unpublished, so every lockfile that names it stays installable.
+
 ## Required secrets
 
 - `NPM_TOKEN`: an npm token with publish access to `@framers/sql-storage-adapter`.
