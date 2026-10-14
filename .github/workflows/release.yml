@@ -101,6 +101,8 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           tag: v${{ steps.pkg.outputs.version }}
+          # A new tag names the commit this run published, not master's head when the release is made.
+          commit: ${{ github.sha }}
           name: sql-storage-adapter v${{ steps.pkg.outputs.version }}
           body: ${{ steps.changelog.outputs.notes }}
           allowUpdates: true
