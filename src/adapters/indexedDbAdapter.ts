@@ -188,6 +188,8 @@ export class IndexedDbAdapter implements StorageAdapter {
 
   private SQL: SqlJsStatic | null = null;
   private db: SqlJsDatabase | null = null;
+  /** Whether open() was asked to enforce foreign keys; sql.js forgets the PRAGMA when export() reopens the connection. */
+  private foreignKeys = false;
   private idb: IDBDatabase | null = null;
   private saveTimer: ReturnType<typeof setInterval> | null = null;
   /** Bumped by every statement that can change the database. */
@@ -243,10 +245,11 @@ export class IndexedDbAdapter implements StorageAdapter {
    * multiple adapters (e.g., fabric_codex_db and quarry-codex-local)
    * are initialized simultaneously.
    */
-  public async open(_options?: StorageOpenOptions): Promise<void> {
+  public async open(options?: StorageOpenOptions): Promise<void> {
     if (this.db) {
       return; // Already open
     }
+    this.foreignKeys = options?.foreignKeys === true;
 
     // Initialize sql.js using global singleton (prevents race conditions)
     this.SQL = await getGlobalSQL(this.sqlJsConfig);
@@ -261,6 +264,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     } else {
       this.db = new this.SQL.Database();
     }
+    this.applyConnectionSettings();
 
     // Start auto-save interval
     if (this.autoSave) {
@@ -528,7 +532,17 @@ export class IndexedDbAdapter implements StorageAdapter {
         "IndexedDbAdapter: cannot export the database while a transaction is open; sql.js's export would end it.",
       );
     }
-    return this.db!.export();
+    const image = this.db!.export();
+    // export() closed and reopened the connection, which reset its PRAGMAs.
+    this.applyConnectionSettings();
+    return image;
+  }
+
+  /** Applies the connection settings open() was asked for: sql.js loses them whenever export() reopens the connection. */
+  private applyConnectionSettings(): void {
+    if (this.foreignKeys) {
+      this.db!.run('PRAGMA foreign_keys = ON;');
+    }
   }
 
   /**
@@ -548,6 +562,7 @@ export class IndexedDbAdapter implements StorageAdapter {
         const imported = new this.SQL!.Database(data);
         this.db!.close();
         this.db = imported;
+        this.applyConnectionSettings();
         this.writeGeneration += 1;
         // The save exports in this turn, so no transaction can open between
         // the swap and the export and hold the save back.
@@ -657,6 +672,8 @@ export class IndexedDbAdapter implements StorageAdapter {
 
     const generation = this.writeGeneration;
     const data = this.db.export();
+    // export() closed and reopened the connection, which reset its PRAGMAs.
+    this.applyConnectionSettings();
 
     await this.withTransactionRetry(
       () =>

@@ -86,6 +86,13 @@ export interface StorageOpenOptions {
   readOnly?: boolean;
   /** Arbitrary adapter-specific options bag. */
   adapterOptions?: Record<string, unknown>;
+  /**
+   * SQLite: turn foreign-key enforcement on (`PRAGMA foreign_keys = ON`) when
+   * the adapter opens, and keep it on when sql.js reopens its connection (a
+   * save, an export, an import). SQLite leaves it off by default.
+   * PostgreSQL always enforces foreign keys and ignores this.
+   */
+  foreignKeys?: boolean;
 }
 
 /**

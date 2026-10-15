@@ -57,6 +57,8 @@ export class SqlJsAdapter implements StorageAdapter {
   private SQL: SqlJsStatic | null = null;
   private db: SqlJsDatabase | null = null;
   private filePath?: string;
+  /** Whether open() was asked to enforce foreign keys; sql.js forgets the PRAGMA when export() reopens the connection. */
+  private foreignKeys = false;
   private readonly runSerializedTransaction = createSerializedTransactionRunner();
   /**
    * Open transaction depth. > 0 means a SQLite-level transaction is in
@@ -91,6 +93,7 @@ export class SqlJsAdapter implements StorageAdapter {
 
     this.SQL = await initSqlJs(this.adapterOptions);
     this.filePath = options?.filePath;
+    this.foreignKeys = options?.foreignKeys === true;
 
     if (this.filePath && hasFsAccess() && fs.existsSync(this.filePath)) {
       const buffer = fs.readFileSync(this.filePath);
@@ -98,6 +101,7 @@ export class SqlJsAdapter implements StorageAdapter {
     } else {
       this.db = new this.SQL.Database();
     }
+    this.applyConnectionSettings();
   }
 
   public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
@@ -277,6 +281,13 @@ export class SqlJsAdapter implements StorageAdapter {
     }
   }
 
+  /** Applies the connection settings open() was asked for: sql.js loses them whenever export() reopens the connection. */
+  private applyConnectionSettings(): void {
+    if (this.foreignKeys) {
+      this.db!.run('PRAGMA foreign_keys = ON;');
+    }
+  }
+
   private async persistIfNeeded(): Promise<void> {
     if (!this.filePath || !hasFsAccess()) {
       return;
@@ -286,6 +297,8 @@ export class SqlJsAdapter implements StorageAdapter {
       fs.mkdirSync(dir, { recursive: true });
     }
     const data = this.db!.export();
+    // export() closed and reopened the connection, which reset its PRAGMAs.
+    this.applyConnectionSettings();
     fs.writeFileSync(this.filePath, Buffer.from(data));
   }
 }

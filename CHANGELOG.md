@@ -1,6 +1,7 @@
 ## [Unreleased]
 
 ### Added
+- `foreignKeys: true` on `createDatabase()`, and on `StorageOpenOptions` for the resolver's `openOptions` and `open()`, turns SQLite's foreign-key enforcement on when better-sqlite3, sql.js, IndexedDB or Capacitor opens. sql.js resets PRAGMAs whenever `export()` reopens its connection, on every save to a file or to IndexedDB, on `exportDatabase()` and on `importDatabase()`, so the sql.js and IndexedDB adapters apply it again after each. On Capacitor it runs outside the plugin's transaction, where SQLite ignores it. Enforcement stays off without the option, as in SQLite.
 - `isUniqueViolation(error)` recognises a unique or primary-key violation from any adapter: PostgreSQL's SQLSTATE 23505, better-sqlite3's `SQLITE_CONSTRAINT_UNIQUE` and `SQLITE_CONSTRAINT_PRIMARYKEY`, and the "UNIQUE constraint failed" message from sql.js, IndexedDB and Capacitor. It follows `cause` up to ten levels and does not loop on a cycle, so an error a product wraps still counts.
 - The SQLite adapters (better-sqlite3, sql.js, IndexedDB, Capacitor) take `$1`, `$2`, ... bound from a positional array, as PostgreSQL does, so one statement runs on both. SQLite reads `$1` as a named parameter: better-sqlite3 refused to bind it from an array ("Too many parameter values were provided"), and sql.js bound it in order of first appearance, so `$2, $1` got the values swapped. Each `$n` outside literals and comments becomes `?` with the values in `$n` order, repeats included. A statement that mixes `?` and `$n` is refused with an error.
 
