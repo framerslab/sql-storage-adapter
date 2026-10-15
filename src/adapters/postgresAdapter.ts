@@ -11,6 +11,7 @@ import type { StorageAdapter, StorageCapability, StorageOpenOptions, StoragePara
 import { toPostgresStatement } from '../shared/sqlPlaceholders';
 import { splitSqlStatements } from '../shared/splitSqlStatements';
 import { validateSegment } from '../shared/segment';
+import { getStorageLogger } from '../shared/logger';
 
 /** What the adapter reads from the answer to a query. */
 export interface PostgresQueryResultLike {
@@ -600,8 +601,9 @@ class SegmentStatements {
     if (!place || place.relocatable !== true) return;
     if (place.schema === 'public' || place.schema === this.segment) return;
     this.reported.add(extension);
-    console.warn(
-      `[StorageAdapter] PostgreSQL extension "${extension}" is installed in schema "${String(place.schema)}", which segment ` +
+    getStorageLogger().warn(
+      { adapter: 'postgres', segment: this.segment, extension, schema: String(place.schema) },
+      `PostgreSQL extension "${extension}" is installed in schema "${String(place.schema)}", which segment ` +
         `"${this.segment}" does not reach: its search_path is ${this.segment}, public, so the extension's types and functions ` +
         `do not resolve here. ALTER EXTENSION "${extension}" SET SCHEMA public moves it where every segment finds it.`,
     );
@@ -613,9 +615,10 @@ const hasEnded = (pool: PostgresPoolLike): boolean => pool.ending === true || po
 
 /** The listener the adapter puts on a pool it owns when no `onError` was given. */
 const warnOfIdleError = (error: Error): void => {
-  console.warn(
-    '[StorageAdapter] PostgreSQL: an idle connection of the pool failed; the pool opens another when one is needed.',
-    error instanceof Error ? error.message : error,
+  const message = error instanceof Error ? error.message : String(error);
+  getStorageLogger().warn(
+    { adapter: 'postgres', error: message },
+    `PostgreSQL: an idle connection of the pool failed; the pool opens another when one is needed. ${message}`,
   );
 };
 
@@ -765,8 +768,9 @@ const runTransaction = async <T>(
       const failure = asError(rollbackError);
       onBroken(failure);
       keepRollbackError(error, failure);
-      console.warn(
-        `[StorageAdapter] PostgreSQL ROLLBACK failed after a transaction error, so the connection was closed; the transaction's own error is rethrown. ${failure.message}`
+      getStorageLogger().warn(
+        { adapter: 'postgres', error: failure.message },
+        `PostgreSQL ROLLBACK failed after a transaction error, so the connection was closed; the transaction's own error is rethrown. ${failure.message}`
       );
     }
     throw error;

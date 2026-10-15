@@ -358,6 +358,25 @@ try {
 }
 ```
 
+### Logging
+
+The library writes its log lines to the console unless a host hands it a logger: which adapter it chose, a fallback, a failed ROLLBACK, an adapter's warnings. pino's logger fits as it is, since each line is a fields object and a message.
+
+```typescript
+import pino from 'pino';
+import { createDatabase, setStorageLogger } from '@framers/sql-storage-adapter';
+
+// Every line, from every call
+setStorageLogger(pino({ name: 'storage' }));
+
+// Or one call's resolver lines
+const db = await createDatabase({ url: process.env.DATABASE_URL, strict: true, logger: requestLogger });
+```
+
+`setStorageLogger(null)` writes to the console again, and `quiet: true` silences the resolver's choice and fallback lines whatever the logger.
+
+The logger takes the lines of the resolver, the PostgreSQL adapter and the adapter base class. The IndexedDB, Capacitor, sync and Electron modules write to the console directly.
+
 ### PostgreSQL pool control
 
 `PostgresAdapter` holds a `pg` pool. Narrow an adapter to it with `db instanceof PostgresAdapter` (or `db.kind === 'postgres'`) to reach these:
