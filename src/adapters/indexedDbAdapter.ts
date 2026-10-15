@@ -58,9 +58,78 @@ import {
   createSharedConnectionTransactionAdapter,
 } from '../shared/serializedTransaction';
 import { createConnectionGate, whenAdmitted, type LongWaitWatch } from '../shared/connectionGate';
+import { leadingKeyword } from '../shared/leadingKeyword';
 
 /** How long a statement waits for an open transaction before the adapter warns. */
 const LONG_WAIT_MS = 10_000;
+
+/**
+ * Connection settings that sql.js's export() resets: it closes and reopens the
+ * connection, and a PRAGMA set on the old connection is back at its default on
+ * the new one. The adapter reads these before each export and sets again the
+ * ones the reopened connection lost. Each reads back with `PRAGMA <name>` and
+ * sets with `PRAGMA <name> = <value>`; query_only comes last, so it cannot
+ * stand in the way of the others.
+ */
+const CONNECTION_PRAGMAS = [
+  'foreign_keys',
+  'recursive_triggers',
+  'ignore_check_constraints',
+  'legacy_alter_table',
+  'reverse_unordered_selects',
+  'trusted_schema',
+  'automatic_index',
+  'cell_size_check',
+  'secure_delete',
+  'cache_size',
+  'cache_spill',
+  'temp_store',
+  'synchronous',
+  'journal_mode',
+  'query_only',
+] as const;
+
+/** Connection settings read from a connection, in the order they are set again. */
+type ConnectionSettings = Array<readonly [name: string, value: number | string]>;
+
+/** A PRAGMA's value on a connection, or undefined when this build of SQLite has no such setting. */
+const readPragma = (db: SqlJsDatabase, name: string): number | string | undefined => {
+  try {
+    const value = db.exec(`PRAGMA ${name}`)[0]?.values?.[0]?.[0];
+    if (typeof value === 'number' && Number.isInteger(value)) return value;
+    if (typeof value === 'string' && /^[A-Za-z_]+$/.test(value)) return value;
+  } catch {
+    // This build of SQLite does not know the pragma.
+  }
+  return undefined;
+};
+
+const readConnectionSettings = (db: SqlJsDatabase): ConnectionSettings => {
+  const settings: ConnectionSettings = [];
+  for (const name of CONNECTION_PRAGMAS) {
+    const value = readPragma(db, name);
+    if (value !== undefined) settings.push([name, value]);
+  }
+  return settings;
+};
+
+/** Sets on a connection each setting whose value it does not already have. */
+const restoreConnectionSettings = (db: SqlJsDatabase, settings: ConnectionSettings): void => {
+  for (const [name, value] of settings) {
+    if (readPragma(db, name) === value) continue;
+    try {
+      db.exec(`PRAGMA ${name} = ${value}`);
+    } catch (error) {
+      console.warn(`[IndexedDbAdapter] Could not set PRAGMA ${name} = ${value} again on the reopened connection.`, error);
+    }
+  }
+};
+
+/** The 16 bytes a SQLite database file starts with: "SQLite format 3" and a NUL. */
+const SQLITE_HEADER = [0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00];
+
+const hasSqliteHeader = (data: Uint8Array): boolean =>
+  data.length >= SQLITE_HEADER.length && SQLITE_HEADER.every((byte, index) => data[index] === byte);
 
 // ============================================================================
 // GLOBAL SQL.JS SINGLETON
@@ -155,6 +224,19 @@ const DB_VERSION = 1;
  * 1. IndexedDB stores the SQLite database file (binary blob) - this is just storage
  * 2. sql.js (WASM) loads the database into memory and executes SQL - this provides SQL capabilities
  * 3. After writes, the updated database is automatically saved back to IndexedDB
+ *
+ * **What a save keeps:** each save, `exportDatabase()` and `importDatabase()`
+ * goes through sql.js's `export()`, which closes and reopens the connection.
+ * The adapter reads the connection's PRAGMA settings first and sets them again
+ * on the reopened connection (foreign_keys, recursive_triggers,
+ * ignore_check_constraints, legacy_alter_table, reverse_unordered_selects,
+ * trusted_schema, automatic_index, cell_size_check, secure_delete,
+ * cache_size, cache_spill, temp_store, synchronous, journal_mode and
+ * query_only). The rest of the connection's state does not survive a save:
+ * TEMP tables, views and triggers, attached databases, functions registered
+ * on the underlying sql.js database, and `PRAGMA case_sensitive_like`, which
+ * cannot be read back. Keep such state in the main database, or create it again
+ * where it is used.
  * 
  * **Why IndexedDB + sql.js?**
  * - IndexedDB alone: NoSQL key-value store, no SQL support
@@ -326,6 +408,13 @@ export class IndexedDbAdapter implements StorageAdapter {
 
   private allNow<T>(statement: string, parameters?: StorageParameters): T[] {
     this.ensureOpen();
+    // all() and get() run writes too (INSERT, UPDATE or DELETE ... RETURNING),
+    // which are saved like a write through run(). SELECT, VALUES and EXPLAIN
+    // only read; WITH leads a read or a write, so SQLite's change count
+    // decides; any other statement counts as a write.
+    const keyword = leadingKeyword(statement);
+    const onlyReads = keyword === 'SELECT' || keyword === 'VALUES' || keyword === 'EXPLAIN';
+    const changesBefore = keyword === 'WITH' ? this.totalChanges() : null;
     const stmt = this.db!.prepare(statement);
     try {
       const { named, positional } = normaliseParameters(parameters);
@@ -351,7 +440,15 @@ export class IndexedDbAdapter implements StorageAdapter {
       return results;
     } finally {
       stmt.free();
+      if (!onlyReads && (changesBefore === null || this.totalChanges() !== changesBefore)) {
+        this.writeGeneration += 1;
+      }
     }
+  }
+
+  /** SQLite's count of the rows changed since the connection opened. */
+  private totalChanges(): number {
+    return Number(this.db!.exec('SELECT total_changes()')[0]?.values?.[0]?.[0] ?? 0);
   }
 
   /**
@@ -515,7 +612,9 @@ export class IndexedDbAdapter implements StorageAdapter {
    * Can be downloaded or stored externally.
    *
    * Throws while a transaction is open: sql.js's export closes and reopens the
-   * connection, which would end the transaction.
+   * connection, which would end the transaction. The connection's PRAGMA
+   * settings are set again after the reopen; see the class notes for what an
+   * export does not keep.
    * @returns SQLite database file as binary
    */
   public exportDatabase(): Uint8Array {
@@ -525,34 +624,96 @@ export class IndexedDbAdapter implements StorageAdapter {
         "IndexedDbAdapter: cannot export the database while a transaction is open; sql.js's export would end it.",
       );
     }
-    return this.db!.export();
+    return this.exportImage();
   }
 
   /**
    * Imports a database from a Uint8Array (SQLite file).
-   * Replaces the current database once any open transaction() has ended, and
-   * saves it to IndexedDB before it resolves.
+   *
+   * The image is checked before anything is replaced: it must start with the
+   * SQLite header (an empty image is an empty database) and pass SQLite's
+   * quick_check. sql.js opens any bytes, since SQLite reads the file only when
+   * a statement needs it, so without the check a file of another kind or a
+   * damaged image would replace the database and be saved over the stored one.
+   * A refused image leaves the adapter on its database, in memory and in
+   * IndexedDB, and the call throws.
+   *
+   * The imported database replaces the current one once any open transaction()
+   * has ended and a save already running has finished, takes the connection's
+   * PRAGMA settings, and is saved to IndexedDB before the call resolves.
    * @param data SQLite database file
    */
   public async importDatabase(data: Uint8Array): Promise<void> {
     this.ensureOpen();
-    await whenAdmitted(
-      this.gate,
-      () => {
-        this.ensureOpen();
-        // Opened before the current database closes: an image sql.js refuses
-        // leaves the adapter on the database it had.
-        const imported = new this.SQL!.Database(data);
-        this.db!.close();
-        this.db = imported;
-        this.writeGeneration += 1;
-        // The save exports in this turn, so no transaction can open between
-        // the swap and the export and hold the save back.
-        return this.startSave();
-      },
-      undefined,
-      this.longWait,
-    );
+    const imported = this.openImage(data);
+    let replaced = false;
+    try {
+      for (;;) {
+        // A save already running stores the image it exported; the import's
+        // save starts after it, so that older image is never the last stored.
+        await this.settleSave();
+        const outcome = await whenAdmitted<'busy' | void>(
+          this.gate,
+          () => {
+            this.ensureOpen();
+            if (this.saving) return 'busy';
+            restoreConnectionSettings(imported, readConnectionSettings(this.db!));
+            this.db!.close();
+            this.db = imported;
+            replaced = true;
+            this.writeGeneration += 1;
+            // The save exports in this turn, so no transaction can open between
+            // the swap and the export and hold the save back.
+            return this.startSave();
+          },
+          undefined,
+          this.longWait,
+        );
+        if (outcome !== 'busy') return;
+      }
+    } finally {
+      if (!replaced) imported.close();
+    }
+  }
+
+  /**
+   * Opens an image for importDatabase() and checks it, before anything is
+   * replaced; throws on an image that is not a sound SQLite database.
+   */
+  private openImage(data: Uint8Array): SqlJsDatabase {
+    if (data.length > 0 && !hasSqliteHeader(data)) {
+      throw new Error(
+        'IndexedDbAdapter: importDatabase() was given bytes that are not a SQLite database: they do not start with the SQLite header.',
+      );
+    }
+    const imported = new this.SQL!.Database(data);
+    let problem: string | null = null;
+    try {
+      const rows = imported.exec('PRAGMA quick_check')[0]?.values ?? [];
+      if (rows.length !== 1 || rows[0][0] !== 'ok') {
+        problem = rows.map((row) => String(row[0])).join('; ') || 'quick_check answered nothing';
+      }
+    } catch (error) {
+      problem = error instanceof Error ? error.message : String(error);
+    }
+    if (problem !== null) {
+      imported.close();
+      throw new Error(`IndexedDbAdapter: importDatabase() was given a damaged SQLite database (${problem}).`);
+    }
+    return imported;
+  }
+
+  /**
+   * The database image, through sql.js's export(). export() closes and reopens
+   * the connection, which sets every PRAGMA back to its default, so the
+   * connection's settings are read first and set again after.
+   */
+  private exportImage(): Uint8Array {
+    const db = this.db!;
+    const settings = readConnectionSettings(db);
+    const image = db.export();
+    restoreConnectionSettings(db, settings);
+    return image;
   }
 
   /**
@@ -653,7 +814,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     if (!this.idb || !this.db) return;
 
     const generation = this.writeGeneration;
-    const data = this.db.export();
+    const data = this.exportImage();
 
     await this.withTransactionRetry(
       () =>

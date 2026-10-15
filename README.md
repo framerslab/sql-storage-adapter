@@ -138,7 +138,7 @@ See [Platform Strategy Guide](./PLATFORM_STRATEGY.md) for detailed pros/cons and
 | `better-sqlite3` | `better-sqlite3` | Node/Electron, CLI, CI | Native performance, transactional semantics, WAL support | Needs native toolchain; version must match Node ABI; 13.x needs Node-API 10 (Node.js 22.14+, Electron 35+) |
 | `postgres` | `pg` | Hosted or on-prem PostgreSQL | Connection pooling, rich SQL features, cloud friendly | Requires `DATABASE_URL`/credentials |
 | `sqljs` | bundled | Browsers, serverless edge, native fallback | Pure WASM SQLite, no native deps, optional filesystem persistence | Write performance limited vs native, in-memory by default |
-| `capacitor` | `@capacitor-community/sqlite` | Mobile (iOS/Android, Capacitor) | Native SQLite on mobile, encryption | Requires Capacitor runtime |
+| `capacitor` | `@capacitor-community/sqlite` | Mobile (iOS/Android, Capacitor) | Native SQLite on mobile, WAL | Requires Capacitor runtime; the adapter opens databases unencrypted. See [Capacitor Notes](#capacitor-notes) |
 | `memory` | bundled (sql.js) | Unit tests, storybooks, constrained sandboxes | Zero dependencies, instant startup | The resolver builds the sql.js adapter for it, as for `sqljs`: in memory in a browser, persisted to the resolver's file path on Node |
 
 ### Platform Priorities
@@ -246,7 +246,9 @@ await sync.connect();
   - runtime hints (Capacitor detection, browser globals, IndexedDB availability).
 - Adapters are attempted in priority order until one opens successfully; a `StorageResolutionError` includes the full failure chain.
 - The resolver builds `postgres`, `better-sqlite3`, `capacitor`, `indexeddb` and `sqljs`, and builds sql.js for `memory`. Any other kind (`electron-main`, `electron-renderer`, `supabase`, or an unknown name, from `priority` or `STORAGE_ADAPTER`) fails as a candidate with an error that names it, and the next candidate is tried.
-- On Node, `createDatabase({ url })`, `createDatabase({ postgres })` and `connectDatabase()` open PostgreSQL, with every Postgres option (pool size, SSL, timeouts, application name, or host, port, database, user and password without a connection string) passed on, and do not fall back to SQLite. In a browser and on Deno, `createDatabase()` opens sql.js whatever the options say. `DATABASE_URL` in the environment does not change what `createDatabase()` picks; `resolveStorageAdapter()` without a `priority` tries Postgres first when it is set.
+- On Node, `createDatabase({ url })` and `createDatabase({ postgres })` open PostgreSQL when the options name a server: a `postgres://` or `postgresql://` URL or connection string, or a host, database or user. Every Postgres option (pool size, SSL, timeouts, application name, or host, port, database, user and password without a connection string) is passed on, and there is no fallback to SQLite. A connection string of another scheme names no server (`file:./dev.db`, which `DATABASE_URL` holds in a project that runs SQLite through Prisma, or `sqlite:...`), and neither does an empty or unset one: the local default opens, or, with `strict`, the call fails. For a `socket:` URL or a socket path, pass `type: 'postgres'` or use `connectDatabase()`. In a browser and on Deno, `createDatabase()` opens sql.js whatever the options say. `DATABASE_URL` in the environment does not change what `createDatabase()` picks; `resolveStorageAdapter()` without a `priority` tries Postgres first when it is set.
+- **Behaviour change in 0.6.14, a patch release:** through 0.6.13, `createDatabase({ url })` and `createDatabase({ postgres: { connectionString } })` with no `priority` or `type` opened the SQLite file `db_data/app.sqlite3` under the working directory on Node, whatever the URL said; since 0.6.14 they open PostgreSQL. A caller whose data is in that file passes `priority: ['better-sqlite3', 'sqljs']` or `type: 'sqlite'` to keep opening it.
+- `connectDatabase()` opens PostgreSQL alone, in every runtime, from any connection string pg reads or from options with a host, database or user; a server it cannot reach fails the call. Given no server, as `connectDatabase(process.env.DATABASE_URL)` is with the variable unset, it throws before it opens anything. It does not read `DATABASE_URL` on its own.
 - `strict: true` (on `createDatabase` and `resolveStorageAdapter`) is for servers: only the database the options name opens. A postgres candidate that fails ends resolution with a `StorageResolutionError`, whatever `priority` lists after it; with `DATABASE_URL` or Postgres options that name a server and no `priority`, `['postgres']` is the whole list; an explicit file path (`file`, `filePath`) outranks `DATABASE_URL`; and a `url` or `postgres` option that names no server fails instead of opening the local default, unless a file is given. Without `strict`, `resolveStorageAdapter()` falls back from a failed Postgres to better-sqlite3, IndexedDB and sql.js, and `DATABASE_URL` comes before a `filePath`.
 - Provide `priority: ['indexeddb', 'sqljs']` for browser bundles or tests where native modules shouldn't load.
 - Use `createCloudBackupManager` for S3-compatible backups with gzip compression and retention limits.
@@ -322,7 +324,18 @@ await adapter.open();
 - ✅ Export/import (Uint8Array SQLite file format)
 - ✅ Auto-save with batching (reduce IDB overhead)
 
-**When it saves:** every `saveIntervalMs`, the adapter writes the database image to IndexedDB if anything changed. It skips the tick while a transaction is open, its own or one begun with `BEGIN`, because sql.js's export closes and reopens the connection, which would end the transaction; the next tick saves it once it has committed. A save counts as done when IndexedDB commits it, not when the put request succeeds. A save that fails or aborts is reported once, and the next tick tries again. A write made while a save is in flight is saved by the next one. A transaction's commit marks its writes for saving, including writes made through `all()` or `get()` (`INSERT ... RETURNING`). `close()` rolls back a transaction still open and saves the committed state. `importDatabase()` saves the imported image before it resolves. `exportDatabase()` throws while a transaction is open.
+**When it saves:** every `saveIntervalMs`, the adapter writes the database image to IndexedDB if anything changed. It skips the tick while a transaction is open, its own or one begun with `BEGIN`, because sql.js's export closes and reopens the connection, which would end the transaction; the next tick saves it once it has committed. A save counts as done when IndexedDB commits it, not when the put request succeeds. A save that fails or aborts is reported once, and the next tick tries again. A write made while a save is in flight is saved by the next one. A transaction's commit marks its writes for saving, including writes made through `all()` or `get()` (`INSERT ... RETURNING`). Outside a transaction, a statement through `all()` or `get()` marks the database changed unless it is a `SELECT`, `VALUES` or `EXPLAIN`; a `WITH` statement does when it changed rows. `close()` rolls back a transaction still open and saves the committed state. `exportDatabase()` throws while a transaction is open.
+
+**Importing:** `importDatabase()` checks the image before it replaces anything: it must start with the SQLite header and pass SQLite's `quick_check` (an empty image imports as an empty database). It throws on an image that fails, and the adapter keeps the database it had, in memory and in IndexedDB. The imported database replaces the current one once an open `transaction()` has ended and a save already running has finished, takes the connection's PRAGMA settings, and is saved to IndexedDB before the call resolves.
+
+**What a save keeps:** each save, `exportDatabase()` and `importDatabase()` goes through sql.js's `export()`, which closes and reopens the connection. The adapter reads the connection's PRAGMA settings first and sets them again on the reopened connection: `foreign_keys`, `recursive_triggers`, `ignore_check_constraints`, `legacy_alter_table`, `reverse_unordered_selects`, `trusted_schema`, `automatic_index`, `cell_size_check`, `secure_delete`, `cache_size`, `cache_spill`, `temp_store`, `synchronous`, `journal_mode` and `query_only`. The rest of the connection's state does not survive a save:
+
+- TEMP tables, views and triggers;
+- attached databases;
+- functions registered on the underlying sql.js database;
+- `PRAGMA case_sensitive_like`, which cannot be read back.
+
+Keep such state in the main database, or create it again where it is used.
 
 **Why IndexedDB Adapter vs sql.js Adapter?**
 
@@ -358,6 +371,23 @@ await adapter.open();
 **Bottom line:** IndexedDB adapter is **necessary for production web apps** that need persistence. For prototypes or edge functions, sql.js alone is fine.
 
 **Note:** IndexedDB adapter is a wrapper around sql.js that adds IndexedDB persistence. It's not a separate SQL engine—it uses sql.js for all SQL operations and IndexedDB only for storing the database file. Since sql.js is full SQLite WASM, it supports all SQLite features including JSON functions, BLOBs, and full-text search.
+
+### Capacitor Notes
+
+```typescript
+import { createDatabase } from '@framers/sql-storage-adapter';
+
+const db = await createDatabase({
+  priority: ['capacitor', 'indexeddb'],
+  mobile: { database: 'my-app', enableWal: true },
+});
+```
+
+- The adapter opens its database through the plugin's `SQLiteConnection`, which every Capacitor adapter of the page shares, and `close()` closes the plugin's connection too, so the database opens again. The plugin keeps its connections across a reload of the page; `open()` closes one a reload left behind and makes it again.
+- One adapter at a time holds a database: `open()` fails while another adapter of the page has the same database open.
+- `enableWal` (default true) sends `PRAGMA journal_mode = WAL` through the plugin's `query()` and warns when SQLite answers another mode.
+- The plugin runs `execute()` and `run()` inside a transaction of its own, where SQLite ignores `PRAGMA foreign_keys` and refuses to change the journal mode, and on Android through `execSQL`, which fails on a statement that answers a row. So a `PRAGMA` in `run()`, or at the start or the end of an `exec()` script, goes through `query()` instead, outside that transaction. A script that turns foreign keys off, rebuilds a table and turns them on again runs as SQLite's procedure for changing a table expects. A `PRAGMA` between two other statements of a script stays inside the plugin's transaction.
+- The plugin turns foreign keys on when it opens a database.
 
 ## Platform Strategy
 

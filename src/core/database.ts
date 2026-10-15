@@ -9,7 +9,7 @@
 
 import { StorageResolutionError, type StorageAdapter } from './contracts';
 import { resolveStorageAdapter, type StorageResolutionOptions, type AdapterKind } from './resolver';
-import { namesPostgresServer } from '../shared/postgresTarget';
+import { hasPostgresConnection, namesPostgresServer } from '../shared/postgresTarget';
 import type { PostgresAdapterOptions } from '../adapters/postgresAdapter';
 import type { CapacitorAdapterOptions } from '../adapters/capacitorSqliteAdapter';
 import type { IndexedDbAdapterOptions } from '../adapters/indexedDbAdapter';
@@ -31,8 +31,11 @@ const configuredPostgresOptions = (options: DatabaseOptions): Array<'url' | 'pos
 export interface DatabaseOptions {
   /**
    * Database URL (e.g., postgresql://user:pass@host/db).
-   * If provided, PostgreSQL is used on Node, with no fallback to SQLite,
-   * unless `priority` or `type` says otherwise.
+   * A `postgres://` or `postgresql://` URL makes `createDatabase()` use
+   * PostgreSQL on Node, with no fallback to SQLite, unless `priority` or
+   * `type` says otherwise. A URL of another scheme (`file:./dev.db`,
+   * `sqlite:...`) names no PostgreSQL server: the local default opens, or,
+   * with `strict`, `createDatabase()` fails.
    */
   url?: string;
   
@@ -44,10 +47,14 @@ export interface DatabaseOptions {
   
   /**
    * PostgreSQL-specific configuration, passed on to the Postgres adapter whole.
-   * When it names a server (a connection string, or a host, database or user),
-   * PostgreSQL is used on Node, with no fallback to SQLite, unless `priority`
-   * or `type` says otherwise. `{ connectionString: process.env.DATABASE_URL }`
-   * with DATABASE_URL unset names none, and the local default is used.
+   * When it names a server (a `postgres://` or `postgresql://` connection
+   * string, or a host, database or user), PostgreSQL is used on Node, with no
+   * fallback to SQLite, unless `priority` or `type` says otherwise.
+   * `{ connectionString: process.env.DATABASE_URL }` with DATABASE_URL unset,
+   * or set to a URL of another scheme, names none, and the local default is
+   * used. To open PostgreSQL from another form of connection string (a
+   * `socket:` URL, a socket path), pass `type: 'postgres'` or use
+   * `connectDatabase()`.
    */
   postgres?: PostgresAdapterOptions;
   
@@ -92,9 +99,9 @@ export interface DatabaseOptions {
    * Strict resolution, for servers: no local database stands in for a
    * Postgres the options configure. Default: false.
    *
-   * - A `url` or `postgres` option that names no server (an empty or unset
-   *   connection string and no host, database or user) fails on Node instead
-   *   of opening the local default, unless `file` is given.
+   * - A `url` or `postgres` option that names no server (no `postgres://` or
+   *   `postgresql://` connection string, and no host, database or user) fails
+   *   on Node instead of opening the local default, unless `file` is given.
    * - A postgres candidate that fails ends resolution with an error, whatever
    *   `priority` lists after it.
    *
@@ -146,10 +153,11 @@ export interface DatabaseOptions {
  * 2. Explicit `options.type` is mapped to a single adapter priority.
  * 3. Otherwise we auto-detect environment:
  *    - Browser / Deno: ['sqljs']
- *    - Node.js with a Postgres URL, or Postgres options that name a server:
- *      ['postgres']. There is no fallback to SQLite: data meant for Postgres
- *      would land in a local file. DATABASE_URL in the environment does not
- *      count here.
+ *    - Node.js with a `postgres://` or `postgresql://` URL, or Postgres
+ *      options that name a server: ['postgres']. There is no fallback to
+ *      SQLite: data meant for Postgres would land in a local file. A URL of
+ *      another scheme names no server. DATABASE_URL in the environment does
+ *      not count here.
  *    - Node.js otherwise: ['better-sqlite3', 'sqljs'] (native first, wasm fallback)
  *
  * With `strict` on Node, a `url` or `postgres` option that names no server
@@ -228,7 +236,7 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
       const named = configuredPostgresOptions(options);
       throw new StorageResolutionError(
         `[StorageAdapter] Strict resolution: the ${named.join(' and ')} option${named.length > 1 ? 's name' : ' names'} no server. ` +
-          'Give a connection string, or a host, database or user, or pass file to open a local database.',
+          'Give a postgres:// or postgresql:// connection string, or a host, database or user, or pass file to open a local database.',
       );
     } else if (isNode) {
       resolverOptions.priority = ['better-sqlite3', 'sqljs'];
@@ -244,13 +252,23 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
 }
 
 /**
- * Connect to a remote database.
- * 
+ * Connect to a PostgreSQL server.
+ *
+ * Opens PostgreSQL alone, in every runtime: there is no fallback to a local
+ * database, so a server that cannot be reached fails the call. Any connection
+ * string pg reads is accepted (a `postgres://` or `postgresql://` URL, a
+ * `socket:` URL, a socket path).
+ *
+ * @throws Error when the configuration names no server: an empty or unset
+ *   connection string and no host, database or user, as
+ *   `connectDatabase(process.env.DATABASE_URL)` gives with DATABASE_URL unset.
+ *   Nothing is opened then; the call does not read DATABASE_URL on its own.
+ *
  * @example
  * ```typescript
  * // Simple connection string
  * const db = await connectDatabase('postgresql://user:pass@host/db');
- * 
+ *
  * // With full config
  * const db = await connectDatabase({
  *   host: 'db.example.com',
@@ -264,10 +282,16 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
 export async function connectDatabase(
   config: string | PostgresAdapterOptions
 ): Promise<StorageAdapter> {
-  if (typeof config === 'string') {
-    return createDatabase({ url: config });
+  // A plain JavaScript caller can pass undefined (an unset environment variable) or null.
+  const postgres: PostgresAdapterOptions =
+    typeof config === 'string' ? { connectionString: config } : { ...(config ?? {}) };
+  if (!hasPostgresConnection(postgres)) {
+    throw new Error(
+      'connectDatabase() was given no PostgreSQL server to connect to: pass a connection string, or options with ' +
+        'a connectionString, host, database or user. An unset DATABASE_URL gives an empty connection string.',
+    );
   }
-  return createDatabase({ postgres: config });
+  return createDatabase({ postgres, priority: ['postgres'] });
 }
 
 /**
