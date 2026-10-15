@@ -38,6 +38,12 @@ export interface PostgresPoolLike {
   readonly ending?: boolean;
   /** True once the pool has ended; pg's Pool sets it. */
   readonly ended?: boolean;
+  /** Connections the pool holds, checked out or idle; pg's Pool counts them. */
+  readonly totalCount?: number;
+  /** Connections idle in the pool. */
+  readonly idleCount?: number;
+  /** Callers waiting for a connection. */
+  readonly waitingCount?: number;
 }
 
 /**
@@ -73,6 +79,12 @@ export interface PostgresAdapterOptions {
   statement_timeout?: number;
   /** Query timeout in ms (0 = no timeout) */
   query_timeout?: number;
+  /**
+   * Let Node exit while every connection in the pool is idle (pg's
+   * `allowExitOnIdle`). Default: false, so idle connections keep the process
+   * running until `idleTimeoutMillis` closes them or `close()` ends the pool.
+   */
+  allowExitOnIdle?: boolean;
   /**
    * A schema of its own for the adapter's tables. Every connection of the
    * adapter's pool starts with `search_path` set to the segment, then
@@ -135,7 +147,75 @@ const POOL_SETTINGS = [
   'application_name',
   'statement_timeout',
   'query_timeout',
+  'allowExitOnIdle',
 ] as const;
+
+/** The isolation levels of PostgreSQL's `BEGIN`. */
+export type PostgresIsolationLevel = 'read uncommitted' | 'read committed' | 'repeatable read' | 'serializable';
+
+/** How a PostgreSQL transaction begins. Left out, each mode is the server's default. */
+export interface PostgresTransactionOptions {
+  /** `BEGIN ISOLATION LEVEL ...`. The server's default is `read committed` unless configured otherwise. */
+  isolationLevel?: PostgresIsolationLevel;
+  /** `READ ONLY` when true, `READ WRITE` when false. */
+  readOnly?: boolean;
+  /** `DEFERRABLE` when true, `NOT DEFERRABLE` when false. It changes only serializable read-only transactions. */
+  deferrable?: boolean;
+}
+
+/** The counts of a Postgres adapter's connection pool. */
+export interface PostgresPoolStats {
+  /** Connections the pool holds, checked out or idle. */
+  total: number;
+  /** Connections idle in the pool. */
+  idle: number;
+  /** Callers waiting for a connection. */
+  waiting: number;
+}
+
+/**
+ * One pooled connection, held for a `withConnection()` callback. Its
+ * statements run outside a transaction unless the callback opens one, and
+ * session state (`SET`, session advisory locks, temporary tables) lasts until
+ * the connection closes.
+ */
+export interface PostgresConnection extends StorageAdapter {
+  /** Runs `fn` in a transaction on this connection. One transaction at a time. */
+  transaction<T>(fn: (trx: StorageAdapter) => Promise<T>, options?: PostgresTransactionOptions): Promise<T>;
+}
+
+const ISOLATION_LEVELS = new Map<string, string>([
+  ['read uncommitted', 'READ UNCOMMITTED'],
+  ['read committed', 'READ COMMITTED'],
+  ['repeatable read', 'REPEATABLE READ'],
+  ['serializable', 'SERIALIZABLE'],
+]);
+
+/** The BEGIN statement for `options`. Refuses an isolation level it does not know, before any SQL is sent. */
+const beginStatement = (options?: PostgresTransactionOptions): string => {
+  const modes: string[] = [];
+  if (options?.isolationLevel !== undefined) {
+    const level = ISOLATION_LEVELS.get(options.isolationLevel);
+    if (!level) {
+      throw new Error(
+        `Unknown isolation level "${String(options.isolationLevel)}". Use 'read uncommitted', 'read committed', 'repeatable read' or 'serializable'.`,
+      );
+    }
+    modes.push(`ISOLATION LEVEL ${level}`);
+  }
+  if (options?.readOnly !== undefined) modes.push(options.readOnly ? 'READ ONLY' : 'READ WRITE');
+  if (options?.deferrable !== undefined) modes.push(options.deferrable ? 'DEFERRABLE' : 'NOT DEFERRABLE');
+  return modes.length > 0 ? `BEGIN ${modes.join(', ')}` : 'BEGIN';
+};
+
+/**
+ * A connection's transaction status: 'I' idle, 'T' in a transaction, 'E' in
+ * a failed one. pg reports it from 8.21; null on an older pg.
+ */
+const transactionStatus = (client: PostgresPoolClientLike): string | null => {
+  const read = (client as unknown as { getTransactionStatus?: () => string | null }).getTransactionStatus;
+  return typeof read === 'function' ? read.call(client) : null;
+};
 
 interface PreparedStatement {
   text: string;
@@ -345,6 +425,54 @@ class SegmentStatements {
       return pool.query(text, values);
     }
     const client = await pool.connect();
+    try {
+      return await this.inOwnTransaction(client, text, values, extension);
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Runs `text` on a transaction's client, inside the caller's transaction. */
+  async inTransaction(client: PostgresPoolClientLike, text: string, values: unknown[]): Promise<PostgresQueryResultLike> {
+    const extension = unqualifiedCreateExtension(text);
+    if (extension === null) {
+      return client.query(text, values);
+    }
+    return this.withinTransaction(client, text, values, extension);
+  }
+
+  /**
+   * Runs `text` on the connection a `withConnection()` callback holds: inside
+   * the transaction the callback began, as `inTransaction` does, or outside
+   * one in a transaction of its own, as on the pool. On a pg that does not
+   * report a connection's transaction status (before 8.21), the session's
+   * search_path is set to `public` around the statement and set back after it.
+   */
+  async onConnection(client: PostgresPoolClientLike, text: string, values: unknown[]): Promise<PostgresQueryResultLike> {
+    const extension = unqualifiedCreateExtension(text);
+    if (extension === null) {
+      return client.query(text, values);
+    }
+    switch (transactionStatus(client)) {
+      case 'T':
+        return this.withinTransaction(client, text, values, extension);
+      case 'I':
+        return this.inOwnTransaction(client, text, values, extension);
+      case 'E':
+        // The transaction has failed: the statement fails with its reason.
+        return client.query(text, values);
+      default:
+        return this.aroundSession(client, text, values, extension);
+    }
+  }
+
+  /** In a transaction of its own on `client`, whose COMMIT or ROLLBACK ends the setting. */
+  private async inOwnTransaction(
+    client: PostgresPoolClientLike,
+    text: string,
+    values: unknown[],
+    extension: string,
+  ): Promise<PostgresQueryResultLike> {
     let result: PostgresQueryResultLike;
     try {
       await client.query('BEGIN');
@@ -356,19 +484,18 @@ class SegmentStatements {
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw error;
-    } finally {
-      client.release();
     }
-    await this.checkReach((t, v) => pool.query(t, v), extension);
+    await this.checkReach((t, v) => client.query(t, v), extension);
     return result;
   }
 
-  /** Runs `text` on a transaction's client, inside the caller's transaction. */
-  async inTransaction(client: PostgresPoolClientLike, text: string, values: unknown[]): Promise<PostgresQueryResultLike> {
-    const extension = unqualifiedCreateExtension(text);
-    if (extension === null) {
-      return client.query(text, values);
-    }
+  /** Inside the transaction open on `client`, setting the search_path for the statement and back. */
+  private async withinTransaction(
+    client: PostgresPoolClientLike,
+    text: string,
+    values: unknown[],
+    extension: string,
+  ): Promise<PostgresQueryResultLike> {
     const saved = await client.query("SELECT current_setting('search_path') AS path");
     const path = (saved.rows[0] as { path?: unknown } | undefined)?.path;
     await client.query("SELECT set_config('search_path', 'public', true)");
@@ -376,6 +503,33 @@ class SegmentStatements {
     // rollback to a savepoint before this) undoes the setting.
     const result = await client.query(text, values);
     await client.query('SELECT set_config($1, $2, true)', ['search_path', typeof path === 'string' ? path : `${this.segment}, public`]);
+    await this.checkReach((t, v) => client.query(t, v), extension);
+    return result;
+  }
+
+  /**
+   * With the session's search_path set to `public` for the statement, and set
+   * back after it. When the statement fails inside a transaction, setting it
+   * back fails too, and that transaction's rollback restores it.
+   */
+  private async aroundSession(
+    client: PostgresPoolClientLike,
+    text: string,
+    values: unknown[],
+    extension: string,
+  ): Promise<PostgresQueryResultLike> {
+    const saved = await client.query("SELECT current_setting('search_path') AS path");
+    const savedPath = (saved.rows[0] as { path?: unknown } | undefined)?.path;
+    const path = typeof savedPath === 'string' ? savedPath : `${this.segment}, public`;
+    await client.query("SELECT set_config('search_path', 'public', false)");
+    let result: PostgresQueryResultLike;
+    try {
+      result = await client.query(text, values);
+    } catch (error) {
+      await client.query('SELECT set_config($1, $2, false)', ['search_path', path]).catch(() => undefined);
+      throw error;
+    }
+    await client.query('SELECT set_config($1, $2, false)', ['search_path', path]);
     await this.checkReach((t, v) => client.query(t, v), extension);
     return result;
   }
@@ -501,6 +655,103 @@ class PostgresTransactionAdapter implements StorageAdapter {
   }
 }
 
+/** Runs `fn` in a transaction that `begin` opens on `client`. */
+const runTransaction = async <T>(
+  client: PostgresPoolClientLike,
+  begin: string,
+  fn: (trx: StorageAdapter) => Promise<T>,
+  capabilities: ReadonlySet<StorageCapability>,
+  segment: SegmentStatements | null,
+): Promise<T> => {
+  try {
+    await client.query(begin);
+    const result = await fn(new PostgresTransactionAdapter(client, capabilities, segment));
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  }
+};
+
+/**
+ * The connection a `withConnection()` callback holds. It refuses statements
+ * once the callback has ended, when the connection is back in the pool or
+ * closed.
+ */
+class PostgresConnectionAdapter implements PostgresConnection {
+  public readonly kind = 'postgres';
+  private ended = false;
+  private transactionOpen = false;
+  private readonly query: QueryRunner;
+
+  constructor(
+    private readonly client: PostgresPoolClientLike,
+    public readonly capabilities: ReadonlySet<StorageCapability>,
+    private readonly segment: SegmentStatements | null,
+  ) {
+    this.query = (text, values) => {
+      const live = this.live();
+      return segment ? segment.onConnection(live, text, values) : live.query(text, values);
+    };
+  }
+
+  public async open(): Promise<void> {
+    // withConnection() checks the connection out before the callback runs.
+  }
+
+  public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
+    return runWith(this.query, statement, parameters);
+  }
+
+  public async get<T>(statement: string, parameters?: StorageParameters): Promise<T | null> {
+    return getWith<T>(this.query, statement, parameters);
+  }
+
+  public async all<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
+    return allWith<T>(this.query, statement, parameters);
+  }
+
+  public async exec(script: string): Promise<void> {
+    await execWith(this.query, script);
+  }
+
+  public async transaction<T>(
+    fn: (trx: StorageAdapter) => Promise<T>,
+    options?: PostgresTransactionOptions
+  ): Promise<T> {
+    const begin = beginStatement(options);
+    const client = this.live();
+    if (this.transactionOpen) {
+      throw new Error(
+        'A transaction is already open on this connection. Run its statements through the handle its callback receives.'
+      );
+    }
+    this.transactionOpen = true;
+    try {
+      return await runTransaction(client, begin, fn, this.capabilities, this.segment);
+    } finally {
+      this.transactionOpen = false;
+    }
+  }
+
+  public async close(): Promise<void> {
+    // withConnection() returns the connection to the pool, or closes it, when the callback ends.
+  }
+
+  /** @internal withConnection() calls this when the callback ends. */
+  public end(): void {
+    this.ended = true;
+  }
+
+  private live(): PostgresPoolClientLike {
+    if (this.ended) {
+      throw new Error('This connection was handed back when its withConnection() callback ended.');
+    }
+    return this.client;
+  }
+}
+
 /**
  * PostgreSQL adapter for production-grade SQL operations.
  *
@@ -607,10 +858,20 @@ class PostgresTransactionAdapter implements StorageAdapter {
  * const agentos = createPostgresAdapter({ connectionString: process.env.DATABASE_URL, segment: 'agentos' });
  * ```
  *
- * ## Graceful Degradation
- * - Automatic reconnection on connection loss
- * - Connection pool handles transient failures
- * - Falls back to SQLite if PostgreSQL unavailable
+ * ## Connection failures
+ * - The pool drops a connection that fails, and the next query opens a new one.
+ * - The adapter never falls back to SQLite. `resolveStorageAdapter()` without
+ *   `strict` tries its next candidate when Postgres fails to open; with
+ *   `strict`, and in `createDatabase()` given a Postgres URL, it throws.
+ *
+ * ## Pool control
+ * - `withConnection(fn)` holds one connection for `fn`: session settings,
+ *   session advisory locks, and statements that must run outside a
+ *   transaction.
+ * - `getPoolStats()` counts the pool's connections and waiting callers.
+ * - `transaction(fn, { isolationLevel, readOnly, deferrable })` sets how the
+ *   transaction begins.
+ * - `allowExitOnIdle` lets Node exit while the pool is idle.
  */
 /**
  * Production-grade PostgreSQL adapter backed by pg.Pool.
@@ -808,6 +1069,9 @@ export class PostgresAdapter implements StorageAdapter {
     if (this.options.query_timeout !== undefined) {
       poolConfig.query_timeout = this.options.query_timeout;
     }
+    if (this.options.allowExitOnIdle !== undefined) {
+      poolConfig.allowExitOnIdle = this.options.allowExitOnIdle;
+    }
 
     // SSL configuration
     if (this.options.ssl !== undefined) {
@@ -857,20 +1121,79 @@ export class PostgresAdapter implements StorageAdapter {
     await execWith(this.query, script);
   }
 
-  public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
+  /**
+   * Runs `fn` in a transaction on one pooled connection: COMMIT when it
+   * resolves, ROLLBACK when it throws. `options` sets the isolation level and
+   * the read-only and deferrable modes; an unknown isolation level is refused
+   * before a connection is checked out.
+   */
+  public async transaction<T>(
+    fn: (trx: StorageAdapter) => Promise<T>,
+    options?: PostgresTransactionOptions
+  ): Promise<T> {
+    const begin = beginStatement(options);
     const client = await this.requirePool().connect();
     try {
-      await client.query('BEGIN');
-      const transactionAdapter = new PostgresTransactionAdapter(client, this.capabilities, this.segmentStatements);
-      const result = await fn(transactionAdapter);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
+      return await runTransaction(client, begin, fn, this.capabilities, this.segmentStatements);
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Holds one pooled connection for `fn`, for work that needs one session:
+   * `SET` and other session settings, session advisory locks
+   * (`pg_advisory_lock`), temporary tables, or statements that must not run
+   * inside a transaction. Its statements run outside a transaction unless
+   * `fn` opens one with `connection.transaction()` or `BEGIN`.
+   *
+   * When `fn` resolves, the connection goes back to the pool with its session
+   * state, so undo what `fn` set (or use `SET LOCAL` inside a transaction).
+   * When `fn` throws, the connection is closed instead, which ends its session
+   * state and any transaction it left open, and `fn`'s error is rethrown.
+   * When `fn` resolves inside a transaction it began and did not end, the
+   * connection is closed, which rolls the transaction back, and the call
+   * rejects (pg 8.21 and later report the transaction status). The connection
+   * refuses statements once `fn` has ended. On a segmented adapter the
+   * connection starts in the segment, as every connection of its pool does.
+   */
+  public async withConnection<T>(fn: (connection: PostgresConnection) => Promise<T>): Promise<T> {
+    const client = await this.requirePool().connect();
+    const connection = new PostgresConnectionAdapter(client, this.capabilities, this.segmentStatements);
+    let releaseError: Error | undefined;
+    try {
+      const result = await fn(connection);
+      const status = transactionStatus(client);
+      if (status === 'T' || status === 'E') {
+        releaseError = new Error(
+          'withConnection(): the callback returned inside an open transaction. The connection was closed, which rolled the transaction back. End each transaction the callback begins, or run it through connection.transaction().'
+        );
+        throw releaseError;
+      }
+      return result;
+    } catch (error) {
+      // The connection may hold session state or an open transaction that
+      // fn did not undo: close it rather than hand it to the next caller.
+      if (!releaseError) {
+        releaseError = error instanceof Error ? error : new Error(String(error));
+      }
+      throw error;
+    } finally {
+      connection.end();
+      client.release(releaseError);
+    }
+  }
+
+  /**
+   * The pool's counts, or null when the adapter is not open. A pool of the
+   * caller's that does not count its connections, as pg's Pool does, reads 0.
+   */
+  public getPoolStats(): PostgresPoolStats | null {
+    const pool = this.pool;
+    if (!pool) {
+      return null;
+    }
+    return { total: pool.totalCount ?? 0, idle: pool.idleCount ?? 0, waiting: pool.waitingCount ?? 0 };
   }
 
   /**
