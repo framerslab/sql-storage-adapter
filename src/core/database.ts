@@ -9,6 +9,7 @@
 
 import type { StorageAdapter } from './contracts';
 import { resolveStorageAdapter, type StorageResolutionOptions, type AdapterKind } from './resolver';
+import { namesPostgresServer } from '../shared/postgresTarget';
 import type { PostgresAdapterOptions } from '../adapters/postgresAdapter';
 import type { CapacitorAdapterOptions } from '../adapters/capacitorSqliteAdapter';
 import type { IndexedDbAdapterOptions } from '../adapters/indexedDbAdapter';
@@ -17,9 +18,10 @@ import type { IndexedDbAdapterOptions } from '../adapters/indexedDbAdapter';
  * Database connection options.
  */
 export interface DatabaseOptions {
-  /** 
+  /**
    * Database URL (e.g., postgresql://user:pass@host/db).
-   * If provided, PostgreSQL will be used.
+   * If provided, PostgreSQL is used, with no fallback to SQLite, unless
+   * `priority` or `type` says otherwise.
    */
   url?: string;
   
@@ -30,8 +32,11 @@ export interface DatabaseOptions {
   file?: string;
   
   /**
-   * PostgreSQL-specific configuration.
-   * Automatically uses PostgreSQL when provided.
+   * PostgreSQL-specific configuration, passed on to the Postgres adapter whole.
+   * When it names a server (a connection string, or a host, database or user),
+   * PostgreSQL is used, with no fallback to SQLite, unless `priority` or `type`
+   * says otherwise. `{ connectionString: process.env.DATABASE_URL }` with
+   * DATABASE_URL unset names none, and the local default is used.
    */
   postgres?: PostgresAdapterOptions;
   
@@ -110,7 +115,10 @@ export interface DatabaseOptions {
  *
  * 1. Explicit `options.priority` (caller-specified) wins entirely.
  * 2. Explicit `options.type` is mapped to a single adapter priority.
- * 3. Otherwise we auto-detect environment:
+ * 3. A Postgres URL, or Postgres options that name a server: ['postgres'].
+ *    There is no fallback to SQLite: data meant for Postgres would land in a
+ *    local file. DATABASE_URL in the environment does not count here.
+ * 4. Otherwise we auto-detect environment:
  *    - Browser / Deno: ['sqljs']
  *    - Node.js: ['better-sqlite3', 'sqljs'] (native first, wasm fallback)
  *
@@ -127,14 +135,13 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const isDeno = typeof (globalThis as any).Deno !== 'undefined';
 
-  // Handle URL (PostgreSQL)
-  if (options.url) {
-    resolverOptions.postgres = { connectionString: options.url };
-  }
-
-  // Handle PostgreSQL config
-  if (options.postgres) {
-    resolverOptions.postgres = options.postgres;
+  // PostgreSQL: the options pass on whole; the URL fills in a connection
+  // string they do not give.
+  if (options.url || options.postgres) {
+    resolverOptions.postgres = {
+      ...options.postgres,
+      connectionString: options.postgres?.connectionString || options.url || undefined,
+    };
   }
 
   // Handle file path
@@ -174,7 +181,9 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
 
   // Auto-detect environment ONLY if no priority already set
   if (!resolverOptions.priority || resolverOptions.priority.length === 0) {
-    if (isBrowser || isDeno) {
+    if (namesPostgresServer(resolverOptions.postgres)) {
+      resolverOptions.priority = ['postgres'];
+    } else if (isBrowser || isDeno) {
       resolverOptions.priority = ['sqljs'];
     } else if (isNode) {
       resolverOptions.priority = ['better-sqlite3', 'sqljs'];

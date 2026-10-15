@@ -131,13 +131,13 @@ See [Platform Strategy Guide](./PLATFORM_STRATEGY.md) for detailed pros/cons and
 
 | Adapter | Package | Ideal for | Pros | Considerations |
 | --- | --- | --- | --- | --- |
-| **🆕 `electron`** | bundled | **Electron desktop apps** | IPC bridge, multi-window, WAL, auto-migrations, crash recovery | Requires Electron runtime |
+| **🆕 `electron`** | bundled | **Electron desktop apps** | IPC bridge, multi-window, WAL, auto-migrations, crash recovery | Requires Electron runtime; create it from `@framers/sql-storage-adapter/electron` (the resolver does not build the `electron-main` and `electron-renderer` kinds) |
 | **🆕 `indexeddb`** | bundled (sql.js) | **Browsers, PWAs** | sql.js + IndexedDB persistence wrapper, browser-native storage, 50MB-1GB+ quota, offline-first | IndexedDB quotas vary, WASM overhead (sql.js), not a separate SQL engine |
 | `better-sqlite3` | `better-sqlite3` | Node/Electron, CLI, CI | Native performance, transactional semantics, WAL support | Needs native toolchain; version must match Node ABI; 13.x needs Node-API 10 (Node.js 22.14+, Electron 35+) |
 | `postgres` | `pg` | Hosted or on-prem PostgreSQL | Connection pooling, rich SQL features, cloud friendly | Requires `DATABASE_URL`/credentials |
 | `sqljs` | bundled | Browsers, serverless edge, native fallback | Pure WASM SQLite, no native deps, optional filesystem persistence | Write performance limited vs native, in-memory by default |
 | `capacitor` | `@capacitor-community/sqlite` | Mobile (iOS/Android, Capacitor) | Native SQLite on mobile, encryption | Requires Capacitor runtime |
-| `memory` | built-in | Unit tests, storybooks, constrained sandboxes | Zero dependencies, instant startup | Non-durable, single-process only |
+| `memory` | bundled (sql.js) | Unit tests, storybooks, constrained sandboxes | Zero dependencies, instant startup | The resolver builds the sql.js adapter for it, as for `sqljs`: in memory in a browser, persisted to the resolver's file path on Node |
 
 ### Platform Priorities
 
@@ -243,8 +243,23 @@ await sync.connect();
   - environment variables (`STORAGE_ADAPTER`, `DATABASE_URL`),
   - runtime hints (Capacitor detection, browser globals, IndexedDB availability).
 - Adapters are attempted in priority order until one opens successfully; a `StorageResolutionError` includes the full failure chain.
+- The resolver builds `postgres`, `better-sqlite3`, `capacitor`, `indexeddb` and `sqljs`, and builds sql.js for `memory`. Any other kind (`electron-main`, `electron-renderer`, `supabase`, or an unknown name, from `priority` or `STORAGE_ADAPTER`) fails as a candidate with an error that names it, and the next candidate is tried.
+- `createDatabase({ url })`, `createDatabase({ postgres })` and `connectDatabase()` open PostgreSQL, with every Postgres option (pool size, SSL, timeouts, application name, or host, port, database, user and password without a connection string) passed on, and do not fall back to SQLite. `DATABASE_URL` in the environment does not change what `createDatabase()` picks; `resolveStorageAdapter()` without a `priority` tries Postgres first when it is set.
 - Provide `priority: ['indexeddb', 'sqljs']` for browser bundles or tests where native modules shouldn't load.
 - Use `createCloudBackupManager` for S3-compatible backups with gzip compression and retention limits.
+
+### Transactions
+
+`transaction(fn)` commits when `fn` resolves and rolls back when it throws. Run the callback's statements through the handle it receives:
+
+```typescript
+await db.transaction(async (trx) => {
+  await trx.run('UPDATE accounts SET balance = balance - ? WHERE id = ?', [100, 'a']);
+  await trx.run('UPDATE accounts SET balance = balance + ? WHERE id = ?', [100, 'b']);
+});
+```
+
+The IndexedDB, Capacitor and better-sqlite3 adapters run every transaction on one connection, so they run transactions one at a time, and a statement from another caller waits until the open transaction ends: it neither joins the transaction (and vanishes in its rollback) nor reads what the transaction has not committed. A browser or a WebView has no async context to tell the callback's own statements apart, so on the IndexedDB and Capacitor adapters a statement the callback issues through the adapter itself, not through its handle, waits for the transaction too. The two then wait on each other, and the adapter logs a warning after 10 seconds. (On Node, better-sqlite3 tells them apart with `AsyncLocalStorage`.) Inside a callback, await only the database.
 
 ### IndexedDB-Specific Config
 
@@ -268,6 +283,8 @@ await adapter.open();
 - ✅ Prepared statements for performance and security
 - ✅ Export/import (Uint8Array SQLite file format)
 - ✅ Auto-save with batching (reduce IDB overhead)
+
+**When it saves:** every `saveIntervalMs`, the adapter writes the database image to IndexedDB if anything changed. It skips the tick while a transaction is open, its own or one begun with `BEGIN`, because sql.js's export closes and reopens the connection, which would end the transaction; the next tick saves it once it has committed. A save counts as done when IndexedDB commits it, not when the put request succeeds. A save that fails or aborts is reported once, and the next tick tries again. A write made while a save is in flight is saved by the next one. `close()` rolls back a transaction still open and saves the committed state. `exportDatabase()` throws while a transaction is open.
 
 **Why IndexedDB Adapter vs sql.js Adapter?**
 
@@ -503,7 +520,7 @@ On Postgres, `features.exporter` requires a Node runtime plus an adapter that wa
 ## CI, Releases, and Badges
 
 - GitHub Actions workflows:
-  - `ci.yml` runs on pushes and pull requests to `master`: lint, type check, tests with coverage and the build, then it packs the package, installs the tarball into a new ES module project and type-checks a consumer with `--module nodenext --moduleResolution nodenext`.
+  - `ci.yml` runs on pushes and pull requests to `master`: lint, type check, tests with coverage and the build, then it packs the package, installs the tarball into a new ES module project and type-checks a consumer with `--module nodenext --moduleResolution nodenext`. The job starts a PostgreSQL 16 service, and the specs that need a server read its URL from `POSTGRES_TEST_URL`.
   - `release.yml` publishes new versions to npm, tags the commit (`vX.Y.Z`), and creates/updates the GitHub Release when `CHANGELOG.md` and `package.json` bump the version.
 - Check badge health whenever builds fail:
   - CI badge should be green for `master`.

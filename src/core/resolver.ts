@@ -45,8 +45,9 @@ import type { AdapterKind } from './contracts/context';
 import { createBetterSqliteAdapter } from '../adapters/betterSqliteAdapter';
 import { createSqlJsAdapter } from '../adapters/sqlJsAdapter';
 import { createCapacitorSqliteAdapter, type CapacitorAdapterOptions } from '../adapters/capacitorSqliteAdapter';
-import { createPostgresAdapter } from '../adapters/postgresAdapter';
+import { createPostgresAdapter, type PostgresAdapterOptions } from '../adapters/postgresAdapter';
 import { IndexedDbAdapter, type IndexedDbAdapterOptions } from '../adapters/indexedDbAdapter';
+import { isNonEmpty, namesPostgresServer } from '../shared/postgresTarget';
 
 // Re-export AdapterKind for external use
 export type { AdapterKind } from './contracts/context';
@@ -54,12 +55,23 @@ export type { AdapterKind } from './contracts/context';
 export interface StorageResolutionOptions {
   /** Absolute path for sqlite file (used by better-sqlite3/sql.js when persistence is desired). */
   filePath?: string;
-  /** Explicit adapter priority override. */
+  /**
+   * Explicit adapter priority override. The resolver builds `postgres`,
+   * `better-sqlite3`, `capacitor`, `indexeddb` and `sqljs`; `memory` builds
+   * sql.js, as `sqljs` does. Any other kind (`electron-main`,
+   * `electron-renderer`, `supabase`, or an unknown name) fails as a candidate
+   * with an error that names it, and the resolver goes on to the next one.
+   */
   priority?: AdapterKind[];
   /** Options passed to the Capacitor adapter. */
   capacitor?: CapacitorAdapterOptions;
-  /** Options passed to the Postgres adapter. */
-  postgres?: { connectionString?: string };
+  /**
+   * Options passed to the Postgres adapter, all of them: a connection string,
+   * or host, port, database, user and password, and the pool, SSL and timeout
+   * settings. Without a connection string or a host, database or user here,
+   * the connection string comes from DATABASE_URL.
+   */
+  postgres?: PostgresAdapterOptions;
   /** Options passed to the IndexedDB adapter (browser persistence). */
   indexedDb?: IndexedDbAdapterOptions;
   /** Options forwarded to adapter.open. */
@@ -107,13 +119,44 @@ interface Candidate {
   openOptions?: StorageOpenOptions;
 }
 
+/** The error of a candidate the resolver cannot build. */
+const unsupportedKind = (kind: string): Error => {
+  switch (kind) {
+    case 'electron-main':
+      return new Error(
+        `The resolver cannot build adapter kind "${kind}". Create it with createElectronMainAdapter from '@framers/sql-storage-adapter/electron'.`,
+      );
+    case 'electron-renderer':
+      return new Error(
+        `The resolver cannot build adapter kind "${kind}". Create it with createElectronRendererAdapter from '@framers/sql-storage-adapter/electron'.`,
+      );
+    case 'supabase':
+      return new Error(
+        `The resolver cannot build adapter kind "${kind}". Use kind "postgres" with the Supabase connection string, or create a SupabaseAdapter.`,
+      );
+    default:
+      return new Error(
+        `Unknown adapter kind "${kind}". The resolver builds postgres, better-sqlite3, capacitor, indexeddb, sqljs and memory.`,
+      );
+  }
+};
+
 /**
  * Resolves the most appropriate storage adapter for the current runtime.
  * Tries candidates in the supplied priority order and falls back when one fails.
  */
 export const resolveStorageAdapter = async (options: StorageResolutionOptions = {}): Promise<StorageAdapter> => {
   const envOverride = getEnv('STORAGE_ADAPTER') as AdapterKind | undefined;
-  const postgresConnection = options.postgres?.connectionString ?? getEnv('DATABASE_URL') ?? undefined;
+  const postgresOptions = options.postgres;
+  const explicitConnection = postgresOptions?.connectionString;
+  // Explicit options that name a server are the target; DATABASE_URL fills in
+  // only when they name none.
+  const postgresConnection = isNonEmpty(explicitConnection)
+    ? explicitConnection
+    : namesPostgresServer(postgresOptions)
+      ? undefined
+      : getEnv('DATABASE_URL') || undefined;
+  const postgresTarget = isNonEmpty(postgresConnection) || namesPostgresServer(postgresOptions);
   const defaultFilePath = isBrowser ? 'db_data/app.sqlite3' : await joinPath([getCwd(), 'db_data', 'app.sqlite3']);
   const filePath = options.filePath ?? defaultFilePath;
 
@@ -146,7 +189,7 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
     if (isCapacitorRuntime()) {
       return ['capacitor', 'indexeddb', 'sqljs'];
     }
-    if (postgresConnection) {
+    if (postgresTarget) {
       return ['postgres', 'better-sqlite3', 'indexeddb', 'sqljs'];
     }
     // Browser detection (check for IndexedDB)
@@ -157,17 +200,21 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
   })();
 
   const candidates: Candidate[] = defaultPriority.map((name) => {
-    switch (name) {
+    // A kind from STORAGE_ADAPTER or a host's list is any string at run time.
+    switch (name as string) {
       case 'postgres': {
         return {
           name,
           factory: async () => {
-            if (!postgresConnection) {
-              throw new Error('DATABASE_URL or postgres connection string not provided.');
+            if (!postgresTarget) {
+              throw new Error('DATABASE_URL, a postgres connection string, or a postgres host, database or user is required.');
             }
-            return createPostgresAdapter(postgresConnection);
+            return createPostgresAdapter({
+              ...postgresOptions,
+              ...(postgresConnection ? { connectionString: postgresConnection } : {}),
+            });
           },
-          openOptions: { connectionString: postgresConnection }
+          openOptions: postgresConnection ? { connectionString: postgresConnection } : undefined
         };
       }
       case 'better-sqlite3':
@@ -197,11 +244,20 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
           }
         };
       case 'sqljs':
-      default:
+      // Not an AdapterKind, but the README lists it and hosts pass it; it builds
+      // what it has always built.
+      case 'memory':
         return {
           name: 'sqljs',
           factory: async () => createSqlJsAdapter(),
           openOptions: { filePath }
+        };
+      default:
+        return {
+          name,
+          factory: async () => {
+            throw unsupportedKind(name);
+          }
         };
     }
   });
