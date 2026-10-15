@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.7.3] - 2026-10-15
 
 ### Added
 - Per-adapter entries (`./postgres`, `./better-sqlite3`, `./sqljs`, `./indexeddb`, `./capacitor`), `./backup`, and an adapter-free `./core`. A server that takes its adapter from its own entry, with the rest from `./core`, bundles neither sql.js nor `@aws-sdk/client-s3`. The root entry imports every adapter, as before.
