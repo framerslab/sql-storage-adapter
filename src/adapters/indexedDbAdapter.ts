@@ -199,6 +199,8 @@ export class IndexedDbAdapter implements StorageAdapter {
   private saveFailureReported = false;
   /** Set while close() runs: no statement or transaction starts. */
   private closing = false;
+  /** The close() in progress, which a second call waits for. */
+  private closeRun: Promise<void> | null = null;
   private longWaitReported = false;
   /**
    * The connection is shared, so transaction() runs one callback at a time.
@@ -361,8 +363,12 @@ export class IndexedDbAdapter implements StorageAdapter {
 
   private execNow(script: string): void {
     this.ensureOpen();
-    this.db!.exec(script);
-    this.writeGeneration += 1;
+    try {
+      this.db!.exec(script);
+    } finally {
+      // A script that fails part way keeps the statements before the failure.
+      this.writeGeneration += 1;
+    }
   }
 
   /**
@@ -389,6 +395,9 @@ export class IndexedDbAdapter implements StorageAdapter {
           const result = await fn(transactionAdapter);
           this.ensureOpen();
           this.db!.run('COMMIT');
+          // The callback may have written through all() or get() (INSERT ...
+          // RETURNING), which mark nothing unsaved; the commit does.
+          this.writeGeneration += 1;
           return result;
         } catch (error) {
           this.rollbackQuietly();
@@ -457,9 +466,19 @@ export class IndexedDbAdapter implements StorageAdapter {
    * Closes the database and saves its committed state to IndexedDB.
    *
    * A transaction still open is rolled back, as closing a SQLite connection
-   * does, before the save; the save then holds committed writes only.
+   * does, before the save; the save then holds committed writes only. A call
+   * made while a close is running waits for that close.
    */
-  public async close(): Promise<void> {
+  public close(): Promise<void> {
+    if (!this.closeRun) {
+      this.closeRun = this.closeNow().finally(() => {
+        this.closeRun = null;
+      });
+    }
+    return this.closeRun;
+  }
+
+  private async closeNow(): Promise<void> {
     if (this.saveTimer) {
       clearInterval(this.saveTimer);
       this.saveTimer = null;
@@ -476,9 +495,9 @@ export class IndexedDbAdapter implements StorageAdapter {
         }
         await this.settleSave();
         if (this.hasUnsavedWrites()) {
-          await this.saveToIndexedDb();
+          await this.startSave();
         }
-        this.db.close();
+        this.db?.close();
         this.db = null;
       } finally {
         this.closing = false;
@@ -511,19 +530,29 @@ export class IndexedDbAdapter implements StorageAdapter {
 
   /**
    * Imports a database from a Uint8Array (SQLite file).
-   * Replaces the current database once any open transaction() has ended.
+   * Replaces the current database once any open transaction() has ended, and
+   * saves it to IndexedDB before it resolves.
    * @param data SQLite database file
    */
   public async importDatabase(data: Uint8Array): Promise<void> {
     this.ensureOpen();
-    await this.settleSave();
-    await whenAdmitted(this.gate, () => {
-      this.ensureOpen();
-      this.db!.close();
-      this.db = new this.SQL!.Database(data);
-      this.writeGeneration += 1;
-    }, undefined, this.longWait);
-    await this.flush();
+    await whenAdmitted(
+      this.gate,
+      () => {
+        this.ensureOpen();
+        // Opened before the current database closes: an image sql.js refuses
+        // leaves the adapter on the database it had.
+        const imported = new this.SQL!.Database(data);
+        this.db!.close();
+        this.db = imported;
+        this.writeGeneration += 1;
+        // The save exports in this turn, so no transaction can open between
+        // the swap and the export and hold the save back.
+        return this.startSave();
+      },
+      undefined,
+      this.longWait,
+    );
   }
 
   /**
@@ -678,6 +707,14 @@ export class IndexedDbAdapter implements StorageAdapter {
     if (!this.db || !this.idb || !this.hasUnsavedWrites() || this.inTransaction()) {
       return Promise.resolve();
     }
+    return this.startSave();
+  }
+
+  /**
+   * Starts a save at once and keeps it as the save in progress. The caller has
+   * made sure no transaction is open: the export would end it.
+   */
+  private startSave(): Promise<void> {
     const saving = this.saveToIndexedDb().finally(() => {
       if (this.saving === saving) this.saving = null;
     });
@@ -690,12 +727,6 @@ export class IndexedDbAdapter implements StorageAdapter {
     if (this.saving) {
       await this.saving.catch(() => undefined);
     }
-  }
-
-  /** Waits for a save in progress, then saves what it did not cover. */
-  private async flush(): Promise<void> {
-    await this.settleSave();
-    await this.saveIfIdle();
   }
 
   private reportLongWait(): void {

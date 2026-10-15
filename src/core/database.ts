@@ -20,8 +20,8 @@ import type { IndexedDbAdapterOptions } from '../adapters/indexedDbAdapter';
 export interface DatabaseOptions {
   /**
    * Database URL (e.g., postgresql://user:pass@host/db).
-   * If provided, PostgreSQL is used, with no fallback to SQLite, unless
-   * `priority` or `type` says otherwise.
+   * If provided, PostgreSQL is used on Node, with no fallback to SQLite,
+   * unless `priority` or `type` says otherwise.
    */
   url?: string;
   
@@ -34,9 +34,9 @@ export interface DatabaseOptions {
   /**
    * PostgreSQL-specific configuration, passed on to the Postgres adapter whole.
    * When it names a server (a connection string, or a host, database or user),
-   * PostgreSQL is used, with no fallback to SQLite, unless `priority` or `type`
-   * says otherwise. `{ connectionString: process.env.DATABASE_URL }` with
-   * DATABASE_URL unset names none, and the local default is used.
+   * PostgreSQL is used on Node, with no fallback to SQLite, unless `priority`
+   * or `type` says otherwise. `{ connectionString: process.env.DATABASE_URL }`
+   * with DATABASE_URL unset names none, and the local default is used.
    */
   postgres?: PostgresAdapterOptions;
   
@@ -115,12 +115,13 @@ export interface DatabaseOptions {
  *
  * 1. Explicit `options.priority` (caller-specified) wins entirely.
  * 2. Explicit `options.type` is mapped to a single adapter priority.
- * 3. A Postgres URL, or Postgres options that name a server: ['postgres'].
- *    There is no fallback to SQLite: data meant for Postgres would land in a
- *    local file. DATABASE_URL in the environment does not count here.
- * 4. Otherwise we auto-detect environment:
+ * 3. Otherwise we auto-detect environment:
  *    - Browser / Deno: ['sqljs']
- *    - Node.js: ['better-sqlite3', 'sqljs'] (native first, wasm fallback)
+ *    - Node.js with a Postgres URL, or Postgres options that name a server:
+ *      ['postgres']. There is no fallback to SQLite: data meant for Postgres
+ *      would land in a local file. DATABASE_URL in the environment does not
+ *      count here.
+ *    - Node.js otherwise: ['better-sqlite3', 'sqljs'] (native first, wasm fallback)
  *
  * The function never throws solely due to a native adapter absence; it falls
  * back to next candidates. Only when no candidate can open will it bubble an error.
@@ -181,10 +182,11 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
 
   // Auto-detect environment ONLY if no priority already set
   if (!resolverOptions.priority || resolverOptions.priority.length === 0) {
-    if (namesPostgresServer(resolverOptions.postgres)) {
-      resolverOptions.priority = ['postgres'];
-    } else if (isBrowser || isDeno) {
+    if (isBrowser || isDeno) {
+      // A browser cannot reach PostgreSQL, so a URL here changes nothing.
       resolverOptions.priority = ['sqljs'];
+    } else if (isNode && namesPostgresServer(resolverOptions.postgres)) {
+      resolverOptions.priority = ['postgres'];
     } else if (isNode) {
       resolverOptions.priority = ['better-sqlite3', 'sqljs'];
     } else {
