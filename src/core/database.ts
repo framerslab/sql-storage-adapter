@@ -13,6 +13,7 @@ import { namesPostgresServer } from '../shared/postgresTarget';
 import type { PostgresAdapterOptions } from '../adapters/postgresAdapter';
 import type { CapacitorAdapterOptions } from '../adapters/capacitorSqliteAdapter';
 import type { IndexedDbAdapterOptions } from '../adapters/indexedDbAdapter';
+import type { StorageLogger } from '../shared/logger';
 
 /**
  * The options that configure Postgres: `url` when the caller set the key, even
@@ -112,6 +113,12 @@ export interface DatabaseOptions {
    * `openOptions: { foreignKeys: true }`.
    */
   foreignKeys?: boolean;
+
+  /**
+   * The logger for this call's resolver lines (pino's fits). Default: the one
+   * `setStorageLogger()` set, else the console.
+   */
+  logger?: StorageLogger;
 }
 
 /**
@@ -229,6 +236,10 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
 
   if (options.foreignKeys !== undefined) {
     resolverOptions.openOptions = { ...resolverOptions.openOptions, foreignKeys: options.foreignKeys };
+  }
+
+  if (options.logger) {
+    resolverOptions.logger = options.logger;
   }
 
   // Auto-detect environment ONLY if no priority already set

@@ -48,6 +48,7 @@ import { createCapacitorSqliteAdapter, type CapacitorAdapterOptions } from '../a
 import { createPostgresAdapter, type PostgresAdapterOptions } from '../adapters/postgresAdapter';
 import { IndexedDbAdapter, type IndexedDbAdapterOptions } from '../adapters/indexedDbAdapter';
 import { isNonEmpty, namesPostgresServer } from '../shared/postgresTarget';
+import { getStorageLogger, type StorageLogger } from '../shared/logger';
 
 // Re-export AdapterKind for external use
 export type { AdapterKind } from './contracts/context';
@@ -78,6 +79,11 @@ export interface StorageResolutionOptions {
   openOptions?: StorageOpenOptions;
   /** Suppress fallback chain logs (adapter not-found warnings). Default: false. */
   quiet?: boolean;
+  /**
+   * The logger for this call's resolver lines (pino's fits). Default: the one
+   * `setStorageLogger()` set, else the console.
+   */
+  logger?: StorageLogger;
   /**
    * Strict resolution, for servers: only the database the options name opens.
    * Default: false.
@@ -166,6 +172,7 @@ const unsupportedKind = (kind: string): Error => {
  */
 export const resolveStorageAdapter = async (options: StorageResolutionOptions = {}): Promise<StorageAdapter> => {
   const envOverride = getEnv('STORAGE_ADAPTER') as AdapterKind | undefined;
+  const log = options.logger ?? getStorageLogger();
   const strict = options.strict === true;
   const postgresOptions = options.postgres;
   const explicitConnection = postgresOptions?.connectionString;
@@ -191,8 +198,9 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
     }
     // Electron detection - provide guidance to use dedicated Electron adapters
     if (isElectronMain()) {
-      console.warn(
-        '[StorageAdapter] Electron main process detected. ' +
+      log.warn(
+        { runtime: 'electron-main' },
+        'Electron main process detected. ' +
         'Consider using the dedicated Electron adapter for full framework support:\n' +
         "  import { createElectronMainAdapter } from '@framers/sql-storage-adapter/electron';\n" +
         'Falling back to better-sqlite3 adapter.'
@@ -200,8 +208,9 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
       return ['better-sqlite3'];
     }
     if (isElectronRenderer()) {
-      console.warn(
-        '[StorageAdapter] Electron renderer process detected. ' +
+      log.warn(
+        { runtime: 'electron-renderer' },
+        'Electron renderer process detected. ' +
         'For IPC-based database access, use the dedicated Electron adapter:\n' +
         "  import { createElectronRendererAdapter } from '@framers/sql-storage-adapter/electron';\n" +
         'Note: Direct database access in renderer is not recommended for security reasons.'
@@ -304,7 +313,7 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
         ...options.openOptions,
       };
       await adapter.open(openOptions);
-      if (!quiet) console.info(`[StorageAdapter] Using adapter "${candidate.name}".`);
+      if (!quiet) log.info({ adapter: candidate.name }, `Using adapter "${candidate.name}".`);
       return adapter;
     } catch (error) {
       errors.push(error);
@@ -317,7 +326,7 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
       }
       if (!quiet) {
         const msg = error instanceof Error ? error.message : String(error);
-        console.warn(`[StorageAdapter] ${candidate.name} not available, trying next. ${msg}`);
+        log.warn({ adapter: candidate.name, error: msg }, `${candidate.name} not available, trying next. ${msg}`);
       }
       continue;
     }

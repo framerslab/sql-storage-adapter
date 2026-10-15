@@ -43,3 +43,4 @@ export { SqliteFileExporter } from './exporters/SqliteFileExporter';
 export { PostgresExporter } from './exporters/PostgresExporter';
 export { createStorageFeatures } from './core/contracts/features';
 export { isUniqueViolation } from './shared/errors';
+export { setStorageLogger, getStorageLogger, type StorageLogger } from './shared/logger';
