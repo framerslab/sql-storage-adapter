@@ -282,6 +282,32 @@ await db.all('SELECT * FROM notes WHERE id = $1 OR parent_id = $1', [1]);
 - On PostgreSQL, `??` is the jsonb `?` (key exists) operator, and `?|` and `?&` stay operators; put a space between a placeholder and a following `|` or `&`. A statement that already uses `$n` is sent as written, so its `?` operators need no escape, and a statement run without parameters keeps its `?`.
 - On SQLite, `$1`, `$2`, ... become `?` with the values in their order, repeats included. A statement that mixes `?` and `$n` is refused.
 
+### Values
+
+On SQLite, values convert as they bind, positional and named alike:
+- a boolean binds as 1 or 0;
+- a Date binds as its ISO 8601 text;
+- an array or a plain object binds as JSON text;
+- undefined binds as NULL;
+- bytes (`Uint8Array`, `Buffer`) bind as a blob.
+
+On PostgreSQL, pg binds them itself: an array as a PostgreSQL array, an object as JSON, a Date as a timestamp.
+
+Reading back, pg returns int8 and numeric as strings and a DATE as a Date at local midnight. `typeParsers` in the PostgreSQL options sets that per pool:
+
+```typescript
+const db = await createDatabase({
+  url: process.env.DATABASE_URL,
+  strict: true,
+  postgres: { typeParsers: { int8: 'bigint', numeric: 'number', date: 'string' } },
+});
+```
+
+- `int8`: `'string'` (pg's default), `'number'` (refuses a value past `Number.MAX_SAFE_INTEGER`) or `'bigint'`.
+- `numeric`: `'string'` (pg's default) or `'number'` (a double, so it can round).
+- `date`: `'date'` (pg's default) or `'string'` (`YYYY-MM-DD`).
+- `json` (json and jsonb): `'parse'` (pg's default) or `'string'`, the text SQLite returns.
+
 ### Errors
 
 `isUniqueViolation(error)` recognises a unique or primary-key violation from any adapter:
