@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import initSqlJs from 'sql.js';
-import { IDBFactory, IDBObjectStore } from 'fake-indexeddb';
+import { IDBDatabase, IDBFactory, IDBObjectStore } from 'fake-indexeddb';
 import { IndexedDbAdapter } from '../src/adapters/indexedDbAdapter';
 
 // IndexedDbAdapter runs SQL on sql.js and writes the whole database image to
@@ -328,6 +328,135 @@ describe('IndexedDbAdapter transactions and saving', () => {
     });
   });
 
+  // all() and get() run INSERT, UPDATE and DELETE ... RETURNING too, and such a
+  // write must reach IndexedDB like one made through run().
+  describe('writes through all() and get() outside a transaction', () => {
+    it('saves an INSERT ... RETURNING run through all() on the next tick', async () => {
+      const adapter = await openWithItems('all-returning');
+      tick();
+      expect(await storedLabels('all-returning')).toEqual([]);
+
+      const rows = await adapter.all<{ id: number }>('INSERT INTO items (label) VALUES (?) RETURNING id', ['returned']);
+      expect(rows).toEqual([{ id: 1 }]);
+
+      tick();
+      expect(await storedLabels('all-returning')).toEqual(['returned']);
+    });
+
+    it('saves an UPDATE ... RETURNING run through get() when it closes', async () => {
+      const adapter = await openWithItems('get-returning');
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['before']);
+      tick();
+      expect(await storedLabels('get-returning')).toEqual(['before']);
+
+      // A comment ahead of the statement does not hide the write.
+      const row = await adapter.get<{ label: string }>(
+        '/* rename */ UPDATE items SET label = ? WHERE id = 1 RETURNING label',
+        ['after'],
+      );
+      expect(row).toEqual({ label: 'after' });
+
+      await adapter.close();
+      const reopened = await openAdapter('get-returning');
+      expect(await labels(reopened)).toEqual(['after']);
+    });
+
+    it('saves a WITH ... INSERT run through all()', async () => {
+      const adapter = await openWithItems('with-insert');
+      tick();
+      expect(await storedLabels('with-insert')).toEqual([]);
+
+      await adapter.all(
+        "WITH incoming(label) AS (VALUES ('from a common table expression')) " +
+          'INSERT INTO items (label) SELECT label FROM incoming RETURNING id',
+      );
+
+      tick();
+      expect(await storedLabels('with-insert')).toEqual(['from a common table expression']);
+    });
+  });
+
+  // sql.js's export() closes and reopens the connection, which sets every
+  // PRAGMA back to its default. Each save, exportDatabase() and
+  // importDatabase() goes through it.
+  describe('connection settings across a save', () => {
+    const childParents = async (adapter: IndexedDbAdapter): Promise<number[]> =>
+      (await adapter.all<{ parent_id: number }>('SELECT parent_id FROM child ORDER BY parent_id')).map(
+        (row) => row.parent_id,
+      );
+
+    it('keeps PRAGMA foreign_keys on after a save, an export and an import', async () => {
+      const adapter = await openAdapter('foreign-keys');
+      await adapter.exec('PRAGMA foreign_keys = ON');
+      await adapter.exec(
+        'CREATE TABLE parent (id INTEGER PRIMARY KEY);' +
+          'CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parent (id) ON DELETE CASCADE);' +
+          'INSERT INTO parent (id) VALUES (1), (2), (3);' +
+          'INSERT INTO child (parent_id) VALUES (1), (2), (3);',
+      );
+
+      // The tick's save exports the image.
+      tick();
+      expect(await readStoredImage('foreign-keys')).not.toBeNull();
+      expect(await adapter.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
+      await adapter.run('DELETE FROM parent WHERE id = 1');
+      expect(await childParents(adapter)).toEqual([2, 3]);
+
+      adapter.exportDatabase();
+      expect(await adapter.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
+
+      await adapter.importDatabase(adapter.exportDatabase());
+      expect(await adapter.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
+      await adapter.run('DELETE FROM parent WHERE id = 2');
+      expect(await childParents(adapter)).toEqual([3]);
+    });
+  });
+
+  describe('importDatabase()', () => {
+    it('refuses bytes that are not a SQLite database, and keeps its database in memory and in IndexedDB', async () => {
+      const adapter = await openWithItems('import-garbage');
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['kept']);
+      tick();
+      expect(await storedLabels('import-garbage')).toEqual(['kept']);
+
+      await expect(
+        adapter.importDatabase(new TextEncoder().encode('these bytes are not a database')),
+      ).rejects.toThrow(/not a SQLite database/);
+
+      expect(await labels(adapter)).toEqual(['kept']);
+      await adapter.close();
+      const reopened = await openAdapter('import-garbage');
+      expect(await labels(reopened)).toEqual(['kept']);
+    });
+
+    it('refuses a SQLite image cut short, which SQLite reads as damaged', async () => {
+      const source = await openWithItems('import-cut-source');
+      await source.transaction(async (trx) => {
+        for (let i = 0; i < 400; i += 1) {
+          await trx.run('INSERT INTO items (label) VALUES (?)', [`row ${i} `.padEnd(200, '.')]);
+        }
+      });
+      const image = source.exportDatabase();
+      expect(image.length).toBeGreaterThan(16_384);
+
+      const adapter = await openWithItems('import-cut');
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['kept']);
+      await expect(adapter.importDatabase(image.slice(0, 8_192))).rejects.toThrow(/damaged/);
+
+      expect(await labels(adapter)).toEqual(['kept']);
+    });
+
+    it('imports an empty image as an empty database', async () => {
+      const source = await openAdapter('import-empty-source');
+      const empty = source.exportDatabase();
+
+      const adapter = await openWithItems('import-empty');
+      await adapter.importDatabase(empty);
+
+      expect(await adapter.all("SELECT name FROM sqlite_master WHERE type = 'table'")).toEqual([]);
+    });
+  });
+
   // IndexedDB fires a request's success before its transaction commits, and a
   // transaction can still abort after that (a quota error at commit).
   describe('a save to IndexedDB', () => {
@@ -411,6 +540,73 @@ describe('IndexedDbAdapter transactions and saving', () => {
 
       tick();
       expect(await storedLabels('save-race')).toEqual(['before', 'during the save']);
+    });
+
+    it('writes nothing to IndexedDB for reads through all() and get(), WITH queries included', async () => {
+      const adapter = await openWithItems('reads-only');
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['kept']);
+      tick();
+      expect(await storedLabels('reads-only')).toEqual(['kept']);
+
+      let puts = 0;
+      IDBObjectStore.prototype.put = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['put']>) {
+        puts += 1;
+        return originalPut.apply(this, args);
+      };
+      expect(await labels(adapter)).toEqual(['kept']);
+      expect(await adapter.get('SELECT count(*) AS n FROM items')).toEqual({ n: 1 });
+      expect(await adapter.all('WITH recent AS (SELECT label FROM items) SELECT label FROM recent')).toEqual([
+        { label: 'kept' },
+      ]);
+      tick();
+      await settle();
+
+      expect(puts).toBe(0);
+    });
+
+    it('lets a save still running finish before an import saves, so the imported image is the one stored', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const originalTransaction = IDBDatabase.prototype.transaction;
+      try {
+        const source = await openWithItems('overlap-source');
+        await source.run('INSERT INTO items (label) VALUES (?)', ['imported']);
+        const image = source.exportDatabase();
+        await source.close();
+
+        const adapter = await openWithItems('overlap');
+        await adapter.run('INSERT INTO items (label) VALUES (?)', ['older']);
+
+        let puts = 0;
+        IDBObjectStore.prototype.put = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['put']>) {
+          puts += 1;
+          return originalPut.apply(this, args);
+        };
+        // The tick's save finds the object store gone once, as when another tab
+        // deletes the database, so it reopens IndexedDB and tries again while
+        // the import runs.
+        let failed = false;
+        IDBDatabase.prototype.transaction = function (
+          this: IDBDatabase,
+          ...args: Parameters<IDBDatabase['transaction']>
+        ) {
+          if (!failed && args[1] === 'readwrite') {
+            failed = true;
+            throw new DOMException('The object store was not found.', 'NotFoundError');
+          }
+          return originalTransaction.apply(this, args);
+        };
+
+        tick();
+        await adapter.importDatabase(image);
+        await until(() => puts === 2);
+        await settle();
+
+        expect(await storedLabels('overlap')).toEqual(['imported']);
+        expect(await labels(adapter)).toEqual(['imported']);
+      } finally {
+        IDBDatabase.prototype.transaction = originalTransaction;
+        warn.mockRestore();
+      }
     });
   });
 });
