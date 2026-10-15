@@ -52,7 +52,7 @@ import type {
   StorageParameters,
   StorageRunResult,
 } from '../core/contracts';
-import { normaliseParameters } from '../shared/parameterUtils';
+import { expandNamedParameters, normaliseParameters } from '../shared/parameterUtils';
 import { toSqliteStatement } from '../shared/sqlPlaceholders';
 import {
   createSerializedTransactionRunner,
@@ -446,7 +446,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     try {
       const { named, positional } = normaliseParameters(parameters);
       if (named) {
-        stmt.bind(named);
+        stmt.bind(expandNamedParameters(named));
       } else if (positional) {
         stmt.bind(positional);
       }
@@ -514,7 +514,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     try {
       const { named, positional } = normaliseParameters(parameters);
       if (named) {
-        stmt.bind(named);
+        stmt.bind(expandNamedParameters(named));
       } else if (positional) {
         stmt.bind(positional);
       }

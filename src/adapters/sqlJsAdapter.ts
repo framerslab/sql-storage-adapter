@@ -3,7 +3,7 @@ import type { SqlJsStatic, SqlJsConfig, Database as SqlJsDatabase } from 'sql.js
 import fs from 'fs';
 import path from 'path';
 import type { StorageAdapter, StorageCapability, StorageOpenOptions, StorageParameters, StorageRunResult } from '../core/contracts';
-import { normaliseParameters } from '../shared/parameterUtils';
+import { expandNamedParameters, normaliseParameters } from '../shared/parameterUtils';
 import { toSqliteStatement } from '../shared/sqlPlaceholders';
 import {
   createSerializedTransactionRunner,
@@ -19,23 +19,6 @@ export type SqlJsAdapterOptions = SqlJsConfig & {
    * `app-agentos.sqlite3`). An in-memory database is its own already.
    */
   segment?: string;
-};
-
-const expandNamedParameters = (named: Record<string, unknown>): Record<string, unknown> => {
-  const expanded: Record<string, unknown> = { ...named };
-  for (const [rawKey, value] of Object.entries(named)) {
-    if (!rawKey) continue;
-    const key = rawKey.replace(/^[:@$]/, '');
-    if (!key) continue;
-    // sql.js expects keys to match the placeholder format (":id", "@id", "$id").
-    // Other adapters (better-sqlite3) accept bare keys ("id") for "@id" placeholders.
-    // Expand all variants so the same query payload works across adapters.
-    if (!(key in expanded)) expanded[key] = value;
-    if (!(`:${key}` in expanded)) expanded[`:${key}`] = value;
-    if (!(`@${key}` in expanded)) expanded[`@${key}`] = value;
-    if (!(`$${key}` in expanded)) expanded[`$${key}`] = value;
-  }
-  return expanded;
 };
 
 const normaliseRowId = (value: unknown): string | number | null => {

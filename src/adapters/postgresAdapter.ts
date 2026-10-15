@@ -94,6 +94,12 @@ export interface PostgresAdapterOptions {
    */
   allowExitOnIdle?: boolean;
   /**
+   * How this pool's connections decode the column types whose pg defaults
+   * surprise JavaScript code, through pg's per-client type parsers. Each field
+   * left out keeps pg's default. A value it does not know fails open().
+   */
+  typeParsers?: PostgresTypeParsers;
+  /**
    * A schema of its own for the adapter's tables. Every connection of the
    * adapter's pool starts with `search_path` set to the segment, then
    * `public`, so the tables it creates without a schema land in the segment,
@@ -138,6 +144,65 @@ export interface PostgresAdapterOptions {
    */
   onError?: (error: Error) => void;
 }
+
+/** Per-pool decoding of int8, numeric, date and json columns. Each field left out keeps pg's default. */
+export interface PostgresTypeParsers {
+  /** int8 / bigint (OID 20). pg's default is 'string'. 'number' refuses a value past `Number.MAX_SAFE_INTEGER`. */
+  int8?: 'string' | 'number' | 'bigint';
+  /** numeric / decimal (OID 1700). pg's default is 'string'. 'number' is a double, so it can round. */
+  numeric?: 'string' | 'number';
+  /** date (OID 1082). pg's default is 'date', a Date at local midnight; 'string' keeps `YYYY-MM-DD`. */
+  date?: 'date' | 'string';
+  /** json (OID 114) and jsonb (OID 3802). pg's default is 'parse'; 'string' keeps the text, as SQLite returns it. */
+  json?: 'parse' | 'string';
+}
+
+type TextParser = (text: string) => unknown;
+
+/** The type-parser overrides `parsers` asks for, by OID, after checking each value. */
+const typeParserOverrides = (parsers: PostgresTypeParsers | undefined): Map<number, TextParser> => {
+  const overrides = new Map<number, TextParser>();
+  if (!parsers) return overrides;
+
+  const choice = (field: keyof PostgresTypeParsers, allowed: readonly string[]): string | undefined => {
+    const value = parsers[field];
+    if (value === undefined) return undefined;
+    if (!allowed.includes(value)) {
+      throw new Error(
+        `typeParsers.${field} must be ${allowed.map((option) => `'${option}'`).join(' or ')}; got ${JSON.stringify(value)}.`
+      );
+    }
+    return value;
+  };
+
+  const int8 = choice('int8', ['string', 'number', 'bigint']);
+  if (int8 === 'string') overrides.set(20, (text) => text);
+  if (int8 === 'bigint') overrides.set(20, (text) => BigInt(text));
+  if (int8 === 'number') {
+    overrides.set(20, (text) => {
+      const value = Number(text);
+      if (!Number.isSafeInteger(value)) {
+        throw new RangeError(
+          `int8 value ${text} is outside Number's safe integer range; read it with typeParsers.int8 'bigint' or 'string'.`
+        );
+      }
+      return value;
+    });
+  }
+
+  const numeric = choice('numeric', ['string', 'number']);
+  if (numeric === 'string') overrides.set(1700, (text) => text);
+  if (numeric === 'number') overrides.set(1700, (text) => Number(text));
+
+  if (choice('date', ['date', 'string']) === 'string') overrides.set(1082, (text) => text);
+
+  if (choice('json', ['parse', 'string']) === 'string') {
+    overrides.set(114, (text) => text);
+    overrides.set(3802, (text) => text);
+  }
+
+  return overrides;
+};
 
 /** The options that configure a pool when one is made, which a pool of the caller's already has. */
 const POOL_SETTINGS = [
@@ -1129,7 +1194,7 @@ export class PostgresAdapter implements StorageAdapter {
 
     // Load pg module dynamically
     const pg = await this.loadPgModule();
-    const pool: PostgresPoolLike = new pg.Pool(this.poolConfig(connectionString));
+    const pool: PostgresPoolLike = new pg.Pool(this.poolConfig(pg, connectionString));
     this.listenOn(pool);
 
     try {
@@ -1152,7 +1217,7 @@ export class PostgresAdapter implements StorageAdapter {
   }
 
   /** The configuration of the pool the adapter makes. */
-  private poolConfig(connectionString: string | undefined): PoolConfig {
+  private poolConfig(pg: PgModule, connectionString: string | undefined): PoolConfig {
     const poolConfig: PoolConfig = {};
 
     // Use connection string if provided
@@ -1187,6 +1252,16 @@ export class PostgresAdapter implements StorageAdapter {
     }
     if (this.options.allowExitOnIdle !== undefined) {
       poolConfig.allowExitOnIdle = this.options.allowExitOnIdle;
+    }
+    const overrides = typeParserOverrides(this.options.typeParsers);
+    if (overrides.size > 0) {
+      const defaults = pg.types;
+      poolConfig.types = {
+        getTypeParser: (oid: number, format?: string) =>
+          (format === undefined || format === 'text') && overrides.has(oid)
+            ? overrides.get(oid)!
+            : defaults.getTypeParser(oid, format as 'text'),
+      } as unknown as PoolConfig['types'];
     }
 
     // SSL configuration
