@@ -344,4 +344,30 @@ describe('a segment through createDatabase and the resolver', () => {
       /segment/i,
     );
   });
+
+  // The Postgres adapter refuses a segment on a pool its caller made. Without
+  // strict, the resolver falls through from a postgres candidate that fails,
+  // so the pair would open a local SQLite file in the segment instead.
+  it('rejects a segment with a pool of the caller before it tries any adapter, and opens no local file', async () => {
+    const dir = tempDir();
+    const filePath = path.join(dir, 'app.sqlite3');
+    const pool = {
+      query: async () => ({ rows: [] }),
+      connect: async () => {
+        throw new Error('the refusal comes before the pool is used');
+      },
+      end: async () => undefined,
+    };
+
+    await expect(resolveStorageAdapter({ postgres: { pool }, filePath, segment: 'agentos', quiet: true })).rejects.toThrow(
+      /segment cannot run on a PostgreSQL pool/,
+    );
+    await expect(
+      resolveStorageAdapter({ postgres: { pool, segment: 'agentos' }, filePath, quiet: true }),
+    ).rejects.toThrow(/segment cannot run on a PostgreSQL pool/);
+    await expect(createDatabase({ postgres: { pool }, segment: 'agentos' })).rejects.toThrow(
+      /segment cannot run on a PostgreSQL pool/,
+    );
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
 });

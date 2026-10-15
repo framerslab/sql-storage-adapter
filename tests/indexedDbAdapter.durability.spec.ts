@@ -232,7 +232,7 @@ describe('IndexedDbAdapter durability', () => {
       await adapter.run('INSERT INTO items (label) VALUES (?)', ['kept']);
 
       await expect(adapter.importDatabase(new TextEncoder().encode('not a database file, just text'))).rejects.toThrow(
-        /not a database/,
+        /not a SQLite database/,
       );
 
       expect((await adapter.all<{ label: string }>('SELECT label FROM items')).map((row) => row.label)).toEqual(['kept']);
