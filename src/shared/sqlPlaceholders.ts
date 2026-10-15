@@ -252,7 +252,7 @@ export interface SqliteStatement {
  * included. Named parameters, and statements without `$n`, pass through. A
  * statement that mixes `?` and `$n` placeholders is refused.
  */
-export const toSqliteStatement = (statement: string, parameters?: StorageParameters): SqliteStatement => {
+const rewriteDollarPlaceholders = (statement: string, parameters?: StorageParameters): SqliteStatement => {
   if (!statement.includes('$')) return { statement, parameters };
   const { named, positional } = normaliseParameters(parameters);
   if (named) return { statement, parameters };
@@ -280,4 +280,53 @@ export const toSqliteStatement = (statement: string, parameters?: StorageParamet
     .join('');
   const values = positional ?? [];
   return { statement: text, parameters: order.map((n) => values[n - 1]) };
+};
+
+/** Whether SQLite would refuse or mangle `value` as it is: a boolean, a Date, undefined, or an array or object that is not bytes. */
+const needsSqliteConversion = (value: unknown): boolean =>
+  value === undefined ||
+  typeof value === 'boolean' ||
+  (value !== null && typeof value === 'object' && !ArrayBuffer.isView(value) && !(value instanceof ArrayBuffer));
+
+/**
+ * A value as the SQLite adapters bind it. better-sqlite3 refuses booleans,
+ * Dates and objects, and sql.js refuses Dates and binds an array as a blob,
+ * so: a boolean binds as 1 or 0, a Date as its ISO 8601 text (an Invalid Date
+ * is refused), an array or a plain object as JSON text, and undefined as
+ * NULL. Strings, numbers, bigints, null and bytes bind as they are.
+ */
+export const toSqliteValue = (value: unknown): unknown => {
+  if (value === undefined) return null;
+  if (typeof value === 'boolean') return value ? 1 : 0;
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      throw new RangeError('Cannot bind an Invalid Date.');
+    }
+    return value.toISOString();
+  }
+  if (needsSqliteConversion(value)) return JSON.stringify(value);
+  return value;
+};
+
+const toSqliteParameters = (parameters?: StorageParameters): StorageParameters => {
+  if (parameters == null) return parameters;
+  if (Array.isArray(parameters)) {
+    return parameters.some(needsSqliteConversion) ? parameters.map(toSqliteValue) : parameters;
+  }
+  if (typeof parameters === 'object') {
+    const values = Object.values(parameters);
+    if (!values.some(needsSqliteConversion)) return parameters;
+    return Object.fromEntries(Object.entries(parameters).map(([name, value]) => [name, toSqliteValue(value)]));
+  }
+  return [toSqliteValue(parameters)];
+};
+
+/**
+ * The statement and values a SQLite adapter binds: `$n` placeholders become
+ * `?` (see rewriteDollarPlaceholders above) and each value is converted with
+ * toSqliteValue, positional and named alike.
+ */
+export const toSqliteStatement = (statement: string, parameters?: StorageParameters): SqliteStatement => {
+  const rewritten = rewriteDollarPlaceholders(statement, parameters);
+  return { statement: rewritten.statement, parameters: toSqliteParameters(rewritten.parameters) };
 };

@@ -13,6 +13,7 @@ import { hasPostgresConnection, namesPostgresServer } from '../shared/postgresTa
 import type { PostgresAdapterOptions } from '../adapters/postgresAdapter';
 import type { CapacitorAdapterOptions } from '../adapters/capacitorSqliteAdapter';
 import type { IndexedDbAdapterOptions } from '../adapters/indexedDbAdapter';
+import type { StorageLogger } from '../shared/logger';
 
 /**
  * The options that configure Postgres: `url` when the caller set the key, even
@@ -109,6 +110,22 @@ export interface DatabaseOptions {
    * See `StorageResolutionOptions.strict` for the resolver's side.
    */
   strict?: boolean;
+
+  /**
+   * SQLite: `true` turns foreign-key enforcement on and `false` turns it off
+   * when the adapter opens, and the setting holds when sql.js reopens its
+   * connection. Left out, each engine keeps its default: better-sqlite3
+   * enforces foreign keys, sql.js, IndexedDB and Capacitor do not.
+   * PostgreSQL always enforces them and ignores this. On the resolver, pass
+   * `openOptions: { foreignKeys: true }`.
+   */
+  foreignKeys?: boolean;
+
+  /**
+   * The logger for this call's resolver lines (pino's fits). Default: the one
+   * `setStorageLogger()` set, else the console.
+   */
+  logger?: StorageLogger;
 }
 
 /**
@@ -223,6 +240,14 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
 
   if (options.strict) {
     resolverOptions.strict = true;
+  }
+
+  if (options.foreignKeys !== undefined) {
+    resolverOptions.openOptions = { ...resolverOptions.openOptions, foreignKeys: options.foreignKeys };
+  }
+
+  if (options.logger) {
+    resolverOptions.logger = options.logger;
   }
 
   // Auto-detect environment ONLY if no priority already set

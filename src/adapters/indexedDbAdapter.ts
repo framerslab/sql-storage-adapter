@@ -52,7 +52,7 @@ import type {
   StorageParameters,
   StorageRunResult,
 } from '../core/contracts';
-import { normaliseParameters } from '../shared/parameterUtils';
+import { expandNamedParameters, normaliseParameters } from '../shared/parameterUtils';
 import { toSqliteStatement } from '../shared/sqlPlaceholders';
 import {
   createSerializedTransactionRunner,
@@ -270,6 +270,8 @@ export class IndexedDbAdapter implements StorageAdapter {
 
   private SQL: SqlJsStatic | null = null;
   private db: SqlJsDatabase | null = null;
+  /** Foreign-key enforcement as open() was asked for it (undefined: the engine default); sql.js forgets the PRAGMA when export() reopens the connection. */
+  private foreignKeys: boolean | undefined;
   private idb: IDBDatabase | null = null;
   private saveTimer: ReturnType<typeof setInterval> | null = null;
   /** Bumped by every statement that can change the database. */
@@ -325,10 +327,11 @@ export class IndexedDbAdapter implements StorageAdapter {
    * multiple adapters (e.g., fabric_codex_db and quarry-codex-local)
    * are initialized simultaneously.
    */
-  public async open(_options?: StorageOpenOptions): Promise<void> {
+  public async open(options?: StorageOpenOptions): Promise<void> {
     if (this.db) {
       return; // Already open
     }
+    this.foreignKeys = options?.foreignKeys;
 
     // Initialize sql.js using global singleton (prevents race conditions)
     this.SQL = await getGlobalSQL(this.sqlJsConfig);
@@ -343,6 +346,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     } else {
       this.db = new this.SQL.Database();
     }
+    this.applyConnectionSettings();
 
     // Start auto-save interval
     if (this.autoSave) {
@@ -367,7 +371,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     try {
       const { named, positional } = normaliseParameters(parameters);
       if (named) {
-        stmt.bind(named);
+        stmt.bind(expandNamedParameters(named));
       } else if (positional) {
         stmt.bind(positional);
       }
@@ -422,7 +426,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     try {
       const { named, positional } = normaliseParameters(parameters);
       if (named) {
-        stmt.bind(named);
+        stmt.bind(expandNamedParameters(named));
       } else if (positional) {
         stmt.bind(positional);
       }
@@ -630,6 +634,13 @@ export class IndexedDbAdapter implements StorageAdapter {
     return this.exportImage();
   }
 
+  /** Applies the connection settings open() was asked for: sql.js loses them whenever export() reopens the connection. */
+  private applyConnectionSettings(): void {
+    if (this.foreignKeys !== undefined) {
+      this.db!.run(`PRAGMA foreign_keys = ${this.foreignKeys ? 'ON' : 'OFF'};`);
+    }
+  }
+
   /**
    * Imports a database from a Uint8Array (SQLite file).
    *
@@ -663,6 +674,7 @@ export class IndexedDbAdapter implements StorageAdapter {
             restoreConnectionSettings(imported, readConnectionSettings(this.db!));
             this.db!.close();
             this.db = imported;
+            this.applyConnectionSettings();
             replaced = true;
             this.writeGeneration += 1;
             // The save exports in this turn, so no transaction can open between
@@ -716,6 +728,8 @@ export class IndexedDbAdapter implements StorageAdapter {
     const settings = readConnectionSettings(db);
     const image = db.export();
     restoreConnectionSettings(db, settings);
+    // export() closed and reopened the connection, which reset its PRAGMAs.
+    this.applyConnectionSettings();
     return image;
   }
 

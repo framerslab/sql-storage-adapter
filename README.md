@@ -250,6 +250,7 @@ await sync.connect();
 - **Behaviour change in 0.6.14, a patch release:** through 0.6.13, `createDatabase({ url })` and `createDatabase({ postgres: { connectionString } })` with no `priority` or `type` opened the SQLite file `db_data/app.sqlite3` under the working directory on Node, whatever the URL said; since 0.6.14 they open PostgreSQL. A caller whose data is in that file passes `priority: ['better-sqlite3', 'sqljs']` or `type: 'sqlite'` to keep opening it.
 - `connectDatabase()` opens PostgreSQL alone, in every runtime, from any connection string pg reads or from options with a host, database or user; a server it cannot reach fails the call. Given no server, as `connectDatabase(process.env.DATABASE_URL)` is with the variable unset, it throws before it opens anything. It does not read `DATABASE_URL` on its own.
 - `strict: true` (on `createDatabase` and `resolveStorageAdapter`) is for servers: only the database the options name opens. A postgres candidate that fails ends resolution with a `StorageResolutionError`, whatever `priority` lists after it; with `DATABASE_URL` or Postgres options that name a server and no `priority`, `['postgres']` is the whole list; an explicit file path (`file`, `filePath`) outranks `DATABASE_URL`; and a `url` or `postgres` option that names no server fails instead of opening the local default, unless a file is given. Without `strict`, `resolveStorageAdapter()` falls back from a failed Postgres to better-sqlite3, IndexedDB and sql.js, and `DATABASE_URL` comes before a `filePath`.
+- `foreignKeys` (on `createDatabase`, or in `openOptions` for the resolver and `open()`) sets SQLite's foreign-key enforcement when a SQLite adapter opens: `true` turns it on and `false` off, on better-sqlite3, sql.js, IndexedDB and Capacitor. The setting holds across the sql.js saves, exports and imports, which reopen the connection and reset its PRAGMAs. Left out, each engine keeps its default, and the defaults differ: better-sqlite3 enforces foreign keys (it is built with `SQLITE_DEFAULT_FOREIGN_KEYS=1`, per its [compilation options](https://github.com/WiseLibs/better-sqlite3/blob/v13.0.3/docs/compilation.md)), while sql.js, IndexedDB and Capacitor do not, as SQLite leaves [foreign keys off by default](https://www.sqlite.org/foreignkeys.html#fk_enable). Until a product passes `foreignKeys`, the same schema behaves differently per engine. Pass `foreignKeys: true` for the same behaviour everywhere. PostgreSQL always enforces foreign keys and ignores the option.
 - Provide `priority: ['indexeddb', 'sqljs']` for browser bundles or tests where native modules shouldn't load.
 - Use `createCloudBackupManager` for S3-compatible backups with gzip compression and retention limits.
 
@@ -283,6 +284,32 @@ await db.all('SELECT * FROM notes WHERE id = $1 OR parent_id = $1', [1]);
 - On PostgreSQL, `??` is the jsonb `?` (key exists) operator, and `?|` and `?&` stay operators; put a space between a placeholder and a following `|` or `&`. A statement that already uses `$n` is sent as written, so its `?` operators need no escape, and a statement run without parameters keeps its `?`.
 - On SQLite, `$1`, `$2`, ... become `?` with the values in their order, repeats included. A statement that mixes `?` and `$n` is refused.
 
+### Values
+
+On SQLite, values convert as they bind, positional and named alike:
+- a boolean binds as 1 or 0;
+- a Date binds as its ISO 8601 text;
+- an array or a plain object binds as JSON text;
+- undefined binds as NULL;
+- bytes (`Uint8Array`, `Buffer`) bind as a blob.
+
+On PostgreSQL, pg binds them itself: an array as a PostgreSQL array, an object as JSON, a Date as a timestamp.
+
+Reading back, pg returns int8 and numeric as strings and a DATE as a Date at local midnight. `typeParsers` in the PostgreSQL options sets that per pool:
+
+```typescript
+const db = await createDatabase({
+  url: process.env.DATABASE_URL,
+  strict: true,
+  postgres: { typeParsers: { int8: 'bigint', numeric: 'number', date: 'string' } },
+});
+```
+
+- `int8`: `'string'` (pg's default), `'number'` (refuses a value past `Number.MAX_SAFE_INTEGER`) or `'bigint'`.
+- `numeric`: `'string'` (pg's default) or `'number'` (a double, so it can round).
+- `date`: `'date'` (pg's default) or `'string'` (`YYYY-MM-DD`).
+- `json` (json and jsonb): `'parse'` (pg's default) or `'string'`, the text SQLite returns.
+
 ### Errors
 
 `isUniqueViolation(error)` recognises a unique or primary-key violation from any adapter:
@@ -302,6 +329,25 @@ try {
   throw error;
 }
 ```
+
+### Logging
+
+The library writes its log lines to the console unless a host hands it a logger: which adapter it chose, a fallback, a failed ROLLBACK, an adapter's warnings. pino's logger fits as it is, since each line is a fields object and a message.
+
+```typescript
+import pino from 'pino';
+import { createDatabase, setStorageLogger } from '@framers/sql-storage-adapter';
+
+// Every line, from every call
+setStorageLogger(pino({ name: 'storage' }));
+
+// Or one call's resolver lines
+const db = await createDatabase({ url: process.env.DATABASE_URL, strict: true, logger: requestLogger });
+```
+
+`setStorageLogger(null)` writes to the console again, and `quiet: true` silences the resolver's choice and fallback lines whatever the logger.
+
+The logger takes the lines of the resolver, the PostgreSQL adapter and the adapter base class. The IndexedDB, Capacitor, sync and Electron modules write to the console directly.
 
 ### PostgreSQL pool control
 

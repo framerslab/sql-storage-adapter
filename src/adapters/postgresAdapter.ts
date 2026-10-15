@@ -12,6 +12,7 @@ type PoolConfig = import('pg').PoolConfig;
 import type { StorageAdapter, StorageCapability, StorageOpenOptions, StorageParameters, StorageRunResult } from '../core/contracts';
 import { toPostgresStatement } from '../shared/sqlPlaceholders';
 import { splitSqlStatements } from '../shared/splitSqlStatements';
+import { getStorageLogger } from '../shared/logger';
 
 /**
  * Configuration options for PostgreSQL adapter.
@@ -52,7 +53,72 @@ export interface PostgresAdapterOptions {
    * running until `idleTimeoutMillis` closes them or `close()` ends the pool.
    */
   allowExitOnIdle?: boolean;
+  /**
+   * How this pool's connections decode the column types whose pg defaults
+   * surprise JavaScript code, through pg's per-client type parsers. Each field
+   * left out keeps pg's default. A value it does not know fails open().
+   */
+  typeParsers?: PostgresTypeParsers;
 }
+
+/** Per-pool decoding of int8, numeric, date and json columns. Each field left out keeps pg's default. */
+export interface PostgresTypeParsers {
+  /** int8 / bigint (OID 20). pg's default is 'string'. 'number' refuses a value past `Number.MAX_SAFE_INTEGER`. */
+  int8?: 'string' | 'number' | 'bigint';
+  /** numeric / decimal (OID 1700). pg's default is 'string'. 'number' is a double, so it can round. */
+  numeric?: 'string' | 'number';
+  /** date (OID 1082). pg's default is 'date', a Date at local midnight; 'string' keeps `YYYY-MM-DD`. */
+  date?: 'date' | 'string';
+  /** json (OID 114) and jsonb (OID 3802). pg's default is 'parse'; 'string' keeps the text, as SQLite returns it. */
+  json?: 'parse' | 'string';
+}
+
+type TextParser = (text: string) => unknown;
+
+/** The type-parser overrides `parsers` asks for, by OID, after checking each value. */
+const typeParserOverrides = (parsers: PostgresTypeParsers | undefined): Map<number, TextParser> => {
+  const overrides = new Map<number, TextParser>();
+  if (!parsers) return overrides;
+
+  const choice = (field: keyof PostgresTypeParsers, allowed: readonly string[]): string | undefined => {
+    const value = parsers[field];
+    if (value === undefined) return undefined;
+    if (!allowed.includes(value)) {
+      throw new Error(
+        `typeParsers.${field} must be ${allowed.map((option) => `'${option}'`).join(' or ')}; got ${JSON.stringify(value)}.`
+      );
+    }
+    return value;
+  };
+
+  const int8 = choice('int8', ['string', 'number', 'bigint']);
+  if (int8 === 'string') overrides.set(20, (text) => text);
+  if (int8 === 'bigint') overrides.set(20, (text) => BigInt(text));
+  if (int8 === 'number') {
+    overrides.set(20, (text) => {
+      const value = Number(text);
+      if (!Number.isSafeInteger(value)) {
+        throw new RangeError(
+          `int8 value ${text} is outside Number's safe integer range; read it with typeParsers.int8 'bigint' or 'string'.`
+        );
+      }
+      return value;
+    });
+  }
+
+  const numeric = choice('numeric', ['string', 'number']);
+  if (numeric === 'string') overrides.set(1700, (text) => text);
+  if (numeric === 'number') overrides.set(1700, (text) => Number(text));
+
+  if (choice('date', ['date', 'string']) === 'string') overrides.set(1082, (text) => text);
+
+  if (choice('json', ['parse', 'string']) === 'string') {
+    overrides.set(114, (text) => text);
+    overrides.set(3802, (text) => text);
+  }
+
+  return overrides;
+};
 
 /** The isolation levels of PostgreSQL's `BEGIN`. */
 export type PostgresIsolationLevel = 'read uncommitted' | 'read committed' | 'repeatable read' | 'serializable';
@@ -312,8 +378,9 @@ const runTransaction = async <T>(
       const failure = asError(rollbackError);
       onBroken(failure);
       keepRollbackError(error, failure);
-      console.warn(
-        `[StorageAdapter] PostgreSQL ROLLBACK failed after a transaction error, so the connection was closed; the transaction's own error is rethrown. ${failure.message}`
+      getStorageLogger().warn(
+        { adapter: 'postgres', error: failure.message },
+        `PostgreSQL ROLLBACK failed after a transaction error, so the connection was closed; the transaction's own error is rethrown. ${failure.message}`
       );
     }
     throw error;
@@ -607,6 +674,16 @@ export class PostgresAdapter implements StorageAdapter {
     }
     if (this.options.allowExitOnIdle !== undefined) {
       poolConfig.allowExitOnIdle = this.options.allowExitOnIdle;
+    }
+    const overrides = typeParserOverrides(this.options.typeParsers);
+    if (overrides.size > 0) {
+      const defaults = pg.types;
+      poolConfig.types = {
+        getTypeParser: (oid: number, format?: string) =>
+          (format === undefined || format === 'text') && overrides.has(oid)
+            ? overrides.get(oid)!
+            : defaults.getTypeParser(oid, format as 'text'),
+      } as unknown as PoolConfig['types'];
     }
 
     // SSL configuration

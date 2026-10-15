@@ -77,6 +77,7 @@ import type {
 } from '../core/contracts/hooks';
 
 import { generateOperationId } from '../core/contracts/hooks';
+import { getStorageLogger } from '../shared/logger';
 
 /**
  * Base state for all adapters.
@@ -1056,7 +1057,8 @@ export abstract class BaseStorageAdapter implements StorageAdapter {
    */
   protected log(message: string): void {
     if (this.options.verbose) {
-      console.log(`[${this.kind}] ${message}`);
+      const logger = getStorageLogger();
+      (logger.debug ?? logger.info).call(logger, { scope: this.kind }, message);
     }
   }
   
@@ -1064,7 +1066,7 @@ export abstract class BaseStorageAdapter implements StorageAdapter {
    * Logs a warning message (always outputs regardless of verbose).
    */
   protected logWarn(message: string): void {
-    console.warn(`[${this.kind}] ${message}`);
+    getStorageLogger().warn({ scope: this.kind }, message);
   }
 
   /**
