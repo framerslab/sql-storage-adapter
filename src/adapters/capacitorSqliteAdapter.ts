@@ -150,6 +150,11 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
         console.warn('[StorageAdapter] Failed to enable WAL on Capacitor SQLite.', error);
       }
     }
+
+    if (options?.foreignKeys !== undefined) {
+      // Outside the plugin's own transaction: SQLite ignores this PRAGMA inside one.
+      await this.connection.execute(`PRAGMA foreign_keys = ${options.foreignKeys ? 'ON' : 'OFF'};`, false);
+    }
   }
 
   public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {

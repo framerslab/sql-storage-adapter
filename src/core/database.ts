@@ -102,6 +102,16 @@ export interface DatabaseOptions {
    * See `StorageResolutionOptions.strict` for the resolver's side.
    */
   strict?: boolean;
+
+  /**
+   * SQLite: `true` turns foreign-key enforcement on and `false` turns it off
+   * when the adapter opens, and the setting holds when sql.js reopens its
+   * connection. Left out, each engine keeps its default: better-sqlite3
+   * enforces foreign keys, sql.js, IndexedDB and Capacitor do not.
+   * PostgreSQL always enforces them and ignores this. On the resolver, pass
+   * `openOptions: { foreignKeys: true }`.
+   */
+  foreignKeys?: boolean;
 }
 
 /**
@@ -215,6 +225,10 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
 
   if (options.strict) {
     resolverOptions.strict = true;
+  }
+
+  if (options.foreignKeys !== undefined) {
+    resolverOptions.openOptions = { ...resolverOptions.openOptions, foreignKeys: options.foreignKeys };
   }
 
   // Auto-detect environment ONLY if no priority already set
