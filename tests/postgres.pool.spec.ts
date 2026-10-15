@@ -205,6 +205,24 @@ describe.skipIf(!POSTGRES_TEST_URL)('PostgresAdapter and a pool of its caller', 
     }
   });
 
+  // typeParsers sets the types of a pool the adapter makes. A pool of the
+  // caller's decodes with its own types, so the option would do nothing there.
+  it("refuses typeParsers with a pool of its caller, and names the pool's own types option", async () => {
+    const pool = new pg.Pool({ connectionString: url, max: 1 });
+    try {
+      expect(() => createPostgresAdapter({ pool, typeParsers: { int8: 'number' } })).toThrow(/typeParsers/);
+      expect(() => createPostgresAdapter({ pool, typeParsers: { int8: 'number' } })).toThrow(/\btypes\b/);
+      // createDatabase() chooses Postgres alone for a pool, so the refusal ends it: nothing opens with the option ignored.
+      const failure = await createDatabase({ postgres: { pool, typeParsers: { json: 'string' } } }).then(
+        () => undefined,
+        (error: unknown) => error as { causes?: unknown[] },
+      );
+      expect(failure?.causes?.map(String).join('\n')).toMatch(/typeParsers/);
+    } finally {
+      await pool.end();
+    }
+  });
+
   it('counts the connections of a pool of its caller, and none once closed', async () => {
     const pool = new pg.Pool({ connectionString: url, max: 1 });
     try {
