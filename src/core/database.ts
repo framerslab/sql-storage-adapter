@@ -107,6 +107,16 @@ export interface DatabaseOptions {
   strict?: boolean;
 
   /**
+   * SQLite: `true` turns foreign-key enforcement on and `false` turns it off
+   * when the adapter opens, and the setting holds when sql.js reopens its
+   * connection. Left out, each engine keeps its default: better-sqlite3
+   * enforces foreign keys, sql.js, IndexedDB and Capacitor do not.
+   * PostgreSQL always enforces them and ignores this. On the resolver, pass
+   * `openOptions: { foreignKeys: true }`.
+   */
+  foreignKeys?: boolean;
+
+  /**
    * Keeps this database's tables apart from other users of the same database:
    * a schema of its own on PostgreSQL, a file with the segment in its name on
    * SQLite, a database name with the segment appended on IndexedDB and
@@ -134,8 +144,8 @@ const isCapacitorNative = (): boolean => {
  * 
  * @example
  * ```typescript
- * // The local default: better-sqlite3 (sql.js without it) on Node, sql.js in a
- * // browser. DATABASE_URL in the environment does not change it.
+ * // The local default: better-sqlite3 (sql.js without it) on Node, IndexedDB in
+ * // a browser. DATABASE_URL in the environment does not change it.
  * const db = await createDatabase();
  *
  * // PostgreSQL from DATABASE_URL on a server; strict fails when it is unset
@@ -248,6 +258,10 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
 
   if (options.strict) {
     resolverOptions.strict = true;
+  }
+
+  if (options.foreignKeys !== undefined) {
+    resolverOptions.openOptions = { ...resolverOptions.openOptions, foreignKeys: options.foreignKeys };
   }
 
   // Auto-detect environment ONLY if no priority already set

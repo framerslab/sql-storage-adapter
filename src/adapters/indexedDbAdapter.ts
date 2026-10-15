@@ -284,6 +284,8 @@ export class IndexedDbAdapter implements StorageAdapter {
 
   private SQL: SqlJsStatic | null = null;
   private db: SqlJsDatabase | null = null;
+  /** Foreign-key enforcement as open() was asked for it (undefined: the engine default); sql.js forgets the PRAGMA when export() reopens the connection. */
+  private foreignKeys: boolean | undefined;
   private idb: IDBDatabase | null = null;
   private saveTimer: ReturnType<typeof setInterval> | null = null;
   /** Bumped by every statement that can change the database. */
@@ -368,11 +370,12 @@ export class IndexedDbAdapter implements StorageAdapter {
    * multiple adapters (e.g., fabric_codex_db and quarry-codex-local)
    * are initialized simultaneously. Two calls at once open once.
    */
-  public open(_options?: StorageOpenOptions): Promise<void> {
+  public open(options?: StorageOpenOptions): Promise<void> {
     if (this.db) {
       return Promise.resolve(); // Already open
     }
     if (!this.opening) {
+      this.foreignKeys = options?.foreignKeys;
       this.opening = this.openNow().finally(() => {
         this.opening = null;
       });
@@ -390,9 +393,13 @@ export class IndexedDbAdapter implements StorageAdapter {
     // Load existing database from IndexedDB or create new
     const stored = await this.loadFromIndexedDb();
     const db = stored.image ? new this.SQL.Database(stored.image) : new this.SQL.Database();
+    // What a fresh connection has, and export() returns to. Read before the
+    // settings open() was asked for, so a save carries those like any other a
+    // caller made.
     this.pragmaDefaults = readPragmas(db);
     this.db = db;
     this.loadedStamp = stored.stamp;
+    this.applyConnectionSettings();
 
     if (this.crossTab) {
       this.locks = this.resolveLocks(this.crossTab);
@@ -796,6 +803,18 @@ export class IndexedDbAdapter implements StorageAdapter {
   }
 
   /**
+   * Applies the connection settings open() was asked for. sql.js loses them
+   * whenever export() reopens the connection; a save, an export, an import
+   * and a reload set them again with the other settings a caller changed
+   * (exportImage, replaceDatabase).
+   */
+  private applyConnectionSettings(): void {
+    if (this.foreignKeys !== undefined) {
+      this.db!.run(`PRAGMA foreign_keys = ${this.foreignKeys ? 'ON' : 'OFF'};`);
+    }
+  }
+
+  /**
    * Imports a database from a Uint8Array (SQLite file).
    * Replaces the current database once any open transaction() has ended, and
    * saves it to IndexedDB before it resolves; with `crossTab`, in place of
@@ -1147,6 +1166,7 @@ export class IndexedDbAdapter implements StorageAdapter {
    */
   private async saveToIndexedDb(): Promise<void> {
     if (!this.idb || !this.db) return;
+    // exportImage() sets the connection settings again after the export.
     await this.saveIfStampIs(undefined);
   }
 
