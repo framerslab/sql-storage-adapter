@@ -105,6 +105,31 @@ jobs:
           "$tsc" --version
           "$tsc" --module nodenext --moduleResolution nodenext --strict --skipLibCheck --noEmit index.ts
 
+      # The CommonJS build and the per-adapter entries, as a consumer installs
+      # them: a CommonJS TypeScript consumer under node16 resolution, require()
+      # of every entry, what each server entry bundles, and the bundled preload.
+      - name: Check the packed package's CommonJS build and entries
+        run: |
+          consumer_dir="$RUNNER_TEMP/nodenext-consumer"
+          cd "$consumer_dir"
+          cat > cjs-consumer.cts <<'EOF'
+          import { createDatabase, type StorageAdapter } from '@framers/sql-storage-adapter';
+          import { createPostgresAdapter } from '@framers/sql-storage-adapter/postgres';
+          import { SqliteDialect, isUniqueViolation, runSchemaMigrations } from '@framers/sql-storage-adapter/core';
+          import { createElectronRendererAdapter } from '@framers/sql-storage-adapter/electron/renderer';
+
+          export const open = (): Promise<StorageAdapter> => createDatabase();
+          export const openPostgres = (url: string): StorageAdapter => createPostgresAdapter(url);
+          export const dialect = new SqliteDialect();
+          export const migrate = runSchemaMigrations;
+          export const unique = isUniqueViolation;
+          export const renderer = createElectronRendererAdapter;
+          EOF
+          tsc="$GITHUB_WORKSPACE/node_modules/.bin/tsc"
+          "$tsc" --module node16 --moduleResolution node16 --strict --skipLibCheck --noEmit cjs-consumer.cts
+          node "$GITHUB_WORKSPACE/scripts/verify-package.mjs" "$consumer_dir"
+
+
   # The IndexedDB adapter's cross-tab coordination and durability, and the
   # key-value module, on the browsers' own IndexedDB, Web Locks and structured
   # clone: Chromium and WebKit, through Playwright.
