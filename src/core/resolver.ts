@@ -48,6 +48,7 @@ import { createCapacitorSqliteAdapter, type CapacitorAdapterOptions } from '../a
 import { createPostgresAdapter, type PostgresAdapterOptions } from '../adapters/postgresAdapter';
 import { IndexedDbAdapter, type IndexedDbAdapterOptions } from '../adapters/indexedDbAdapter';
 import { isNonEmpty, namesPostgresServer } from '../shared/postgresTarget';
+import { validateSegment } from '../shared/segment';
 import { getStorageLogger, type StorageLogger } from '../shared/logger';
 
 // Re-export AdapterKind for external use
@@ -73,7 +74,7 @@ export interface StorageResolutionOptions {
    * the connection string comes from DATABASE_URL.
    */
   postgres?: PostgresAdapterOptions;
-  /** Options passed to the IndexedDB adapter (browser persistence). */
+  /** Options passed to the IndexedDB adapter (browser persistence), all of them. */
   indexedDb?: IndexedDbAdapterOptions;
   /** Options forwarded to adapter.open. */
   openOptions?: StorageOpenOptions;
@@ -103,6 +104,19 @@ export interface StorageResolutionOptions {
    * `filePath` is given.
    */
   strict?: boolean;
+  /**
+   * Keeps the resolved adapter's tables apart from other users of the same
+   * database: on PostgreSQL a schema of the segment's name, on better-sqlite3
+   * and sql.js a file with the segment in its name (`app.sqlite3` becomes
+   * `app-agentos.sqlite3`), on IndexedDB and Capacitor a database name with
+   * the segment appended (`app-db-agentos`). Lower-case letters, digits and
+   * underscores; not `public`, `information_schema` or a name beginning with
+   * `pg_`. A name that cannot be a segment is refused before any adapter is
+   * tried, and so is a segment with `postgres.pool`, which the Postgres
+   * adapter cannot start in the segment. Takes the place of a `segment` in
+   * `postgres`, `indexedDb` or `capacitor`.
+   */
+  segment?: string;
 }
 
 interface CapacitorGlobal {
@@ -171,6 +185,26 @@ const unsupportedKind = (kind: string): Error => {
  * Tries candidates in the supplied priority order and falls back when one fails.
  */
 export const resolveStorageAdapter = async (options: StorageResolutionOptions = {}): Promise<StorageAdapter> => {
+  // A segment name is a programming error, not an adapter that failed: refuse
+  // it before trying any.
+  const segment = options.segment === undefined ? undefined : validateSegment(options.segment);
+  // A segment on a pool of the caller's never opens: the Postgres adapter sets
+  // the segment's search_path when it starts a connection, and it does not
+  // start the connections of a pool it did not make. Without strict, the
+  // failed postgres candidate would fall through to a local file in the
+  // segment, so the pair is refused before any adapter is tried.
+  if ((segment ?? options.postgres?.segment) !== undefined && options.postgres?.pool) {
+    throw new Error(
+      "A segment cannot run on a PostgreSQL pool of the caller's (postgres.pool): the segment's search_path is set when " +
+        'each connection of the pool starts, and the adapter does not start the connections of a pool it did not make. ' +
+        'Give the connection settings and the segment instead of the pool.',
+    );
+  }
+  /** The segment an adapter's own options carry, unless the resolver's takes their place. */
+  const segmentFor = (own: string | undefined): { segment?: string } => {
+    const chosen = segment ?? own;
+    return chosen === undefined ? {} : { segment: chosen };
+  };
   const envOverride = getEnv('STORAGE_ADAPTER') as AdapterKind | undefined;
   const log = options.logger ?? getStorageLogger();
   const strict = options.strict === true;
@@ -252,6 +286,7 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
             return createPostgresAdapter({
               ...postgresOptions,
               ...(postgresConnection ? { connectionString: postgresConnection } : {}),
+              ...segmentFor(postgresOptions?.segment),
             });
           },
           openOptions: postgresConnection ? { connectionString: postgresConnection } : undefined
@@ -260,13 +295,13 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
       case 'better-sqlite3':
         return {
           name,
-          factory: async () => createBetterSqliteAdapter(filePath),
+          factory: async () => createBetterSqliteAdapter(filePath, segmentFor(undefined)),
           openOptions: { filePath }
         };
       case 'capacitor':
         return {
           name,
-          factory: async () => createCapacitorSqliteAdapter(options.capacitor)
+          factory: async () => createCapacitorSqliteAdapter({ ...options.capacitor, ...segmentFor(options.capacitor?.segment) })
         };
       case 'indexeddb':
         return {
@@ -275,11 +310,10 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
             // Use dedicated indexedDb options, fallback to legacy openOptions.adapterOptions
             const legacyOptions = options.openOptions?.adapterOptions as { dbName?: string } | undefined;
             return new IndexedDbAdapter({
+              ...options.indexedDb,
               dbName: options.indexedDb?.dbName || legacyOptions?.dbName || 'app-db',
-              storeName: options.indexedDb?.storeName,
               autoSave: options.indexedDb?.autoSave ?? true,
-              saveIntervalMs: options.indexedDb?.saveIntervalMs,
-              sqlJsConfig: options.indexedDb?.sqlJsConfig,
+              ...segmentFor(options.indexedDb?.segment),
             });
           }
         };
@@ -289,7 +323,7 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
       case 'memory':
         return {
           name: 'sqljs',
-          factory: async () => createSqlJsAdapter(),
+          factory: async () => createSqlJsAdapter(segmentFor(undefined)),
           openOptions: { filePath }
         };
       default:
@@ -313,7 +347,12 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
         ...options.openOptions,
       };
       await adapter.open(openOptions);
-      if (!quiet) log.info({ adapter: candidate.name }, `Using adapter "${candidate.name}".`);
+      if (!quiet) {
+        log.info(
+          segment === undefined ? { adapter: candidate.name } : { adapter: candidate.name, segment },
+          `Using adapter "${candidate.name}"${segment === undefined ? '' : ` for segment "${segment}"`}.`,
+        );
+      }
       return adapter;
     } catch (error) {
       errors.push(error);
