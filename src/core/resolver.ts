@@ -106,8 +106,9 @@ export interface StorageResolutionOptions {
    * the segment appended (`app-db-agentos`). Lower-case letters, digits and
    * underscores; not `public`, `information_schema` or a name beginning with
    * `pg_`. A name that cannot be a segment is refused before any adapter is
-   * tried. Takes the place of a `segment` in `postgres`, `indexedDb` or
-   * `capacitor`.
+   * tried, and so is a segment with `postgres.pool`, which the Postgres
+   * adapter cannot start in the segment. Takes the place of a `segment` in
+   * `postgres`, `indexedDb` or `capacitor`.
    */
   segment?: string;
 }
@@ -181,6 +182,18 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
   // A segment name is a programming error, not an adapter that failed: refuse
   // it before trying any.
   const segment = options.segment === undefined ? undefined : validateSegment(options.segment);
+  // A segment on a pool of the caller's never opens: the Postgres adapter sets
+  // the segment's search_path when it starts a connection, and it does not
+  // start the connections of a pool it did not make. Without strict, the
+  // failed postgres candidate would fall through to a local file in the
+  // segment, so the pair is refused before any adapter is tried.
+  if ((segment ?? options.postgres?.segment) !== undefined && options.postgres?.pool) {
+    throw new Error(
+      "A segment cannot run on a PostgreSQL pool of the caller's (postgres.pool): the segment's search_path is set when " +
+        'each connection of the pool starts, and the adapter does not start the connections of a pool it did not make. ' +
+        'Give the connection settings and the segment instead of the pool.',
+    );
+  }
   /** The segment an adapter's own options carry, unless the resolver's takes their place. */
   const segmentFor = (own: string | undefined): { segment?: string } => {
     const chosen = segment ?? own;

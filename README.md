@@ -297,7 +297,7 @@ On PostgreSQL:
 - `public` stays on the path, so the types, functions and operators of extensions installed there resolve in every segment: pgvector's `vector` and `<->`. A `CREATE EXTENSION` that names no schema installs the extension into `public`, as it would without a segment, instead of into the segment, where no other segment and not the host would find it. When an extension a segment asks for is already installed in another segment's schema, the adapter warns once and names the `ALTER EXTENSION ... SET SCHEMA public` that moves it.
 - A name the segment does not hold falls through to `public`. Create a segment's tables before reading them (`CREATE TABLE IF NOT EXISTS` creates the table in the segment even when `public` has one of that name), and name the schema in a `DROP` or `ALTER` that `public` could also answer.
 - `exportData()` exports the tables of the current schema: the segment's, or `public` without one.
-- A segment cannot run on a pool of your own: the adapter sets `search_path` when it starts a connection, and it does not start the connections of a pool it did not make.
+- A segment cannot run on a pool of your own: the adapter sets `search_path` when it starts a connection, and it does not start the connections of a pool it did not make. `createDatabase()` and `resolveStorageAdapter()` refuse a segment with `postgres.pool` before they try any adapter.
 
 On the Electron main adapter, a segmented adapter serves the main process alone: the renderer's IPC channels are one set per process, and they stay with the adapter without a segment.
 

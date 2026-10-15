@@ -835,7 +835,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     } catch (error) {
       imported.close();
       const reason = error instanceof Error ? error.message : String(error);
-      throw new Error(`IndexedDbAdapter: the image to import is not a database sql.js can read (${reason}).`);
+      throw new Error(`IndexedDbAdapter: the image to import is not a SQLite database that sql.js can read (${reason}).`);
     }
     this.replaceDatabase(imported);
     this.writeGeneration += 1;
