@@ -1,3 +1,8 @@
+## [Unreleased]
+
+### Changed
+- CI runs the PostgreSQL integration suite (17 tests) and the dialect and full-text search suite (9 tests) against its PostgreSQL 16 service; both skipped in CI before. They read `POSTGRES_TEST_URL`, as the `createDatabase` specs do: the integration suite read `TEST_POSTGRES_URL`, which it still reads when `POSTGRES_TEST_URL` is unset, and the dialect suite read `DATABASE_URL`, which also moves the resolver's default to Postgres. The integration suite fails when its server cannot be reached, where its tests returned early and passed, and its granular-configuration test takes the host, port, database, user and password from the URL.
+
 ## [0.6.14] - 2026-10-15
 
 ### Fixed

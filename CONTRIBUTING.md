@@ -84,8 +84,9 @@ npm run typecheck
 ### Testing with Different Adapters
 
 ```bash
-# Test PostgreSQL adapter
-DATABASE_URL=postgresql://user:pass@localhost/test pnpm test
+# Run the PostgreSQL suites against a server (CI starts PostgreSQL 16 and sets it).
+# Use a database the suites may create and drop tables in.
+POSTGRES_TEST_URL=postgresql://user:pass@localhost:5432/test pnpm test
 
 # Test better-sqlite3
 STORAGE_ADAPTER=better-sqlite3 pnpm test

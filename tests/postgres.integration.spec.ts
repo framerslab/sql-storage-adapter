@@ -4,64 +4,26 @@ import type { StorageAdapter } from '../src/types';
 
 /**
  * PostgreSQL Integration Tests
- * 
- * These tests verify real PostgreSQL connections including:
- * - Connection string and granular configuration
- * - Remote connection support with SSL/TLS
- * - Connection pooling
- * - Cloud provider configurations
- * 
- * SETUP: Requires a running PostgreSQL instance
- * 
- * Quick Docker setup:
+ *
+ * These tests run against a real PostgreSQL server: connection string and
+ * granular configuration, pool settings, CRUD, transactions, JSONB, arrays and
+ * CTEs. The "Remote Connection Examples" only build configuration objects.
+ *
+ * They run when POSTGRES_TEST_URL names a server; CI starts a PostgreSQL 16
+ * service and sets it. TEST_POSTGRES_URL, the name this suite read before, is
+ * read when POSTGRES_TEST_URL is unset. Locally:
  * ```bash
- * docker run --name test-postgres \
- *   -e POSTGRES_PASSWORD=test123 \
- *   -e POSTGRES_DB=testdb \
- *   -p 5432:5432 \
- *   -d postgres:15
+ * docker run --name test-postgres -e POSTGRES_PASSWORD=test123 -e POSTGRES_DB=testdb -p 5432:5432 -d postgres:16
+ * POSTGRES_TEST_URL="postgresql://postgres:test123@localhost:5432/testdb" npm test
  * ```
- * 
- * Set connection via environment variable:
- * ```bash
- * export TEST_POSTGRES_URL="postgresql://postgres:test123@localhost:5432/testdb"
- * npm test
- * ```
- * 
- * Skip integration tests if Postgres not available:
- * ```bash
- * npm test -- --exclude postgres.integration.spec.ts
- * ```
+ * When the variable is set and the server cannot be reached, the suite fails.
  */
 
-const TEST_CONNECTION_STRING =
-  process.env.TEST_POSTGRES_URL || 'postgresql://postgres:test123@localhost:5432/testdb';
+const POSTGRES_TEST_URL = process.env.POSTGRES_TEST_URL || process.env.TEST_POSTGRES_URL;
 
-// Helper to check if PostgreSQL is available
-async function isPostgresAvailable(): Promise<boolean> {
-  try {
-    const adapter = createPostgresAdapter(TEST_CONNECTION_STRING);
-    await adapter.open();
-    await adapter.close();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', () => {
+describe.skipIf(!POSTGRES_TEST_URL)('PostgreSQL Integration Tests', () => {
+  const TEST_CONNECTION_STRING = POSTGRES_TEST_URL as string;
   let adapter: StorageAdapter;
-  let isAvailable: boolean;
-
-  beforeAll(async () => {
-    isAvailable = await isPostgresAvailable();
-    if (!isAvailable) {
-      console.warn(
-        '⚠️  PostgreSQL not available. Set TEST_POSTGRES_URL or start Docker:\n' +
-          '   docker run --name test-postgres -e POSTGRES_PASSWORD=test123 -e POSTGRES_DB=testdb -p 5432:5432 -d postgres:15'
-      );
-    }
-  });
 
   afterAll(async () => {
     if (adapter) {
@@ -79,8 +41,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
 
   describe('Connection Methods', () => {
     it('should connect with connection string', async () => {
-      if (!isAvailable) return;
-
       adapter = createPostgresAdapter(TEST_CONNECTION_STRING);
       await adapter.open();
 
@@ -91,14 +51,14 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
     });
 
     it('should connect with granular configuration', async () => {
-      if (!isAvailable) return;
-
+      // The same server, named by its parts instead of a connection string.
+      const parsed = new URL(TEST_CONNECTION_STRING);
       const options: PostgresAdapterOptions = {
-        host: 'localhost',
-        port: 5432,
-        database: 'testdb',
-        user: 'postgres',
-        password: 'test123',
+        host: parsed.hostname,
+        port: Number(parsed.port || 5432),
+        database: decodeURIComponent(parsed.pathname.slice(1)),
+        user: decodeURIComponent(parsed.username),
+        password: decodeURIComponent(parsed.password),
       };
 
       adapter = createPostgresAdapter(options);
@@ -111,8 +71,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
     });
 
     it('should support connection pool configuration', async () => {
-      if (!isAvailable) return;
-
       const options: PostgresAdapterOptions = {
         connectionString: TEST_CONNECTION_STRING,
         max: 5,
@@ -136,8 +94,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
 
   describe('CRUD Operations', () => {
     beforeAll(async () => {
-      if (!isAvailable) return;
-
       adapter = createPostgresAdapter(TEST_CONNECTION_STRING);
       await adapter.open();
 
@@ -154,8 +110,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
     });
 
     it('should insert and retrieve data', async () => {
-      if (!isAvailable) return;
-
       await adapter.run(
         'INSERT INTO test_users (name, email) VALUES ($1, $2)',
         ['Alice', 'alice@example.com']
@@ -172,8 +126,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
     });
 
     it('should query multiple rows', async () => {
-      if (!isAvailable) return;
-
       await adapter.run('INSERT INTO test_users (name, email) VALUES ($1, $2)', ['Bob', 'bob@example.com']);
       await adapter.run('INSERT INTO test_users (name, email) VALUES ($1, $2)', [
         'Charlie',
@@ -189,8 +141,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
     });
 
     it('should update data', async () => {
-      if (!isAvailable) return;
-
       await adapter.run('UPDATE test_users SET email = $1 WHERE name = $2', [
         'alice.new@example.com',
         'Alice',
@@ -205,8 +155,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
     });
 
     it('should delete data', async () => {
-      if (!isAvailable) return;
-
       await adapter.run('DELETE FROM test_users WHERE name = $1', ['Charlie']);
 
       const user = await adapter.get('SELECT * FROM test_users WHERE name = $1', ['Charlie']);
@@ -214,8 +162,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
     });
 
     it('should handle NULL values', async () => {
-      if (!isAvailable) return;
-
       await adapter.run('INSERT INTO test_users (name, email) VALUES ($1, $2)', ['NoEmail', null]);
 
       const user = await adapter.get<{ email: string | null }>(
@@ -229,8 +175,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
 
   describe('Transactions', () => {
     beforeAll(async () => {
-      if (!isAvailable) return;
-
       await adapter.exec('DROP TABLE IF EXISTS test_accounts');
       await adapter.exec(`
         CREATE TABLE test_accounts (
@@ -248,8 +192,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
     });
 
     it('should commit successful transaction', async () => {
-      if (!isAvailable) return;
-
       await adapter.transaction(async tx => {
         await tx.run('UPDATE test_accounts SET balance = balance - $1 WHERE name = $2', [100, 'Account A']);
         await tx.run('UPDATE test_accounts SET balance = balance + $1 WHERE name = $2', [100, 'Account B']);
@@ -269,8 +211,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
     });
 
     it('should rollback failed transaction', async () => {
-      if (!isAvailable) return;
-
       const balanceBefore = await adapter.get<{ balance: string }>(
         'SELECT balance FROM test_accounts WHERE name = $1',
         ['Account A']
@@ -299,8 +239,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
 
   describe('Advanced PostgreSQL Features', () => {
     it('should support JSONB operations', async () => {
-      if (!isAvailable) return;
-
       const metadata = { role: 'admin', permissions: ['read', 'write'], active: true };
 
       await adapter.run('INSERT INTO test_users (name, email, metadata) VALUES ($1, $2, $3)', [
@@ -319,8 +257,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
     });
 
     it('should support array types', async () => {
-      if (!isAvailable) return;
-
       await adapter.exec('DROP TABLE IF EXISTS test_arrays');
       await adapter.exec(`
         CREATE TABLE test_arrays (
@@ -345,8 +281,6 @@ describe.skipIf(!process.env.TEST_POSTGRES_URL)('PostgreSQL Integration Tests', 
     });
 
     it('should support CTEs (Common Table Expressions)', async () => {
-      if (!isAvailable) return;
-
       const result = await adapter.all<{ name: string; email: string }>(`
         WITH active_users AS (
           SELECT name, email FROM test_users WHERE email IS NOT NULL

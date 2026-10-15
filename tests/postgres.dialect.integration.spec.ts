@@ -1,18 +1,20 @@
-// packages/sql-storage-adapter/tests/postgres.dialect.integration.spec.ts
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { resolveStorageAdapter, createStorageFeatures } from '../src/index.js';
 import type { StorageAdapter, StorageFeatures } from '../src/index.js';
 
-const DATABASE_URL = process.env.DATABASE_URL;
-const describeIf = DATABASE_URL ? describe : describe.skip;
+// Runs against the server POSTGRES_TEST_URL names; CI starts a PostgreSQL 16
+// service and sets it. The suite read DATABASE_URL before, which also moves the
+// resolver's default to Postgres, so a run that set it changed what the other
+// suites opened.
+const POSTGRES_TEST_URL = process.env.POSTGRES_TEST_URL;
 
-describeIf('Postgres dialect integration', () => {
+describe.skipIf(!POSTGRES_TEST_URL)('Postgres dialect integration', () => {
   let adapter: StorageAdapter;
   let features: StorageFeatures;
 
   beforeAll(async () => {
     adapter = await resolveStorageAdapter({
-      postgres: { connectionString: DATABASE_URL! },
+      postgres: { connectionString: POSTGRES_TEST_URL! },
       priority: ['postgres'],
     });
     features = createStorageFeatures(adapter);
