@@ -9,9 +9,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # The Postgres specs that need a server (tests/createDatabase.postgres.spec.ts)
-    # run against this one. They read POSTGRES_TEST_URL; the older Postgres suites
-    # read TEST_POSTGRES_URL and DATABASE_URL, which stay unset here.
+    # The Postgres specs that need a server (createDatabase.postgres,
+    # postgres.integration and postgres.dialect.integration) run against this
+    # one. They read POSTGRES_TEST_URL. DATABASE_URL stays unset here: it moves
+    # the resolver's default to Postgres for every other suite.
     services:
       postgres:
         image: postgres:16
