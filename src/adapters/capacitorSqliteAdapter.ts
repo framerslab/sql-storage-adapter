@@ -11,6 +11,7 @@ import {
   createSharedConnectionTransactionAdapter,
 } from '../shared/serializedTransaction';
 import { createConnectionGate, whenAdmitted, type LongWaitWatch } from '../shared/connectionGate';
+import { segmentName, validateSegment } from '../shared/segment';
 
 import type { CapacitorSQLitePlugin, SQLiteDBConnection } from '@capacitor-community/sqlite';
 
@@ -26,6 +27,12 @@ export interface CapacitorAdapterOptions {
    * Whether to enable WAL when platform supports it.
    */
   enableWal?: boolean;
+  /**
+   * A database of its own: the segment is appended to the database name
+   * (`app` becomes `app-agentos`), whether the name comes from `database` or
+   * from `open()`'s `adapterOptions.database`.
+   */
+  segment?: string;
 }
 
 const isCapacitorPlugin = (value: unknown): value is CapacitorSQLitePlugin => {
@@ -120,8 +127,12 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
     onLongWait: () => this.reportLongWait(),
   };
 
+  private readonly segment: string | undefined;
+
+  /** @throws {Error} When `options.segment` is not a name a segment can take. */
   constructor(private readonly options: CapacitorAdapterOptions = {}) {
     this.dbName = options.database ?? 'app';
+    this.segment = options.segment === undefined ? undefined : validateSegment(options.segment);
   }
 
   public async open(options?: StorageOpenOptions): Promise<void> {
@@ -137,7 +148,7 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
     const adapterOptions = options?.adapterOptions as { database?: unknown } | undefined;
     const requestedName = typeof adapterOptions?.database === 'string' ? adapterOptions.database : undefined;
     const configuredName = this.options.database;
-    const resolvedDbName = requestedName ?? configuredName ?? this.dbName;
+    const resolvedDbName = segmentName(requestedName ?? configuredName ?? this.dbName, this.segment);
 
     this.connection = await this.plugin.createConnection(resolvedDbName, false, 'no-encryption', 1, false);
     await this.connection.open();

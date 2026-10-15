@@ -5,13 +5,40 @@ const __isBrowser = typeof window !== 'undefined' && typeof window.document !== 
 
 // Dynamic import for pg to prevent bundlers from trying to bundle it in browser builds
 type PgModule = typeof import('pg');
-type Pool = import('pg').Pool;
-type PoolClient = import('pg').PoolClient;
 type PoolConfig = import('pg').PoolConfig;
 
 import type { StorageAdapter, StorageCapability, StorageOpenOptions, StorageParameters, StorageRunResult } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
 import { splitSqlStatements } from '../shared/splitSqlStatements';
+import { validateSegment } from '../shared/segment';
+
+/** What the adapter reads from the answer to a query. */
+export interface PostgresQueryResultLike {
+  rows: unknown[];
+  rowCount?: number | null;
+}
+
+/** A connection checked out of a pool: the part of pg's `PoolClient` the adapter uses. */
+export interface PostgresPoolClientLike {
+  query(text: string, values?: unknown[]): Promise<PostgresQueryResultLike>;
+  release(error?: Error | boolean): void;
+}
+
+/**
+ * The part of pg's `Pool` the adapter uses. A `Pool` from `pg` is one; so is
+ * any object with these members.
+ */
+export interface PostgresPoolLike {
+  query(text: string, values?: unknown[]): Promise<PostgresQueryResultLike>;
+  connect(): Promise<PostgresPoolClientLike>;
+  end(): Promise<void>;
+  on?(event: 'error', listener: (error: Error) => void): unknown;
+  removeListener?(event: 'error', listener: (error: Error) => void): unknown;
+  /** True once `end()` has been called; pg's Pool sets it. */
+  readonly ending?: boolean;
+  /** True once the pool has ended; pg's Pool sets it. */
+  readonly ended?: boolean;
+}
 
 /**
  * Configuration options for PostgreSQL adapter.
@@ -46,7 +73,69 @@ export interface PostgresAdapterOptions {
   statement_timeout?: number;
   /** Query timeout in ms (0 = no timeout) */
   query_timeout?: number;
+  /**
+   * A schema of its own for the adapter's tables. Every connection of the
+   * adapter's pool starts with `search_path` set to the segment, then
+   * `public`, so the tables it creates without a schema land in the segment,
+   * and the types, functions and operators of extensions in `public`
+   * (pgvector's `vector`, `<->`) still resolve. `open()` creates the schema
+   * when it is missing, and a `CREATE EXTENSION` that names no schema installs
+   * the extension where it would without a segment, in `public`.
+   *
+   * A name the segment does not hold falls through to `public`: create a
+   * segment's tables before reading them (`CREATE TABLE IF NOT EXISTS` creates
+   * one in the segment even when `public` has a table of that name), and name
+   * the segment in a DROP or ALTER that `public` could also answer.
+   *
+   * Lower-case letters, digits and underscores; not `public`,
+   * `information_schema` or a name beginning with `pg_`. A segment cannot be
+   * combined with `pool`, nor with a connection string that sets its own
+   * `options` startup parameter: pg sends those in place of the segment's.
+   */
+  segment?: string;
+  /**
+   * A pool the caller made (a `pg` `Pool`) for the adapter to run on, instead
+   * of making one. The adapter runs on it from the start: no `open()` is
+   * needed, and `open()` after `close()` takes it up again. The connection
+   * settings above apply when a pool is made, so none of them, nor `segment`,
+   * can be given with it.
+   */
+  pool?: PostgresPoolLike;
+  /**
+   * Whether `close()` ends `pool`. False by default: the pool is its caller's,
+   * and `close()` leaves it open. Pass true when the adapter is the pool's one
+   * holder and closing the adapter is how the pool should end; `close()` then
+   * ends it once, however often it is called.
+   */
+  ownsPool?: boolean;
+  /**
+   * Called with the error an idle connection of the pool reports (the server
+   * ended it, the network dropped). pg's Pool raises such an error as an event
+   * that, with no listener, ends the process. On a pool the adapter makes or
+   * owns, the adapter listens even without `onError` and logs one warning per
+   * error; on a pool of its caller's that it does not own, it listens only
+   * when given `onError`, and takes its listener off again on `close()`.
+   */
+  onError?: (error: Error) => void;
 }
+
+/** The options that configure a pool when one is made, which a pool of the caller's already has. */
+const POOL_SETTINGS = [
+  'connectionString',
+  'host',
+  'port',
+  'database',
+  'user',
+  'password',
+  'ssl',
+  'max',
+  'min',
+  'idleTimeoutMillis',
+  'connectionTimeoutMillis',
+  'application_name',
+  'statement_timeout',
+  'query_timeout',
+] as const;
 
 interface PreparedStatement {
   text: string;
@@ -88,14 +177,13 @@ const prepareStatement = (statement: string, parameters?: StorageParameters): Pr
   return { text: statement, values: [] };
 };
 
-/** Execute a mutation through a specific pool or transaction client. */
-const runWithExecutor = async (
-  executor: Pool | PoolClient,
-  statement: string,
-  parameters?: StorageParameters
-): Promise<StorageRunResult> => {
+/** Runs one statement's text: on the adapter's pool, or on a transaction's client. */
+type QueryRunner = (text: string, values: unknown[]) => Promise<PostgresQueryResultLike>;
+
+/** Execute a mutation through a pool or a transaction client. */
+const runWith = async (query: QueryRunner, statement: string, parameters?: StorageParameters): Promise<StorageRunResult> => {
   const { text, values } = prepareStatement(statement, parameters);
-  const result = await executor.query(text, values);
+  const result = await query(text, values);
   const firstRow: unknown = result.rows?.[0];
   const lastInsertRowid =
     firstRow && typeof firstRow === 'object' && 'id' in (firstRow as Record<string, unknown>)
@@ -104,33 +192,259 @@ const runWithExecutor = async (
   return { changes: result.rowCount ?? 0, lastInsertRowid };
 };
 
-/** Read one row through a specific pool or transaction client. */
-const getWithExecutor = async <T>(
-  executor: Pool | PoolClient,
-  statement: string,
-  parameters?: StorageParameters
-): Promise<T | null> => {
+/** Read one row through a pool or a transaction client. */
+const getWith = async <T>(query: QueryRunner, statement: string, parameters?: StorageParameters): Promise<T | null> => {
   const { text, values } = prepareStatement(statement, parameters);
-  const result = await executor.query(text, values);
+  const result = await query(text, values);
   return (result.rows?.[0] as T) ?? null;
 };
 
-/** Read every matching row through a specific pool or transaction client. */
-const allWithExecutor = async <T>(
-  executor: Pool | PoolClient,
-  statement: string,
-  parameters?: StorageParameters
-): Promise<T[]> => {
+/** Read every matching row through a pool or a transaction client. */
+const allWith = async <T>(query: QueryRunner, statement: string, parameters?: StorageParameters): Promise<T[]> => {
   const { text, values } = prepareStatement(statement, parameters);
-  const result = await executor.query(text, values);
+  const result = await query(text, values);
   return (result.rows as T[]) ?? [];
 };
 
-/** Execute a statement script through a specific pool or transaction client. */
-const execWithExecutor = async (executor: Pool | PoolClient, script: string): Promise<void> => {
+/** Execute a statement script through a pool or a transaction client. */
+const execWith = async (query: QueryRunner, script: string): Promise<void> => {
   const statements = splitSqlStatements(script);
   for (const text of statements) {
-    await executor.query(text);
+    await query(text, []);
+  }
+};
+
+/** A word of a statement: keywords upper-cased, identifiers as PostgreSQL reads them. */
+interface StatementWord {
+  /** An unquoted word upper-cased; '"' for a quoted identifier; the character itself for anything else. */
+  keyword: string;
+  /** The identifier the word names: an unquoted word lower-cased, a quoted one as written. */
+  identifier: string;
+}
+
+/**
+ * The first `limit` words of a statement, past its comments: enough to tell
+ * what the statement is. String literals and dollar-quoted strings count as
+ * one word each and never read as a keyword.
+ */
+const leadingWords = (statement: string, limit: number): StatementWord[] => {
+  const words: StatementWord[] = [];
+  let i = 0;
+  const length = statement.length;
+  while (i < length && words.length < limit) {
+    const char = statement[i];
+    if (/\s/.test(char)) {
+      i += 1;
+    } else if (char === '-' && statement[i + 1] === '-') {
+      const end = statement.indexOf('\n', i);
+      i = end === -1 ? length : end + 1;
+    } else if (char === '/' && statement[i + 1] === '*') {
+      // PostgreSQL's block comments nest.
+      let depth = 1;
+      i += 2;
+      while (i < length && depth > 0) {
+        if (statement[i] === '/' && statement[i + 1] === '*') {
+          depth += 1;
+          i += 2;
+        } else if (statement[i] === '*' && statement[i + 1] === '/') {
+          depth -= 1;
+          i += 2;
+        } else {
+          i += 1;
+        }
+      }
+    } else if (char === "'") {
+      i += 1;
+      while (i < length) {
+        if (statement[i] === "'" && statement[i + 1] === "'") i += 2;
+        else if (statement[i] === "'") break;
+        else i += 1;
+      }
+      i += 1;
+      words.push({ keyword: "'", identifier: '' });
+    } else if (char === '"') {
+      let identifier = '';
+      i += 1;
+      while (i < length) {
+        if (statement[i] === '"' && statement[i + 1] === '"') {
+          identifier += '"';
+          i += 2;
+        } else if (statement[i] === '"') {
+          break;
+        } else {
+          identifier += statement[i];
+          i += 1;
+        }
+      }
+      i += 1;
+      words.push({ keyword: '"', identifier });
+    } else if (char === '$') {
+      const tag = /^\$[A-Za-z_]*\$/.exec(statement.slice(i));
+      if (tag) {
+        const end = statement.indexOf(tag[0], i + tag[0].length);
+        i = end === -1 ? length : end + tag[0].length;
+        words.push({ keyword: '$', identifier: '' });
+      } else {
+        i += 1;
+        words.push({ keyword: '$', identifier: '' });
+      }
+    } else if (/[A-Za-z_]/.test(char)) {
+      const word = /^[A-Za-z_][A-Za-z0-9_$]*/.exec(statement.slice(i))![0];
+      i += word.length;
+      words.push({ keyword: word.toUpperCase(), identifier: word.toLowerCase() });
+    } else {
+      i += 1;
+      words.push({ keyword: char, identifier: '' });
+    }
+  }
+  return words;
+};
+
+/**
+ * The extension a `CREATE EXTENSION` statement creates when the statement
+ * names no schema (`SCHEMA` or `WITH SCHEMA`), or null for any other
+ * statement.
+ */
+const unqualifiedCreateExtension = (statement: string): string | null => {
+  const words = leadingWords(statement, 16);
+  if (words[0]?.keyword !== 'CREATE' || words[1]?.keyword !== 'EXTENSION') return null;
+  let at = 2;
+  if (words[2]?.keyword === 'IF' && words[3]?.keyword === 'NOT' && words[4]?.keyword === 'EXISTS') at = 5;
+  const name = words[at];
+  if (!name || (name.keyword !== '"' && !/^[A-Z_]/.test(name.keyword))) return null;
+  if (words.slice(at + 1).some((word) => word.keyword === 'SCHEMA')) return null;
+  return name.identifier;
+};
+
+/** Where an installed extension's objects are, and whether ALTER EXTENSION ... SET SCHEMA can move them. */
+const EXTENSION_PLACE =
+  'SELECT n.nspname AS schema, e.extrelocatable AS relocatable FROM pg_extension e ' +
+  'JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = $1';
+
+/**
+ * Runs a statement through a segment's connections with care for the one
+ * statement whose effect depends on where it runs: an unqualified
+ * `CREATE EXTENSION` installs into the current schema, which on a segment is
+ * the segment, where no other segment and not the host find the extension's
+ * types. Such a statement runs with `search_path` set to `public` for itself
+ * alone, as it would without a segment (an extension whose control file names
+ * a schema still goes there). Afterwards the adapter checks where the
+ * extension is, since `IF NOT EXISTS` also succeeds for one installed in a
+ * schema the segment cannot see.
+ */
+class SegmentStatements {
+  /** Extensions already reported as out of the segment's reach. */
+  private readonly reported = new Set<string>();
+
+  constructor(public readonly segment: string) {}
+
+  /** Runs `text` on the pool. */
+  async onPool(pool: PostgresPoolLike, text: string, values: unknown[]): Promise<PostgresQueryResultLike> {
+    const extension = unqualifiedCreateExtension(text);
+    if (extension === null) {
+      return pool.query(text, values);
+    }
+    const client = await pool.connect();
+    let result: PostgresQueryResultLike;
+    try {
+      await client.query('BEGIN');
+      // set_config(..., true) is SET LOCAL: the COMMIT or ROLLBACK below ends it,
+      // so the connection goes back to the pool on the segment's search_path.
+      await client.query("SELECT set_config('search_path', 'public', true)");
+      result = await client.query(text, values);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+    await this.checkReach((t, v) => pool.query(t, v), extension);
+    return result;
+  }
+
+  /** Runs `text` on a transaction's client, inside the caller's transaction. */
+  async inTransaction(client: PostgresPoolClientLike, text: string, values: unknown[]): Promise<PostgresQueryResultLike> {
+    const extension = unqualifiedCreateExtension(text);
+    if (extension === null) {
+      return client.query(text, values);
+    }
+    const saved = await client.query("SELECT current_setting('search_path') AS path");
+    const path = (saved.rows[0] as { path?: unknown } | undefined)?.path;
+    await client.query("SELECT set_config('search_path', 'public', true)");
+    // A failure aborts the caller's transaction, whose rollback (or a
+    // rollback to a savepoint before this) undoes the setting.
+    const result = await client.query(text, values);
+    await client.query('SELECT set_config($1, $2, true)', ['search_path', typeof path === 'string' ? path : `${this.segment}, public`]);
+    await this.checkReach((t, v) => client.query(t, v), extension);
+    return result;
+  }
+
+  private async checkReach(query: QueryRunner, extension: string): Promise<void> {
+    if (this.reported.has(extension)) return;
+    const found = await query(EXTENSION_PLACE, [extension]);
+    const place = found.rows[0] as { schema?: unknown; relocatable?: unknown } | undefined;
+    if (!place || place.relocatable !== true) return;
+    if (place.schema === 'public' || place.schema === this.segment) return;
+    this.reported.add(extension);
+    console.warn(
+      `[StorageAdapter] PostgreSQL extension "${extension}" is installed in schema "${String(place.schema)}", which segment ` +
+        `"${this.segment}" does not reach: its search_path is ${this.segment}, public, so the extension's types and functions ` +
+        `do not resolve here. ALTER EXTENSION "${extension}" SET SCHEMA public moves it where every segment finds it.`,
+    );
+  }
+}
+
+/** A pool on which `end()` has been called. */
+const hasEnded = (pool: PostgresPoolLike): boolean => pool.ending === true || pool.ended === true;
+
+/** The listener the adapter puts on a pool it owns when no `onError` was given. */
+const warnOfIdleError = (error: Error): void => {
+  console.warn(
+    '[StorageAdapter] PostgreSQL: an idle connection of the pool failed; the pool opens another when one is needed.',
+    error instanceof Error ? error.message : error,
+  );
+};
+
+/** The value of an environment variable, where there is an environment. */
+const readEnv = (key: string): string | undefined =>
+  typeof process !== 'undefined' && process.env ? process.env[key] : undefined;
+
+/**
+ * Refuses a connection string that sets its own startup options when a
+ * segment needs that parameter: pg copies a connection string's parameters
+ * over the explicit configuration, so its `options` would replace the
+ * segment's search_path.
+ */
+const refuseOwnStartupOptions = (connectionString: string | undefined): void => {
+  if (connectionString && /[?&]options=/i.test(connectionString)) {
+    throw new Error(
+      'PostgresAdapter: a segment cannot be used with a connection string that sets its own startup options (options=...): ' +
+        "pg sends those in place of the segment's search_path. Move them out of the connection string, into PGOPTIONS.",
+    );
+  }
+};
+
+/**
+ * Creates a segment's schema when it is missing. The check comes first, so a
+ * role without CREATE on the database can open a segment that exists: CREATE
+ * SCHEMA IF NOT EXISTS checks that privilege before it looks for the schema.
+ */
+const createSchema = async (client: PostgresPoolClientLike, segment: string): Promise<void> => {
+  const found = await client.query('SELECT 1 FROM pg_namespace WHERE nspname = $1', [segment]);
+  if (found.rows.length > 0) {
+    return;
+  }
+  try {
+    // validateSegment admits lower-case letters, digits and underscores alone.
+    await client.query(`CREATE SCHEMA IF NOT EXISTS "${segment}"`);
+  } catch (error) {
+    // Two processes that open one new segment at once can both find it
+    // missing; the slower CREATE then fails on pg_namespace's unique index.
+    const code = (error as { code?: unknown } | null)?.code;
+    if (code !== '23505' && code !== '42P06') {
+      throw error;
+    }
   }
 };
 
@@ -141,11 +455,17 @@ const execWithExecutor = async (executor: Pool | PoolClient, script: string): Pr
  */
 class PostgresTransactionAdapter implements StorageAdapter {
   public readonly kind = 'postgres';
+  private readonly query: QueryRunner;
 
   constructor(
-    private readonly client: PoolClient,
-    public readonly capabilities: ReadonlySet<StorageCapability>
-  ) {}
+    client: PostgresPoolClientLike,
+    public readonly capabilities: ReadonlySet<StorageCapability>,
+    segment: SegmentStatements | null,
+  ) {
+    this.query = segment
+      ? (text, values) => segment.inTransaction(client, text, values)
+      : (text, values) => client.query(text, values);
+  }
 
   public async open(): Promise<void> {
     // The owning PostgresAdapter opens the pool before creating this view.
@@ -155,19 +475,19 @@ class PostgresTransactionAdapter implements StorageAdapter {
     statement: string,
     parameters?: StorageParameters
   ): Promise<StorageRunResult> {
-    return runWithExecutor(this.client, statement, parameters);
+    return runWith(this.query, statement, parameters);
   }
 
   public async get<T>(statement: string, parameters?: StorageParameters): Promise<T | null> {
-    return getWithExecutor<T>(this.client, statement, parameters);
+    return getWith<T>(this.query, statement, parameters);
   }
 
   public async all<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
-    return allWithExecutor<T>(this.client, statement, parameters);
+    return allWith<T>(this.query, statement, parameters);
   }
 
   public async exec(script: string): Promise<void> {
-    await execWithExecutor(this.client, script);
+    await execWith(this.query, script);
   }
 
   public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
@@ -211,14 +531,14 @@ class PostgresTransactionAdapter implements StorageAdapter {
  * - Remote database access
  *
  * ## Remote Connection Examples
- * 
+ *
  * ### Connection String (Recommended)
  * ```typescript
  * const db = createPostgresAdapter({
  *   connectionString: 'postgresql://user:password@db.example.com:5432/mydb?sslmode=require'
  * });
  * ```
- * 
+ *
  * ### Granular Configuration
  * ```typescript
  * const db = createPostgresAdapter({
@@ -232,9 +552,9 @@ class PostgresTransactionAdapter implements StorageAdapter {
  *   statement_timeout: 30000  // 30 second timeout
  * });
  * ```
- * 
+ *
  * ### Cloud Provider Examples
- * 
+ *
  * #### AWS RDS
  * ```typescript
  * const db = createPostgresAdapter({
@@ -246,7 +566,7 @@ class PostgresTransactionAdapter implements StorageAdapter {
  *   ssl: { rejectUnauthorized: true }
  * });
  * ```
- * 
+ *
  * #### Heroku Postgres
  * ```typescript
  * const db = createPostgresAdapter({
@@ -254,7 +574,7 @@ class PostgresTransactionAdapter implements StorageAdapter {
  *   ssl: { rejectUnauthorized: false }  // Heroku uses self-signed certs
  * });
  * ```
- * 
+ *
  * #### Supabase
  * ```typescript
  * const db = createPostgresAdapter({
@@ -262,7 +582,7 @@ class PostgresTransactionAdapter implements StorageAdapter {
  *   ssl: true
  * });
  * ```
- * 
+ *
  * #### DigitalOcean Managed Database
  * ```typescript
  * const db = createPostgresAdapter({
@@ -273,6 +593,18 @@ class PostgresTransactionAdapter implements StorageAdapter {
  *   password: process.env.DO_DB_PASSWORD,
  *   ssl: { rejectUnauthorized: true, ca: process.env.DO_CA_CERT }
  * });
+ * ```
+ *
+ * ### A pool the host already holds
+ * ```typescript
+ * const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+ * // The adapter runs on the host's pool; close() leaves it open.
+ * const db = new PostgresAdapter({ pool, onError: (error) => console.warn('idle connection failed', error) });
+ * ```
+ *
+ * ### A segment: the adapter's tables in a schema of their own
+ * ```typescript
+ * const agentos = createPostgresAdapter({ connectionString: process.env.DATABASE_URL, segment: 'agentos' });
  * ```
  *
  * ## Graceful Degradation
@@ -299,16 +631,65 @@ export class PostgresAdapter implements StorageAdapter {
   ]);
 
   private options: PostgresAdapterOptions;
-  private pool: Pool | null = null;
+  /**
+   * The pool statements run on, or null while the adapter is closed. Hosts
+   * written against 0.6 hand the adapter a Pool by setting this field before
+   * `open()`; the adapter then runs on that Pool and ends it on `close()`, as
+   * 0.6 did. Keep its name, and keep it a plain field that starts as null.
+   */
+  private pool: PostgresPoolLike | null = null;
   private pgModule: PgModule | null = null;
+  /** The pool of the caller's the adapter was given, which `open()` takes up again after `close()`. */
+  private readonly givenPool: PostgresPoolLike | null;
+  /** Whether `close()` ends the pool. */
+  private readonly ownsPool: boolean;
+  private readonly segmentStatements: SegmentStatements | null;
+  /** The error listener the adapter has on a pool, and that pool. */
+  private listening: { pool: PostgresPoolLike; listener: (error: Error) => void } | null = null;
+  private opening: Promise<void> | null = null;
+  private closing: Promise<void> | null = null;
 
   constructor(options: PostgresAdapterOptions | string) {
     // Support both string and object initialization
-    if (typeof options === 'string') {
-      this.options = { connectionString: options };
+    this.options = typeof options === 'string' ? { connectionString: options } : { ...options };
+    const segment = this.options.segment === undefined ? undefined : validateSegment(this.options.segment);
+    this.segmentStatements = segment === undefined ? null : new SegmentStatements(segment);
+
+    const given = this.options.pool;
+    if (given) {
+      if (segment !== undefined) {
+        throw new Error(
+          "PostgresAdapter: a segment cannot run on a pool its caller made: the segment's search_path is set when each " +
+            'connection of the pool starts, and the adapter does not start the connections of a pool it did not make. ' +
+            'Give the connection settings and the segment instead of the pool.',
+        );
+      }
+      const settings = POOL_SETTINGS.filter((key) => this.options[key] !== undefined);
+      if (settings.length > 0) {
+        throw new Error(
+          `PostgresAdapter: ${settings.join(', ')} cannot be given with pool: they configure a pool when one is made, ` +
+            'and the pool given was made by its caller. Set them on that pool.',
+        );
+      }
+      this.givenPool = given;
+      this.ownsPool = this.options.ownsPool === true;
+      this.pool = given;
+      this.listenOn(given);
     } else {
-      this.options = options;
+      this.givenPool = null;
+      this.ownsPool = true;
+      if (segment !== undefined) {
+        refuseOwnStartupOptions(this.options.connectionString);
+      }
     }
+  }
+
+  /**
+   * The pool the adapter runs on: the pool it was given, or the pool it made
+   * while it is open. Null while the adapter is closed.
+   */
+  public getPool(): PostgresPoolLike | null {
+    return this.pool;
   }
 
   /**
@@ -332,25 +713,74 @@ export class PostgresAdapter implements StorageAdapter {
     }
   }
 
-  public async open(openOptions?: StorageOpenOptions): Promise<void> {
+  /**
+   * Opens the adapter: makes its pool and checks that a connection can be
+   * made (and with a segment, creates the segment's schema when it is
+   * missing), or takes up the pool it was given. A failure ends the pool it
+   * made, so a later `open()` starts again. Two calls at once open once.
+   */
+  public open(openOptions?: StorageOpenOptions): Promise<void> {
     if (this.pool) {
-      return;
+      return Promise.resolve();
     }
+    if (!this.opening) {
+      this.opening = this.openNow(openOptions).finally(() => {
+        this.opening = null;
+      });
+    }
+    return this.opening;
+  }
 
+  private async openNow(openOptions?: StorageOpenOptions): Promise<void> {
     if (__isBrowser) {
       throw new Error('[StorageAdapter] PostgreSQL adapter cannot be opened in a browser environment.');
     }
 
+    if (this.givenPool) {
+      if (hasEnded(this.givenPool)) {
+        throw new Error('PostgresAdapter: the pool it was given has ended, so the adapter cannot open on it again.');
+      }
+      this.pool = this.givenPool;
+      this.listenOn(this.givenPool);
+      return;
+    }
+
+    const connectionString = openOptions?.connectionString ?? this.options.connectionString;
+    if (this.segmentStatements) {
+      refuseOwnStartupOptions(connectionString);
+    }
+
     // Load pg module dynamically
     const pg = await this.loadPgModule();
-    const { Pool } = pg;
+    const pool: PostgresPoolLike = new pg.Pool(this.poolConfig(connectionString));
+    this.listenOn(pool);
 
-    // Build pool configuration
+    try {
+      // Test connection
+      const client = await pool.connect();
+      try {
+        if (this.segmentStatements) {
+          await createSchema(client, this.segmentStatements.segment);
+        }
+      } finally {
+        client.release();
+      }
+    } catch (error) {
+      // The listener stays on the pool through its end; the adapter forgets it.
+      this.listening = null;
+      await pool.end().catch(() => undefined);
+      throw error;
+    }
+    this.pool = pool;
+  }
+
+  /** The configuration of the pool the adapter makes. */
+  private poolConfig(connectionString: string | undefined): PoolConfig {
     const poolConfig: PoolConfig = {};
 
     // Use connection string if provided
-    if (this.options.connectionString || openOptions?.connectionString) {
-      poolConfig.connectionString = openOptions?.connectionString ?? this.options.connectionString;
+    if (connectionString) {
+      poolConfig.connectionString = connectionString;
     } else {
       // Build from individual options
       poolConfig.host = this.options.host ?? 'localhost';
@@ -384,41 +814,54 @@ export class PostgresAdapter implements StorageAdapter {
       poolConfig.ssl = this.options.ssl;
     }
 
-    this.pool = new Pool(poolConfig);
+    if (this.segmentStatements) {
+      // Every connection the pool opens, a replacement included, starts on the
+      // segment. A startup setting is the connection's default, so RESET and
+      // DISCARD ALL return to it. pg reads PGOPTIONS only for a connection
+      // without options of its own, so its options are kept here.
+      const searchPath = `-c search_path=${this.segmentStatements.segment},public`;
+      const inherited = readEnv('PGOPTIONS')?.trim();
+      poolConfig.options = inherited ? `${inherited} ${searchPath}` : searchPath;
+    }
 
-    // Test connection
-    const client = await this.pool.connect();
-    client.release();
+    return poolConfig;
   }
 
+  /** Puts the adapter's error listener on `pool`: `onError`, or the warning on a pool it owns. */
+  private listenOn(pool: PostgresPoolLike): void {
+    const listener = this.options.onError ?? (this.ownsPool ? warnOfIdleError : null);
+    if (!listener || typeof pool.on !== 'function' || this.listening?.pool === pool) return;
+    pool.on('error', listener);
+    this.listening = { pool, listener };
+  }
+
+  /** The runner of statements outside a transaction. */
+  private readonly query: QueryRunner = (text, values) => {
+    const pool = this.requirePool();
+    return this.segmentStatements ? this.segmentStatements.onPool(pool, text, values) : pool.query(text, values);
+  };
+
   public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
-    const executor = await this.getExecutor();
-    return runWithExecutor(executor, statement, parameters);
+    return runWith(this.query, statement, parameters);
   }
 
   public async get<T>(statement: string, parameters?: StorageParameters): Promise<T | null> {
-    const executor = await this.getExecutor();
-    return getWithExecutor<T>(executor, statement, parameters);
+    return getWith<T>(this.query, statement, parameters);
   }
 
   public async all<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
-    const executor = await this.getExecutor();
-    return allWithExecutor<T>(executor, statement, parameters);
+    return allWith<T>(this.query, statement, parameters);
   }
 
   public async exec(script: string): Promise<void> {
-    const executor = await this.getExecutor();
-    await execWithExecutor(executor, script);
+    await execWith(this.query, script);
   }
 
   public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
-    if (!this.pool) {
-      throw new Error('Postgres adapter not opened.');
-    }
-    const client = await this.pool.connect();
+    const client = await this.requirePool().connect();
     try {
       await client.query('BEGIN');
-      const transactionAdapter = new PostgresTransactionAdapter(client, this.capabilities);
+      const transactionAdapter = new PostgresTransactionAdapter(client, this.capabilities, this.segmentStatements);
       const result = await fn(transactionAdapter);
       await client.query('COMMIT');
       return result;
@@ -430,14 +873,45 @@ export class PostgresAdapter implements StorageAdapter {
     }
   }
 
-  public async close(): Promise<void> {
-    if (this.pool) {
-      await this.pool.end();
-      this.pool = null;
+  /**
+   * Closes the adapter. A pool the adapter made or owns is ended, once; a pool
+   * of its caller's that it does not own is left open, with the adapter's
+   * listener taken off it. A call made while a close is running waits for it.
+   */
+  public close(): Promise<void> {
+    if (!this.closing) {
+      this.closing = this.closeNow().finally(() => {
+        this.closing = null;
+      });
+    }
+    return this.closing;
+  }
+
+  private async closeNow(): Promise<void> {
+    if (this.opening) {
+      await this.opening.catch(() => undefined);
+    }
+    const pool = this.pool;
+    this.pool = null;
+    if (!pool) {
+      return;
+    }
+    const listening = this.listening?.pool === pool ? this.listening : null;
+    this.listening = null;
+    if (this.ownsPool) {
+      // The listener stays on: a connection the pool lets go can still report
+      // its end after end() has resolved.
+      if (!hasEnded(pool)) {
+        await pool.end();
+      }
+      return;
+    }
+    if (listening && typeof pool.removeListener === 'function') {
+      pool.removeListener('error', listening.listener);
     }
   }
 
-  private async getExecutor(): Promise<Pool | PoolClient> {
+  private requirePool(): PostgresPoolLike {
     if (!this.pool) {
       throw new Error('Postgres adapter not opened.');
     }

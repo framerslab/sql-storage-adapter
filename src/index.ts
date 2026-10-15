@@ -31,6 +31,10 @@ export * from './features/sync/syncManager';
 
 // Shared utilities -----------------------------------------------------------
 export * from './shared/parameterUtils';
+export { segmentFilePath, segmentName, validateSegment } from './shared/segment';
+
+// Note: the key-value store is available via a separate entry point, which loads no adapter.
+// Usage: import { createSqlKeyValueStore, openIndexedDbStore } from '@framers/sql-storage-adapter/kv';
 
 // Dialect & feature abstractions -----------------------------------------------
 export { SqliteDialect } from './dialects/SqliteDialect';

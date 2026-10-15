@@ -8,8 +8,17 @@ import {
   createSerializedTransactionRunner,
   createSharedConnectionTransactionAdapter,
 } from '../shared/serializedTransaction';
+import { namesInMemoryDatabase, segmentFilePath, validateSegment } from '../shared/segment';
 
-type SqlJsAdapterOptions = SqlJsConfig;
+/** sql.js's own configuration (`locateFile` and the rest), and the adapter's segment. */
+export type SqlJsAdapterOptions = SqlJsConfig & {
+  /**
+   * A database file of its own: the segment goes into the name of the file
+   * `open({ filePath })` names, before its extension (`app.sqlite3` becomes
+   * `app-agentos.sqlite3`). An in-memory database is its own already.
+   */
+  segment?: string;
+};
 
 const expandNamedParameters = (named: Record<string, unknown>): Record<string, unknown> => {
   const expanded: Record<string, unknown> = { ...named };
@@ -74,8 +83,13 @@ export class SqlJsAdapter implements StorageAdapter {
    * managed). One source of truth for the in-tx flag.
    */
   private transactionDepth = 0;
+  private readonly sqlJsConfig: SqlJsConfig;
+  private readonly segment: string | undefined;
 
-  constructor(private readonly adapterOptions: SqlJsAdapterOptions = {}) {
+  constructor(adapterOptions: SqlJsAdapterOptions = {}) {
+    const { segment, ...sqlJsConfig } = adapterOptions;
+    this.segment = segment === undefined ? undefined : validateSegment(segment);
+    this.sqlJsConfig = sqlJsConfig;
     const caps: StorageCapability[] = ['transactions', 'json', 'prepared'];
     if (hasFsAccess()) {
       caps.push('persistence');
@@ -88,8 +102,11 @@ export class SqlJsAdapter implements StorageAdapter {
       return;
     }
 
-    this.SQL = await initSqlJs(this.adapterOptions);
-    this.filePath = options?.filePath;
+    this.SQL = await initSqlJs(this.sqlJsConfig);
+    // ':memory:' names a database of the connection alone: no file holds it.
+    const requested = options?.filePath;
+    this.filePath =
+      requested === undefined || namesInMemoryDatabase(requested) ? undefined : segmentFilePath(requested, this.segment);
 
     if (this.filePath && hasFsAccess() && fs.existsSync(this.filePath)) {
       const buffer = fs.readFileSync(this.filePath);
@@ -287,6 +304,12 @@ export class SqlJsAdapter implements StorageAdapter {
   }
 }
 
+/**
+ * Creates a sql.js adapter. `open({ filePath })` loads the database from that
+ * file and saves it there; with `segment`, from a file of the segment's own.
+ *
+ * @throws {Error} When `segment` is not a name a segment can take.
+ */
 export const createSqlJsAdapter = (options?: SqlJsAdapterOptions): StorageAdapter => new SqlJsAdapter(options);
 
 /**

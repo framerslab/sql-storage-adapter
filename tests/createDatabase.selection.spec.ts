@@ -1,7 +1,7 @@
 import { describe, expect, it, afterEach, vi } from 'vitest';
 import type { StorageAdapter } from '../src/core/contracts';
 import type { StorageResolutionOptions } from '../src/core/resolver';
-import { connectDatabase, createDatabase } from '../src/core/database';
+import { connectDatabase, createDatabase, createMemoryDatabase } from '../src/core/database';
 
 // createDatabase() chooses the adapter priority and hands it to the resolver.
 // These specs read what it hands over: the resolver is a stub here, so no
@@ -65,6 +65,24 @@ describe('createDatabase - adapter priority', () => {
 
     await createDatabase();
     expect(last().priority).toEqual(['indexeddb', 'sqljs']);
+  });
+
+  it('keeps an in-memory database in memory in a browser, which IndexedDB would keep', async () => {
+    vi.stubGlobal('window', { document: {} });
+
+    await createDatabase({ file: ':memory:' });
+    expect(last().priority).toEqual(['sqljs']);
+
+    await createMemoryDatabase();
+    expect(last().priority).toEqual(['sqljs']);
+  });
+
+  it('chooses the native SQLite plugin, then IndexedDB, in a Capacitor app, as the resolver does', async () => {
+    vi.stubGlobal('window', { document: {}, Capacitor: { isNativePlatform: () => true } });
+
+    await createDatabase();
+
+    expect(last().priority).toEqual(['capacitor', 'indexeddb', 'sqljs']);
   });
 
   it('hands the IndexedDB options and the segment to the resolver in a browser', async () => {
