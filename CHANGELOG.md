@@ -20,6 +20,7 @@
 ### Fixed
 - `exportData()` on PostgreSQL exports the tables of the current schema, the segment's on a segmented adapter, and reads each table's columns from that schema alone, in their order. It listed `public`'s tables, and read the columns of every table of that name in any schema.
 - IndexedDB adapter: a save keeps the connection settings a caller made (`PRAGMA foreign_keys = ON` and the rest). sql.js's `export()`, which every save runs, closes the connection and opens it again, which reset them. A write made through `all()` or `get()` outside a transaction is saved, and `importDatabase()` refuses bytes that are not a SQLite database, keeping the database it had.
+- Electron main adapter: `run()` resolves with its result. It threw a `TypeError` after every write while multi-window broadcasting was on, the default: three of the patterns that find the statement's tables for the broadcast lacked the global flag `matchAll()` needs.
 - sql.js adapter: `open({ filePath: ':memory:' })` keeps the database in memory. It wrote it to a file named `:memory:` in the working directory, which every such adapter then shared.
 - The `createDatabase()` documentation and the remote-connection guide said that `createDatabase()` with no options opens PostgreSQL when `DATABASE_URL` is set. It opens the local default; pass `url: process.env.DATABASE_URL`. The README's cloud example passed `postgres: { connectionString: process.env.DATABASE_URL }`, which opens a local SQLite file when the variable is unset; it passes `url` with `strict` now.
 

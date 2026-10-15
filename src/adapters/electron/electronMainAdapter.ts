@@ -593,11 +593,12 @@ export class ElectronMainAdapter implements StorageAdapter {
    */
   private extractTables(statement: string): string[] {
     const tables: string[] = [];
+    // matchAll() takes global patterns only; it throws for any other.
     const patterns = [
       /FROM\s+([^\s,;(]+)/gi,
-      /INSERT\s+INTO\s+([^\s(]+)/i,
-      /UPDATE\s+([^\s]+)/i,
-      /DELETE\s+FROM\s+([^\s]+)/i,
+      /INSERT\s+INTO\s+([^\s(]+)/gi,
+      /UPDATE\s+([^\s]+)/gi,
+      /DELETE\s+FROM\s+([^\s]+)/gi,
     ];
 
     for (const pattern of patterns) {
