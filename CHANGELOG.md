@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.7.2] - 2026-10-15
 
 ### Added
 - A versioned schema-migration runner: `runSchemaMigrations(adapter, migrations, options)`, `schemaMigrationStatus()` and `readSchemaMigrations(dir, { dialect })`, on PostgreSQL and SQLite.
