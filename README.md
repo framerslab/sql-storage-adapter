@@ -319,7 +319,7 @@ await db.close(); // leaves the pool open; pool.end() is yours
 - `close()` leaves a pool of yours open. Pass `ownsPool: true` when the adapter is the pool's one holder and closing the adapter is how the pool ends: `close()` then ends it once, however often it is called. `open()` after `close()` takes the pool up again, unless it has ended.
 - `onError` is called with the error an idle connection of the pool reports (the server ended it, the network dropped). pg raises such an error as an event that ends the process when nothing listens. On a pool of yours the adapter listens only when given `onError`, and takes its listener off on `close()`; on a pool it makes or owns it listens anyway, and logs a warning when no `onError` was given.
 - `getPool()` returns the pool the adapter runs on: yours, or the one it made, while it is open.
-- The settings that configure a pool when one is made (`connectionString`, `host`, `max`, `ssl`, the timeouts and the rest) and `segment` cannot be given with `pool`: set them on the pool.
+- The settings that configure a pool when one is made (`connectionString`, `host`, `max`, `ssl`, the timeouts, `typeParsers` and the rest) and `segment` cannot be given with `pool`: set them on the pool (`typeParsers` as the pool's own `types`).
 - `createDatabase({ postgres: { pool } })` opens PostgreSQL on it.
 
 A host on 0.6 that wrote its Pool into the adapter's `pool` field before `open()` keeps working: the adapter runs on that Pool and ends it on `close()`, as 0.6 did. Moving to `{ pool }`, such a host passes `ownsPool: true` to keep `close()` ending the Pool.

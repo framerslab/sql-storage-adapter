@@ -96,7 +96,9 @@ export interface PostgresAdapterOptions {
   /**
    * How this pool's connections decode the column types whose pg defaults
    * surprise JavaScript code, through pg's per-client type parsers. Each field
-   * left out keeps pg's default. A value it does not know fails open().
+   * left out keeps pg's default. A value it does not know fails open(). A pool
+   * of the caller's decodes with the `types` it was made with, so this cannot
+   * be given with `pool`.
    */
   typeParsers?: PostgresTypeParsers;
   /**
@@ -221,6 +223,7 @@ const POOL_SETTINGS = [
   'statement_timeout',
   'query_timeout',
   'allowExitOnIdle',
+  'typeParsers',
 ] as const;
 
 /** The isolation levels of PostgreSQL's `BEGIN`. */
@@ -1110,7 +1113,8 @@ export class PostgresAdapter implements StorageAdapter {
       if (settings.length > 0) {
         throw new Error(
           `PostgresAdapter: ${settings.join(', ')} cannot be given with pool: they configure a pool when one is made, ` +
-            'and the pool given was made by its caller. Set them on that pool.',
+            'and the pool given was made by its caller. Set them on that pool' +
+            (settings.includes('typeParsers') ? " (typeParsers through the pool's own types option)." : '.'),
         );
       }
       this.givenPool = given;
