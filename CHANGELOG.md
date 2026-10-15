@@ -16,6 +16,9 @@
 - `insertOrReplace` and `upsert` with every column in the conflict target give `DO NOTHING`. The PostgreSQL dialect gave an empty `DO UPDATE SET`, which PostgreSQL refuses.
 - `SqlDialect` has the members above; a custom implementation of the interface needs them.
 
+### Fixed
+- better-sqlite3 binds a JavaScript integer as an INTEGER. It bound every number as a REAL (`sqlite3_bind_double`), so 7 reached SQL as 7.0: `CAST(? AS TEXT)` gave `'7.0'`, a TEXT column stored `'7.0'`, and a comparison with a JSON element missed. Safe integers now bind as INTEGER, as on sql.js. On sql.js, an integer outside the 32-bit range still binds as a REAL.
+
 ## [0.6.16] - 2026-10-15
 
 ### Added
