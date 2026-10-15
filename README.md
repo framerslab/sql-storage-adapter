@@ -372,34 +372,13 @@ See [**PLATFORM_STRATEGY.md**](./PLATFORM_STRATEGY.md) for a comprehensive guide
 
 ## Performance Tiers & Cost Optimization
 
-The adapter supports configurable performance tiers for different use cases:
+The package exports performance-tier types, the tier presets (`TIER_DEFAULTS`) and `resolvePerformanceConfig()`, which turns a tier and overrides into settings. `createDatabase()` takes no `performance` option, and no adapter applies a tier: a host that wants one reads the settings and acts on them itself.
 
 ```typescript
-import { createDatabase } from '@framers/sql-storage-adapter';
+import { resolvePerformanceConfig } from '@framers/sql-storage-adapter';
 
-// Development: Fast tier - prioritize speed
-const devDb = await createDatabase({
-  type: 'memory',
-  performance: { tier: 'fast' }
-});
-
-// Production: Balanced tier (default)
-const prodDb = await createDatabase({
-  priority: ['indexeddb', 'sqljs'],
-  performance: { tier: 'balanced' }
-});
-
-// Analytics/Reporting: Accurate tier - no caching, full validation
-const analyticsDb = await createDatabase({
-  postgres: { connectionString: process.env.DATABASE_URL },
-  performance: { tier: 'accurate', trackMetrics: true }
-});
-
-// Mobile: Efficient tier - battery optimization
-const mobileDb = await createDatabase({
-  priority: ['capacitor', 'indexeddb'],
-  performance: { tier: 'efficient', batchWrites: true }
-});
+// Analytics/Reporting: the accurate tier's settings (no caching, full validation)
+const settings = resolvePerformanceConfig({ tier: 'accurate' });
 ```
 
 | Tier | Caching | Batching | Validation | Use Case |
@@ -413,10 +392,10 @@ See [**guides/OPTIMIZATION_GUIDE.md**](./guides/OPTIMIZATION_GUIDE.md) for detai
 
 ## Lifecycle Hooks
 
-The adapter provides lifecycle hooks for extending behavior:
+The package exports the `StorageHooks` types and the `combineHooks()` and `filterHooks()` helpers. `createDatabase()` takes no `hooks` option, and no adapter runs hooks: a host that wants them calls them around its own adapter calls.
 
 ```typescript
-import { createDatabase, type StorageHooks } from '@framers/sql-storage-adapter';
+import { combineHooks, type StorageHooks } from '@framers/sql-storage-adapter';
 
 const myHooks: StorageHooks = {
   // Log all writes
@@ -442,10 +421,8 @@ const myHooks: StorageHooks = {
   }
 };
 
-const db = await createDatabase({
-  performance: { tier: 'balanced' },
-  hooks: myHooks
-});
+// One StorageHooks object from several; the host calls its hooks itself
+const hooks = combineHooks(myHooks);
 ```
 
 ### Available Hooks
