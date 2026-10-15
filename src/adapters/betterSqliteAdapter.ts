@@ -15,7 +15,7 @@ const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'u
 
 import type { StorageAdapter, StorageOpenOptions, StorageParameters, StorageRunResult, StorageCapability, BatchOperation, BatchResult } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
-import { toSqliteStatement } from '../shared/sqlPlaceholders';
+import { integersAsBigInt, toSqliteStatement } from '../shared/sqlPlaceholders';
 import {
   createSerializedTransactionRunner,
   createSharedConnectionTransactionAdapter,
@@ -281,6 +281,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
 
   private runNow(statement: string, parameters?: StorageParameters): StorageRunResult {
     ({ statement, parameters } = toSqliteStatement(statement, parameters));
+    parameters = integersAsBigInt(parameters);
     const stmt = this.prepareInternal(statement);
     const { named, positional } = normaliseParameters(parameters);
     const result = named ? stmt.run(named) : stmt.run(positional ?? []);
@@ -289,6 +290,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
 
   private getNow<T>(statement: string, parameters?: StorageParameters): T | null {
     ({ statement, parameters } = toSqliteStatement(statement, parameters));
+    parameters = integersAsBigInt(parameters);
     const stmt = this.prepareInternal(statement);
     const { named, positional } = normaliseParameters(parameters);
     const row = named ? stmt.get(named) : stmt.get(positional ?? []);
@@ -297,6 +299,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
 
   private allNow<T>(statement: string, parameters?: StorageParameters): T[] {
     ({ statement, parameters } = toSqliteStatement(statement, parameters));
+    parameters = integersAsBigInt(parameters);
     const stmt = this.prepareInternal(statement);
     const { named, positional } = normaliseParameters(parameters);
     const rows = named ? stmt.all(named) : stmt.all(positional ?? []);
@@ -399,7 +402,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
         try {
           const prepared = toSqliteStatement(op.statement, op.parameters);
           const stmt = this.prepareInternal(prepared.statement);
-          const { named, positional } = normaliseParameters(prepared.parameters);
+          const { named, positional } = normaliseParameters(integersAsBigInt(prepared.parameters));
           const result = named ? stmt.run(named) : stmt.run(positional ?? []);
           results.push({
             changes: result.changes,

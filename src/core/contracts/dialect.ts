@@ -3,6 +3,10 @@
  *
  * Each method returns a SQL string fragment or full statement.
  * Implementations are pure string transformers — no database calls.
+ *
+ * Expressions and placeholders passed in are inserted as written; numbers,
+ * units, types and JSON paths are checked, so nothing a caller passes as a
+ * value reaches the SQL text unchecked.
  */
 export interface SqlDialect {
   /** Dialect identifier. */
@@ -16,13 +20,31 @@ export interface SqlDialect {
   insertOrIgnore(table: string, columns: string[], placeholders: string[]): string;
 
   /**
-   * Generate an INSERT OR REPLACE (upsert) statement.
-   * SQLite: `INSERT OR REPLACE INTO t (a, b) VALUES (?, ?)`
-   * Postgres: `INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (pk) DO UPDATE SET ...`
+   * Generate an upsert on the primary key that updates the existing row in
+   * place, on both engines:
+   * `INSERT INTO t (a, b) VALUES (?, ?) ON CONFLICT (a) DO UPDATE SET b = excluded.b`.
+   * The row keeps the columns the statement does not name, and its dependents.
+   * When every column is the key, the statement does nothing on a conflict.
    *
-   * @param primaryKey - Required for Postgres ON CONFLICT clause. Defaults to first column.
+   * @param primaryKey - The conflict target. Defaults to the first column.
    */
   insertOrReplace(table: string, columns: string[], placeholders: string[], primaryKey?: string): string;
+
+  /**
+   * An upsert with an explicit conflict target that updates the existing row
+   * in place on both engines (SQLite 3.24 and later):
+   * `INSERT INTO t (a, b, c) VALUES (?, ?, ?) ON CONFLICT (a) DO UPDATE SET b = excluded.b, c = excluded.c`.
+   *
+   * @param conflictColumns - The unique or primary-key columns of the conflict target.
+   * @param updateColumns - The columns to update; by default every column outside the target. None left: DO NOTHING.
+   */
+  upsert(
+    table: string,
+    columns: string[],
+    placeholders: string[],
+    conflictColumns: string[],
+    updateColumns?: string[]
+  ): string;
 
   /**
    * Generate a JSON field extraction expression.
@@ -30,6 +52,20 @@ export interface SqlDialect {
    * Postgres: `(col::jsonb)->>'key'`
    */
   jsonExtract(column: string, jsonPath: string): string;
+
+  /**
+   * A value at `jsonPath` (`$.a.b`, `$.a[0]`) read as text, an integer or a
+   * real, with the same result on both engines; `json` reads the JSON value
+   * itself (jsonb on PostgreSQL, JSON text on SQLite), for use inside another
+   * expression such as jsonArrayContains. A path outside that form is refused.
+   */
+  jsonExtractAs(column: string, jsonPath: string, type: JsonValueType): string;
+
+  /**
+   * Whether the JSON array `jsonArray` holds the value `valueExpr`, compared
+   * as text, so a string or a number matches on both engines.
+   */
+  jsonArrayContains(jsonArray: string, valueExpr: string): string;
 
   /**
    * Generate a null-coalesce expression.
@@ -46,6 +82,15 @@ export interface SqlDialect {
   autoIncrementPrimaryKey(): string;
 
   /**
+   * A column type for DDL. PostgreSQL: TEXT, INTEGER, BIGINT, DOUBLE
+   * PRECISION, BOOLEAN, TIMESTAMPTZ, JSONB, UUID, BYTEA. SQLite: TEXT,
+   * INTEGER, INTEGER, REAL, INTEGER, TEXT, TEXT, TEXT, BLOB. The values a
+   * column returns follow each engine (a PostgreSQL boolean is `true`, a
+   * SQLite one 1); `typeParsers` and the bound-value conversions narrow that.
+   */
+  columnType(kind: ColumnKind): string;
+
+  /**
    * Generate a PRAGMA statement or equivalent.
    * SQLite: `PRAGMA key = value`
    * Postgres: returns null (skip — Postgres enforces FKs by default, etc.)
@@ -58,4 +103,85 @@ export interface SqlDialect {
    * Postgres: `$1`, `$2`, etc.
    */
   placeholder(index: number): string;
+
+  /**
+   * The current time. PostgreSQL: `now()` (timestamptz). SQLite: ISO 8601
+   * UTC text with milliseconds, the form a bound Date takes, so text
+   * comparisons with stored times order correctly.
+   */
+  now(): string;
+
+  /**
+   * `expr` cast to a type both engines read the same way. `timestamp` is
+   * timestamptz on PostgreSQL and ISO 8601 UTC text on SQLite.
+   */
+  cast(expr: string, type: CastType): string;
+
+  /**
+   * The time `expr` moved by `amount` units (negative moves back), as an
+   * exact number of seconds on both engines. PostgreSQL: timestamptz.
+   * SQLite: ISO 8601 UTC text.
+   */
+  addInterval(expr: string, amount: number, unit: IntervalUnit): string;
+
+  /**
+   * The start of the minute, hour, day, month or year that holds `expr`, in
+   * UTC, as ISO 8601 text (`2026-10-15T00:00:00.000Z`) on both engines.
+   */
+  dateBucket(unit: DateBucketUnit, expr: string): string;
+
+  /**
+   * Case-insensitive LIKE. PostgreSQL: ILIKE. SQLite: LIKE, which folds only
+   * ASCII letters.
+   */
+  ilike(expr: string, pattern: string): string;
+
+  /** `expr IN (...)` over the given placeholders or expressions; an empty list matches nothing. */
+  inList(expr: string, items: string[]): string;
+
+  /**
+   * Membership in an array bound as one parameter. PostgreSQL: `= ANY(param)`
+   * (pg binds a JavaScript array as an array). SQLite: `IN (SELECT value
+   * FROM json_each(param))` over the JSON text the array binds as.
+   */
+  inArray(expr: string, arrayParam: string): string;
+
+  /**
+   * A row-lock clause to append to a SELECT. PostgreSQL: ` FOR UPDATE` or
+   * ` FOR SHARE`, with ` SKIP LOCKED` or ` NOWAIT`. SQLite: `''`, since a
+   * write transaction there holds the whole database.
+   */
+  rowLock(mode: 'update' | 'share', wait?: 'wait' | 'skipLocked' | 'noWait'): string;
+
+  /**
+   * A statement that takes a transaction-scoped advisory lock on an integer
+   * key, released at COMMIT or ROLLBACK. PostgreSQL:
+   * `SELECT pg_advisory_xact_lock(key)`. SQLite: null, to skip, since its
+   * write transactions already run one at a time.
+   */
+  advisoryTransactionLock(keyExpr: string): string | null;
+
+  /** The largest of the expressions, NULLs skipped on both engines; NULL when all are. */
+  greatest(...exprs: string[]): string;
+
+  /** The smallest of the expressions, NULLs skipped on both engines; NULL when all are. */
+  least(...exprs: string[]): string;
+
+  /** A random version 4 UUID as text. PostgreSQL: `gen_random_uuid()` (13 and later). SQLite: built from randomblob(). */
+  uuid(): string;
 }
+
+/** The types jsonExtractAs reads. */
+export type JsonValueType = 'text' | 'integer' | 'real' | 'json';
+
+/** The types cast takes. */
+export type CastType = 'text' | 'integer' | 'real' | 'timestamp';
+
+/** The units addInterval takes. Months and years are left out: the engines clamp a month's end differently. */
+export type IntervalUnit = 'seconds' | 'minutes' | 'hours' | 'days';
+
+/** The units dateBucket takes. */
+export type DateBucketUnit = 'minute' | 'hour' | 'day' | 'month' | 'year';
+
+/** The column kinds columnType declares. */
+export type ColumnKind = 'text' | 'integer' | 'bigint' | 'real' | 'boolean' | 'timestamp' | 'json' | 'uuid' | 'blob';

@@ -330,3 +330,25 @@ export const toSqliteStatement = (statement: string, parameters?: StorageParamet
   const rewritten = rewriteDollarPlaceholders(statement, parameters);
   return { statement: rewritten.statement, parameters: toSqliteParameters(rewritten.parameters) };
 };
+
+const isSafeInteger = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value);
+const toBigIntIfInteger = (value: unknown): unknown => (isSafeInteger(value) ? BigInt(value) : value);
+
+/**
+ * better-sqlite3 binds every JavaScript number as a REAL (sqlite3_bind_double),
+ * so 7 reaches SQL as 7.0: `CAST(? AS TEXT)` gives '7.0', a TEXT column
+ * stores '7.0', and a comparison with a JSON element misses. It binds a
+ * BigInt as an INTEGER, so this hands it each safe integer as one. sql.js
+ * binds integers in the 32-bit range as INTEGER already.
+ */
+export const integersAsBigInt = (parameters?: StorageParameters): StorageParameters => {
+  if (parameters == null) return parameters;
+  if (Array.isArray(parameters)) {
+    return parameters.some(isSafeInteger) ? parameters.map(toBigIntIfInteger) : parameters;
+  }
+  if (typeof parameters === 'object') {
+    if (!Object.values(parameters).some(isSafeInteger)) return parameters;
+    return Object.fromEntries(Object.entries(parameters).map(([name, value]) => [name, toBigIntIfInteger(value)]));
+  }
+  return parameters;
+};
