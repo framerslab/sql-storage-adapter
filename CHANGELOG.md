@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.7.1] - 2026-10-15
 
 ### Added
 - `SqlDialect` additions, each returning the same rows on PostgreSQL, better-sqlite3 and sql.js:
