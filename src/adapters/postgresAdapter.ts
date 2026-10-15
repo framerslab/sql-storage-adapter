@@ -299,6 +299,10 @@ const keepRollbackError = (error: unknown, rollbackError: Error): void => {
  */
 const watchClient = (client: PoolClient): { failure: () => Error | undefined; stop: () => void } => {
   let failure: Error | undefined;
+  // A pg-compatible pool whose clients are not event emitters emits nothing to hear.
+  if (typeof client.on !== 'function' || typeof client.removeListener !== 'function') {
+    return { failure: () => undefined, stop: () => undefined };
+  }
   const onError = (error: Error): void => {
     if (!failure) failure = error;
   };
