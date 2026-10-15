@@ -39,3 +39,30 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      # A consumer on --module nodenext reads the packed declarations as an ES
+      # module, where a relative specifier resolves only when it names its file.
+      - name: Type-check a NodeNext consumer of the packed package
+        run: |
+          pack_dir="$RUNNER_TEMP/pack"
+          consumer_dir="$RUNNER_TEMP/nodenext-consumer"
+          mkdir -p "$pack_dir" "$consumer_dir"
+          npm pack --pack-destination "$pack_dir"
+          cd "$consumer_dir"
+          echo '{ "name": "nodenext-consumer", "private": true, "type": "module" }' > package.json
+          npm install --no-audit --no-fund "$pack_dir"/*.tgz
+          cat > index.ts <<'EOF'
+          import {
+            createDatabase,
+            createPostgresAdapter,
+            resolveStorageAdapter,
+            type StorageAdapter,
+          } from '@framers/sql-storage-adapter';
+
+          export const openDefault = (): Promise<StorageAdapter> => createDatabase();
+          export const openResolved = (): Promise<StorageAdapter> => resolveStorageAdapter();
+          export const openPostgres = (url: string): StorageAdapter => createPostgresAdapter(url);
+          EOF
+          tsc="$GITHUB_WORKSPACE/node_modules/.bin/tsc"
+          "$tsc" --version
+          "$tsc" --module nodenext --moduleResolution nodenext --strict --skipLibCheck --noEmit index.ts
