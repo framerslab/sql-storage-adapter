@@ -1,3 +1,21 @@
+## [Unreleased]
+
+### Added
+- `SqlDialect` additions, each returning the same rows on PostgreSQL, better-sqlite3 and sql.js:
+  - `upsert(table, columns, placeholders, conflictColumns, updateColumns?)`: `ON CONFLICT (...) DO UPDATE`, updating the row in place, or `DO NOTHING` when every column is in the conflict target.
+  - `now()`, `addInterval(expr, amount, unit)` in exact seconds, minutes, hours or days, and `dateBucket(unit, expr)` as ISO 8601 UTC text. Times on SQLite are ISO 8601 UTC text with milliseconds, the form a bound Date takes.
+  - `ilike`, `inList` (an empty list matches nothing), `inArray` over one bound array, and `jsonArrayContains`.
+  - `jsonExtractAs(column, path, type)` for text, integer, real or JSON, from a checked path (`$.a.b`, `$.a[0]`).
+  - `rowLock(mode, wait?)` (`FOR UPDATE` and `FOR SHARE`, with `SKIP LOCKED` or `NOWAIT`) and `advisoryTransactionLock(key)`. They give an empty clause and null on SQLite.
+  - `greatest` and `least`, which skip NULLs on SQLite as on PostgreSQL.
+  - `cast(expr, type)` for text, integer, real and timestamp, and `uuid()` (version 4).
+  - `columnType(kind)` for DDL.
+
+### Changed
+- `SqliteDialect.insertOrReplace` updates the existing row in place (`ON CONFLICT (key) DO UPDATE`), as the PostgreSQL dialect does. `INSERT OR REPLACE` deleted the conflicting row first, which fired `ON DELETE` actions on its dependents (a cascade deleted them) and reset the columns the statement did not name. A conflict on a unique column other than the key now fails, where REPLACE deleted that row too.
+- `insertOrReplace` and `upsert` with every column in the conflict target give `DO NOTHING`. The PostgreSQL dialect gave an empty `DO UPDATE SET`, which PostgreSQL refuses.
+- `SqlDialect` has the members above; a custom implementation of the interface needs them.
+
 ## [0.6.16] - 2026-10-15
 
 ### Added

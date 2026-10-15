@@ -536,25 +536,44 @@ const features = createStorageFeatures(adapter);
 
 ### SqlDialect — Cross-Platform SQL
 
+Each form below returns the same rows on PostgreSQL, better-sqlite3 and sql.js; `tests/dialect.parity.spec.ts` runs every one on all three.
+
 ```typescript
-const { dialect } = features;
+const { dialect: d } = features;
 
-// INSERT OR IGNORE (SQLite) → ON CONFLICT DO NOTHING (Postgres)
-const sql = dialect.insertOrIgnore('users', ['id', 'name'], ['?', '?']);
+// Upserts that update the row in place on both engines (ON CONFLICT ... DO UPDATE)
+await db.run(d.upsert('users', ['id', 'email', 'name'], ['?', '?', '?'], ['email']), [1, 'a@x.io', 'Ann']);
+await db.run(d.insertOrReplace('users', ['id', 'name'], ['?', '?'], 'id'), [1, 'Ann']);
+await db.run(d.insertOrIgnore('users', ['id', 'name'], ['?', '?']), [1, 'Ann']);
 
-// INSERT OR REPLACE (SQLite) → ON CONFLICT DO UPDATE (Postgres)
-const upsert = dialect.insertOrReplace('users', ['id', 'name'], ['?', '?'], 'id');
+// Times: now() and arithmetic in exact seconds, buckets as ISO 8601 UTC text
+const recent = `created_at > ${d.addInterval(d.now(), -7, 'days')}`;
+const perDay = `SELECT ${d.dateBucket('day', 'created_at')} AS day, count(*) AS n FROM events GROUP BY 1`;
 
-// json_extract(col, '$.key') (SQLite) → (col::jsonb)->>'key' (Postgres)
-const expr = dialect.jsonExtract('metadata', '$.theme');
+// Matching and membership
+const byName = `${d.ilike('name', '?')}`;                    // ILIKE / LIKE
+const someIds = d.inList('id', ['?', '?']);                  // an empty list matches nothing
+const idsFromArray = d.inArray('id', '?');                   // bind one JavaScript array
+const tagged = d.jsonArrayContains(d.jsonExtractAs('doc', '$.tags', 'json'), '?');
 
-// ifnull(expr, fallback) (SQLite) → COALESCE(expr, fallback) (Postgres)
-const safe = dialect.ifnull(dialect.jsonExtract('config', '$.lang'), "'en'");
+// JSON values with a type, from a checked path
+const count = d.jsonExtractAs('doc', '$.stats.count', 'integer');
 
-// PRAGMA (SQLite) → null/no-op (Postgres)
-const pragma = dialect.pragma('journal_mode', 'WAL');
-if (pragma) await adapter.exec(pragma);
+// Locks: FOR UPDATE ... and pg_advisory_xact_lock on PostgreSQL, nothing on SQLite
+const lock = d.advisoryTransactionLock('?');
+const claim = `SELECT id FROM jobs WHERE state = 'queued' LIMIT 1${d.rowLock('update', 'skipLocked')}`;
+
+// Values and DDL
+const best = d.greatest('a', 'b', 'c');                      // NULLs skipped on both engines
+const asInt = d.cast('?', 'integer');
+const ddl = `CREATE TABLE notes (id ${d.columnType('uuid')} PRIMARY KEY DEFAULT (${d.uuid()}), body ${d.columnType('json')}, at ${d.columnType('timestamp')})`;
 ```
+
+- `insertOrReplace` updates the existing row in place on SQLite as on PostgreSQL. `INSERT OR REPLACE` deletes the conflicting row first, which fires `ON DELETE` actions on its dependents and resets the columns the statement does not name.
+- Times on SQLite are ISO 8601 UTC text with milliseconds (`2026-10-15T12:34:56.789Z`), the form a bound `Date` takes, so text comparisons order correctly; on PostgreSQL they are `timestamptz`. `addInterval` takes seconds, minutes, hours and days, as exact seconds on both engines; months and years are left out because the engines clamp a month's end differently.
+- SQLite's LIKE folds only ASCII letters. `jsonArrayContains` compares elements as text, so strings and numbers match on both engines.
+- Column values follow each engine: a PostgreSQL `BOOLEAN` returns `true` and the SQLite `INTEGER` returns `1`, and a `TIMESTAMPTZ` returns a `Date` where SQLite returns text. `typeParsers` (see "Values") narrows the PostgreSQL side.
+- `pragma()` returns null on PostgreSQL and `advisoryTransactionLock()` returns null on SQLite: skip the statement when it is null.
 
 ### IFullTextSearch — FTS5 & tsvector
 
