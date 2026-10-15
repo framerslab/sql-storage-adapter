@@ -8,7 +8,7 @@ type PgModule = typeof import('pg');
 type PoolConfig = import('pg').PoolConfig;
 
 import type { StorageAdapter, StorageCapability, StorageOpenOptions, StorageParameters, StorageRunResult } from '../core/contracts';
-import { normaliseParameters } from '../shared/parameterUtils';
+import { toPostgresStatement } from '../shared/sqlPlaceholders';
 import { splitSqlStatements } from '../shared/splitSqlStatements';
 import { validateSegment } from '../shared/segment';
 
@@ -224,45 +224,8 @@ const transactionStatus = (client: PostgresPoolClientLike): string | null => {
   return typeof read === 'function' ? read.call(client) : null;
 };
 
-interface PreparedStatement {
-  text: string;
-  values: unknown[];
-}
-
-const isPositional = (statement: string): boolean => statement.includes('?');
-
-const buildNamedStatement = (statement: string, named: Record<string, unknown>): PreparedStatement => {
-  const order: string[] = [];
-  const text = statement.replace(/@([A-Za-z0-9_]+)/g, (_, name: string) => {
-    order.push(name);
-    return `$${order.length}`;
-  });
-  const values = order.map((key) => named[key]);
-  return { text, values };
-};
-
-const buildPositionalStatement = (statement: string, positional: unknown[]): PreparedStatement => {
-  let index = 0;
-  const text = statement.replace(/\?/g, () => {
-    index += 1;
-    return `$${index}`;
-  });
-  return { text, values: positional };
-};
-
-const prepareStatement = (statement: string, parameters?: StorageParameters): PreparedStatement => {
-  const { named, positional } = normaliseParameters(parameters);
-  if (named) {
-    return buildNamedStatement(statement, named);
-  }
-  if (positional) {
-    return buildPositionalStatement(statement, positional);
-  }
-  if (isPositional(statement)) {
-    return buildPositionalStatement(statement, []);
-  }
-  return { text: statement, values: [] };
-};
+/** The statement and values node-postgres receives: see toPostgresStatement. */
+const prepareStatement = toPostgresStatement;
 
 /** Runs one statement's text: on the adapter's pool, or on a transaction's client. */
 type QueryRunner = (text: string, values: unknown[]) => Promise<PostgresQueryResultLike>;

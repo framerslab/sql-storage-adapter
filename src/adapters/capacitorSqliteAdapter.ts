@@ -6,6 +6,7 @@ import type {
   StorageRunResult
 } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
+import { toSqliteStatement } from '../shared/sqlPlaceholders';
 import {
   createSerializedTransactionRunner,
   createSharedConnectionTransactionAdapter,
@@ -257,12 +258,14 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
     parameters: StorageParameters | undefined,
     ownTransaction: boolean,
   ): Promise<StorageRunResult> {
+    ({ statement, parameters } = toSqliteStatement(statement, parameters));
     const conn = this.ensureConnection();
     const { positional } = normaliseParameters(parameters);
     return toRunResult(await conn.run(statement, positional ?? [], ownTransaction));
   }
 
   private async allNow<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
+    ({ statement, parameters } = toSqliteStatement(statement, parameters));
     const conn = this.ensureConnection();
     const { positional } = normaliseParameters(parameters);
     const result = await conn.query(statement, positional ?? []);

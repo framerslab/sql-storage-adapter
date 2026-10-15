@@ -46,3 +46,4 @@ export { BrowserBlobCodec } from './codecs/BrowserBlobCodec';
 export { SqliteFileExporter } from './exporters/SqliteFileExporter';
 export { PostgresExporter } from './exporters/PostgresExporter';
 export { createStorageFeatures } from './core/contracts/features';
+export { isUniqueViolation } from './shared/errors';
