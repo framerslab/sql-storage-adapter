@@ -264,6 +264,41 @@ await db.transaction(async (trx) => {
 
 The IndexedDB, Capacitor and better-sqlite3 adapters run every transaction on one connection, so they run transactions one at a time, and a statement from another caller waits until the open transaction ends: it neither joins the transaction (and vanishes in its rollback) nor reads what the transaction has not committed. A browser or a WebView has no async context to tell the callback's own statements apart, so on the IndexedDB and Capacitor adapters a statement the callback issues through the adapter itself, not through its handle, waits for the transaction too. The two then wait on each other, and the adapter logs a warning after 10 seconds. (On Node, better-sqlite3 tells them apart with `AsyncLocalStorage`.) Inside a callback, run every statement through the handle, and do not await work that itself needs the database.
 
+The PostgreSQL adapter runs each transaction on its own pooled connection, so transactions run side by side. When the connection breaks during a transaction and its ROLLBACK fails too, `transaction()` still throws the transaction's own error (the callback's, or COMMIT's), with the ROLLBACK error on it as a non-enumerable `rollbackError` property. The broken connection is closed, not returned to the pool. A connection the server closes while a callback holds it, between statements, does not end the process. Once a transaction has ended, its handle runs on the pool, as the adapter's own statements do, and its `transaction()` begins a new transaction.
+
+
+### PostgreSQL pool control
+
+`PostgresAdapter` holds a `pg` pool. Narrow an adapter to it with `db instanceof PostgresAdapter` (or `db.kind === 'postgres'`) to reach these:
+
+```typescript
+import { createDatabase, PostgresAdapter } from '@framers/sql-storage-adapter';
+
+const db = await createDatabase({ url: process.env.DATABASE_URL, strict: true, postgres: { max: 10, allowExitOnIdle: true } });
+
+if (db instanceof PostgresAdapter) {
+  // One connection for the callback: a session advisory lock, then statements on the same session
+  await db.withConnection(async (connection) => {
+    await connection.get('SELECT pg_advisory_lock(?)', [42]);
+    try {
+      await connection.run('UPDATE jobs SET owner = ? WHERE owner IS NULL', ['worker-1']);
+    } finally {
+      await connection.get('SELECT pg_advisory_unlock(?)', [42]);
+    }
+  });
+
+  // Isolation level and read-only and deferrable modes
+  await db.transaction(async (trx) => trx.all('SELECT * FROM ledger'), { isolationLevel: 'serializable', readOnly: true, deferrable: true });
+
+  // { total, idle, waiting }, or null before open() and after close()
+  console.log(db.getPoolStats());
+}
+```
+
+- `withConnection(fn)` returns the connection to the pool when `fn` resolves, with whatever session state `fn` left (undo `SET` and release session locks before returning, or use `SET LOCAL` inside a transaction). When `fn` throws, the connection is closed, and `fn`'s error is rethrown. When `fn` returns inside a transaction it began and did not end, the connection is closed (rolling it back) and the call rejects; pg 8.21 and later report the transaction status this needs. The connection refuses statements once `fn` has ended, and `connection.transaction()` runs one transaction at a time.
+- `transaction(fn, options)` refuses an isolation level outside `'read uncommitted'`, `'read committed'`, `'repeatable read'` and `'serializable'` before it checks out a connection.
+- `allowExitOnIdle` is pg's option: Node can exit while every pooled connection is idle. Without it, idle connections keep the process running until `idleTimeoutMillis` (10 seconds by default) closes them.
+
 ### IndexedDB-Specific Config
 
 ```typescript
@@ -337,34 +372,13 @@ See [**PLATFORM_STRATEGY.md**](./PLATFORM_STRATEGY.md) for a comprehensive guide
 
 ## Performance Tiers & Cost Optimization
 
-The adapter supports configurable performance tiers for different use cases:
+The package exports performance-tier types, the tier presets (`TIER_DEFAULTS`) and `resolvePerformanceConfig()`, which turns a tier and overrides into settings. `createDatabase()` takes no `performance` option, and no adapter applies a tier: a host that wants one reads the settings and acts on them itself.
 
 ```typescript
-import { createDatabase } from '@framers/sql-storage-adapter';
+import { resolvePerformanceConfig } from '@framers/sql-storage-adapter';
 
-// Development: Fast tier - prioritize speed
-const devDb = await createDatabase({
-  type: 'memory',
-  performance: { tier: 'fast' }
-});
-
-// Production: Balanced tier (default)
-const prodDb = await createDatabase({
-  priority: ['indexeddb', 'sqljs'],
-  performance: { tier: 'balanced' }
-});
-
-// Analytics/Reporting: Accurate tier - no caching, full validation
-const analyticsDb = await createDatabase({
-  postgres: { connectionString: process.env.DATABASE_URL },
-  performance: { tier: 'accurate', trackMetrics: true }
-});
-
-// Mobile: Efficient tier - battery optimization
-const mobileDb = await createDatabase({
-  priority: ['capacitor', 'indexeddb'],
-  performance: { tier: 'efficient', batchWrites: true }
-});
+// Analytics/Reporting: the accurate tier's settings (no caching, full validation)
+const settings = resolvePerformanceConfig({ tier: 'accurate' });
 ```
 
 | Tier | Caching | Batching | Validation | Use Case |
@@ -378,10 +392,10 @@ See [**guides/OPTIMIZATION_GUIDE.md**](./guides/OPTIMIZATION_GUIDE.md) for detai
 
 ## Lifecycle Hooks
 
-The adapter provides lifecycle hooks for extending behavior:
+The package exports the `StorageHooks` types and the `combineHooks()` and `filterHooks()` helpers. `createDatabase()` takes no `hooks` option, and no adapter runs hooks: a host that wants them calls them around its own adapter calls.
 
 ```typescript
-import { createDatabase, type StorageHooks } from '@framers/sql-storage-adapter';
+import { combineHooks, type StorageHooks } from '@framers/sql-storage-adapter';
 
 const myHooks: StorageHooks = {
   // Log all writes
@@ -407,10 +421,8 @@ const myHooks: StorageHooks = {
   }
 };
 
-const db = await createDatabase({
-  performance: { tier: 'balanced' },
-  hooks: myHooks
-});
+// One StorageHooks object from several; the host calls its hooks itself
+const hooks = combineHooks(myHooks);
 ```
 
 ### Available Hooks
