@@ -12,6 +12,7 @@ type PoolConfig = import('pg').PoolConfig;
 import type { StorageAdapter, StorageCapability, StorageOpenOptions, StorageParameters, StorageRunResult } from '../core/contracts';
 import { toPostgresStatement } from '../shared/sqlPlaceholders';
 import { splitSqlStatements } from '../shared/splitSqlStatements';
+import { getStorageLogger } from '../shared/logger';
 
 /**
  * Configuration options for PostgreSQL adapter.
@@ -312,8 +313,9 @@ const runTransaction = async <T>(
       const failure = asError(rollbackError);
       onBroken(failure);
       keepRollbackError(error, failure);
-      console.warn(
-        `[StorageAdapter] PostgreSQL ROLLBACK failed after a transaction error, so the connection was closed; the transaction's own error is rethrown. ${failure.message}`
+      getStorageLogger().warn(
+        { adapter: 'postgres', error: failure.message },
+        `PostgreSQL ROLLBACK failed after a transaction error, so the connection was closed; the transaction's own error is rethrown. ${failure.message}`
       );
     }
     throw error;
