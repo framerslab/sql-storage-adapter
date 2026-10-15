@@ -20,7 +20,10 @@ import { createElectronMainAdapter } from '../src/adapters/electron/electronMain
 // a database file of its own, on IndexedDB and Capacitor a database name of its
 // own. tests/postgres.segment.spec.ts covers PostgreSQL, where it is a schema.
 
-const { capacitorNames } = vi.hoisted(() => ({ capacitorNames: [] as string[] }));
+const { capacitorNames, ipc } = vi.hoisted(() => ({
+  capacitorNames: [] as string[],
+  ipc: { initialized: [] as unknown[], disposed: 0 },
+}));
 
 // @capacitor-community/sqlite is an optional peer that CI does not install; the
 // adapter loads it in open(), and this stands in for it.
@@ -45,8 +48,12 @@ vi.mock('electron', () => ({
   ipcMain: { handle: () => undefined, removeHandler: () => undefined },
 }));
 vi.mock('../src/adapters/electron/ipc/protocol', () => ({
-  initializeIpcProtocol: () => undefined,
-  disposeIpcProtocol: () => undefined,
+  initializeIpcProtocol: (adapter: unknown) => {
+    ipc.initialized.push(adapter);
+  },
+  disposeIpcProtocol: () => {
+    ipc.disposed += 1;
+  },
 }));
 
 describe('segment names', () => {
@@ -113,6 +120,8 @@ describe('a segment on each adapter', () => {
   beforeEach(() => {
     vi.stubGlobal('indexedDB', new IDBFactory());
     capacitorNames.length = 0;
+    ipc.initialized.length = 0;
+    ipc.disposed = 0;
   });
 
   afterEach(async () => {
@@ -154,6 +163,28 @@ describe('a segment on each adapter', () => {
 
     expect(fs.existsSync(path.join(dir, 'app-agentos.sqlite3'))).toBe(true);
     expect(fs.existsSync(path.join(dir, 'app.sqlite3'))).toBe(false);
+  });
+
+  // ':memory:' is SQLite's name for a database of the connection alone; sql.js
+  // wrote it to a file of that name in the working directory, which every
+  // in-memory instance, of any segment, then shared.
+  it('sql.js keeps an in-memory database in memory and writes no file named :memory:', async () => {
+    const stray = path.join(process.cwd(), ':memory:');
+    try {
+      const first = keep(createSqlJsAdapter({ segment: 'first' }));
+      await first.open({ filePath: ':memory:' });
+      await writeOneRow(first, 'first');
+      await first.close();
+
+      const second = keep(createSqlJsAdapter({ segment: 'second' }));
+      await second.open({ filePath: ':memory:' });
+      await second.exec('CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, label TEXT NOT NULL)');
+
+      expect(await labels(second)).toEqual([]);
+      expect(fs.existsSync(stray)).toBe(false);
+    } finally {
+      fs.rmSync(stray, { force: true });
+    }
   });
 
   it('IndexedDB opens a database of its own', async () => {
@@ -213,6 +244,31 @@ describe('a segment on each adapter', () => {
     expect(adapter.getFilePath()).toBe(path.join(dir, 'app-agentos.db'));
     expect(fs.existsSync(path.join(dir, 'app-agentos.db'))).toBe(true);
     expect(fs.existsSync(path.join(dir, 'app.db'))).toBe(false);
+  });
+
+  // The renderer's IPC channels are one set per process. A main adapter takes
+  // them when it opens and removes them when it closes, so a segmented adapter
+  // opened beside the app's own would take the app's windows over to its
+  // segment, and closing it would cut them off.
+  it('leaves the renderer channels to the Electron main adapter without a segment', async () => {
+    const dir = tempDir();
+    const app = keep(
+      createElectronMainAdapter({ filePath: path.join(dir, 'app.db'), wal: { enabled: false }, recovery: { enabled: false } }),
+    );
+    const segmented = keep(
+      createElectronMainAdapter({
+        filePath: path.join(dir, 'app.db'),
+        segment: 'agentos',
+        wal: { enabled: false },
+        recovery: { enabled: false },
+      }),
+    );
+    await app.open();
+    await segmented.open();
+    await segmented.close();
+
+    expect(ipc.initialized).toEqual([app]);
+    expect(ipc.disposed).toBe(0);
   });
 
   it('refuses a segment name the adapter cannot use, when it is made', () => {
