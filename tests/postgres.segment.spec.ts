@@ -1,6 +1,6 @@
 import { describe, expect, it, afterAll, afterEach, beforeAll, vi } from 'vitest';
 import pg from 'pg';
-import { createDatabase, createPostgresAdapter, exportData, type StorageAdapter } from '../src/index.js';
+import { PostgresAdapter, createDatabase, createPostgresAdapter, exportData, type StorageAdapter } from '../src/index.js';
 
 // A segment on PostgreSQL is a schema of its own: every connection of the
 // adapter's pool starts with search_path set to the segment, then public, so the
@@ -225,6 +225,40 @@ describe.skipIf(!POSTGRES_TEST_URL)('PostgreSQL segments', () => {
       expect(
         await host.all<{ table_schema: string }>(
           "SELECT table_schema FROM information_schema.tables WHERE table_name = 'after_extension'",
+        ),
+      ).toEqual([{ table_schema: segment }]);
+    });
+
+    // withConnection() hands its callback one connection: the statement runs
+    // in a transaction of its own outside the callback's transactions, and
+    // inside one the callback began.
+    it('installs an extension a held connection creates without a schema into public, outside a transaction and inside one', async () => {
+      const segment = unique('seg');
+      const adapter = new PostgresAdapter({ connectionString: freshUrl, segment });
+      freshAdapters.push(adapter);
+      await adapter.open();
+
+      const schemas = await adapter.withConnection(async (connection) => {
+        const schema = async (): Promise<string | undefined> =>
+          (await connection.get<{ schema: string }>('SELECT current_schema() AS schema'))?.schema;
+        const seen = [await schema()];
+        await connection.exec('CREATE EXTENSION IF NOT EXISTS isn');
+        seen.push(await schema());
+        await connection.run('BEGIN');
+        await connection.exec('CREATE EXTENSION IF NOT EXISTS ltree');
+        await connection.exec('CREATE TABLE held_rows (id INTEGER PRIMARY KEY, path ltree)');
+        await connection.run('COMMIT');
+        seen.push(await schema());
+        return seen;
+      });
+
+      expect(schemas).toEqual([segment, segment, segment]);
+      const host = await freshAdapter();
+      expect(await extensionSchema(host, 'isn')).toBe('public');
+      expect(await extensionSchema(host, 'ltree')).toBe('public');
+      expect(
+        await host.all<{ table_schema: string }>(
+          "SELECT table_schema FROM information_schema.tables WHERE table_name = 'held_rows'",
         ),
       ).toEqual([{ table_schema: segment }]);
     });

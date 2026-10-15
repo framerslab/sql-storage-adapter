@@ -199,6 +199,21 @@ describe.skipIf(!POSTGRES_TEST_URL)('PostgresAdapter and a pool of its caller', 
     try {
       expect(() => createPostgresAdapter({ pool, connectionString: url })).toThrow(/connectionString/);
       expect(() => createPostgresAdapter({ pool, max: 5, statement_timeout: 1000 })).toThrow(/max, statement_timeout/);
+      expect(() => createPostgresAdapter({ pool, allowExitOnIdle: true })).toThrow(/allowExitOnIdle/);
+    } finally {
+      await pool.end();
+    }
+  });
+
+  it('counts the connections of a pool of its caller, and none once closed', async () => {
+    const pool = new pg.Pool({ connectionString: url, max: 1 });
+    try {
+      const adapter = new PostgresAdapter({ pool });
+      await adapter.get('SELECT 1 AS one');
+      expect(adapter.getPoolStats()).toEqual({ total: 1, idle: 1, waiting: 0 });
+
+      await adapter.close();
+      expect(adapter.getPoolStats()).toBeNull();
     } finally {
       await pool.end();
     }
