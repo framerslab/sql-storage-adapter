@@ -207,10 +207,11 @@ async function getTables(adapter: StorageAdapter): Promise<string[]> {
     );
     return rows.map(r => r.name);
   } catch {
-    // Try PostgreSQL
+    // Try PostgreSQL: the tables of the schema unqualified names are created
+    // in, which is the segment on a segmented adapter and public otherwise.
     try {
       const rows = await adapter.all<{ name: string }>(
-        `SELECT tablename AS name FROM pg_tables WHERE schemaname = 'public'`
+        `SELECT tablename AS name FROM pg_tables WHERE schemaname = current_schema() ORDER BY tablename`
       );
       return rows.map(r => r.name);
     } catch {
@@ -242,7 +243,8 @@ async function getTableSchema(adapter: StorageAdapter, table: string): Promise<T
       })),
     };
   } catch {
-    // Try PostgreSQL information_schema
+    // Try PostgreSQL information_schema: the columns of the table in the
+    // current schema alone, in their order, not of every table of that name.
     try {
       const columns = await adapter.all<{
         column_name: string;
@@ -250,9 +252,10 @@ async function getTableSchema(adapter: StorageAdapter, table: string): Promise<T
         is_nullable: string;
         column_default: string | null;
       }>(
-        `SELECT column_name, data_type, is_nullable, column_default 
-         FROM information_schema.columns 
-         WHERE table_name = $1`,
+        `SELECT column_name, data_type, is_nullable, column_default
+         FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = $1
+         ORDER BY ordinal_position`,
         [table]
       );
 

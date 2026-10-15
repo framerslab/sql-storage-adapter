@@ -10,6 +10,7 @@
 import { StorageResolutionError, type StorageAdapter } from './contracts';
 import { resolveStorageAdapter, type StorageResolutionOptions, type AdapterKind } from './resolver';
 import { hasPostgresConnection, namesPostgresServer } from '../shared/postgresTarget';
+import { namesInMemoryDatabase } from '../shared/segment';
 import type { PostgresAdapterOptions } from '../adapters/postgresAdapter';
 import type { CapacitorAdapterOptions } from '../adapters/capacitorSqliteAdapter';
 import type { IndexedDbAdapterOptions } from '../adapters/indexedDbAdapter';
@@ -48,14 +49,14 @@ export interface DatabaseOptions {
   
   /**
    * PostgreSQL-specific configuration, passed on to the Postgres adapter whole.
-   * When it names a server (a `postgres://` or `postgresql://` connection
-   * string, or a host, database or user), PostgreSQL is used on Node, with no
-   * fallback to SQLite, unless `priority` or `type` says otherwise.
-   * `{ connectionString: process.env.DATABASE_URL }` with DATABASE_URL unset,
-   * or set to a URL of another scheme, names none, and the local default is
-   * used. To open PostgreSQL from another form of connection string (a
-   * `socket:` URL, a socket path), pass `type: 'postgres'` or use
-   * `connectDatabase()`.
+   * When it names a server (a pool of the caller's, a `postgres://` or
+   * `postgresql://` connection string, or a host, database or user),
+   * PostgreSQL is used on Node, with no fallback to SQLite, unless `priority`
+   * or `type` says otherwise. `{ connectionString: process.env.DATABASE_URL }`
+   * with DATABASE_URL unset, or set to a URL of another scheme, names none,
+   * and the local default is used. To open PostgreSQL from another form of
+   * connection string (a `socket:` URL, a socket path), pass
+   * `type: 'postgres'` or use `connectDatabase()`.
    */
   postgres?: PostgresAdapterOptions;
   
@@ -66,7 +67,8 @@ export interface DatabaseOptions {
   mobile?: CapacitorAdapterOptions;
 
   /**
-   * IndexedDB configuration for browser-native persistence.
+   * IndexedDB configuration for browser-native persistence, passed on to the
+   * IndexedDB adapter whole (`durability`, `crossTab` and the rest).
    * Uses sql.js (WASM) for SQL execution + IndexedDB for storage.
    *
    * @example
@@ -100,9 +102,10 @@ export interface DatabaseOptions {
    * Strict resolution, for servers: no local database stands in for a
    * Postgres the options configure. Default: false.
    *
-   * - A `url` or `postgres` option that names no server (no `postgres://` or
-   *   `postgresql://` connection string, and no host, database or user) fails
-   *   on Node instead of opening the local default, unless `file` is given.
+   * - A `url` or `postgres` option that names no server (no pool, no
+   *   `postgres://` or `postgresql://` connection string, and no host,
+   *   database or user) fails on Node instead of opening the local default,
+   *   unless `file` is given.
    * - A postgres candidate that fails ends resolution with an error, whatever
    *   `priority` lists after it.
    *
@@ -122,11 +125,32 @@ export interface DatabaseOptions {
   foreignKeys?: boolean;
 
   /**
+   * Keeps this database's tables apart from other users of the same database:
+   * a schema of its own on PostgreSQL, a file with the segment in its name on
+   * SQLite, a database name with the segment appended on IndexedDB and
+   * Capacitor. See `StorageResolutionOptions.segment`.
+   *
+   * @example
+   * ```typescript
+   * // AgentOS's tables beside the app's, in one PostgreSQL database
+   * const agentos = await createDatabase({ url: process.env.DATABASE_URL, segment: 'agentos' });
+   * ```
+   */
+  segment?: string;
+
+  /**
    * The logger for this call's resolver lines (pino's fits). Default: the one
    * `setStorageLogger()` set, else the console.
    */
   logger?: StorageLogger;
 }
+
+/** Whether this runs in a Capacitor app on a phone, where the native SQLite plugin keeps the database. */
+const isCapacitorNative = (): boolean => {
+  const scope = globalThis as unknown as { window?: { Capacitor?: { isNativePlatform?: () => boolean } } };
+  const capacitor = scope.window?.Capacitor;
+  return Boolean(capacitor?.isNativePlatform?.());
+};
 
 /**
  * Create a database connection.
@@ -134,8 +158,8 @@ export interface DatabaseOptions {
  * 
  * @example
  * ```typescript
- * // The local default: better-sqlite3 (sql.js without it) on Node, sql.js in a
- * // browser. DATABASE_URL in the environment does not change it.
+ * // The local default: better-sqlite3 (sql.js without it) on Node, IndexedDB in
+ * // a browser. DATABASE_URL in the environment does not change it.
  * const db = await createDatabase();
  *
  * // PostgreSQL from DATABASE_URL on a server; strict fails when it is unset
@@ -169,7 +193,12 @@ export interface DatabaseOptions {
  * 1. Explicit `options.priority` (caller-specified) wins entirely.
  * 2. Explicit `options.type` is mapped to a single adapter priority.
  * 3. Otherwise we auto-detect environment:
- *    - Browser / Deno: ['sqljs']
+ *    - Browser: ['indexeddb', 'sqljs']: the database is kept in IndexedDB,
+ *      with in-memory sql.js where IndexedDB cannot open. `file: ':memory:'`
+ *      (`createMemoryDatabase()`) keeps ['sqljs'], in memory.
+ *    - A Capacitor app on a phone: ['capacitor', 'indexeddb', 'sqljs'], as
+ *      the resolver chooses.
+ *    - Deno: ['sqljs']
  *    - Node.js with a `postgres://` or `postgresql://` URL, or Postgres
  *      options that name a server: ['postgres']. There is no fallback to
  *      SQLite: data meant for Postgres would land in a local file. A URL of
@@ -218,6 +247,10 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
     resolverOptions.indexedDb = options.indexedDb;
   }
 
+  if (options.segment !== undefined) {
+    resolverOptions.segment = options.segment;
+  }
+
   // Handle explicit type (maps to a canonical adapter kind)
   if (options.type) {
     const typeMap: Record<NonNullable<DatabaseOptions['type']>, AdapterKind> = {
@@ -252,8 +285,19 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
 
   // Auto-detect environment ONLY if no priority already set
   if (!resolverOptions.priority || resolverOptions.priority.length === 0) {
-    if (isBrowser || isDeno) {
-      // A browser cannot reach PostgreSQL, so a URL here changes nothing.
+    if (isBrowser && options.file !== undefined && namesInMemoryDatabase(options.file)) {
+      // ':memory:' asks for a database of the connection alone, which
+      // IndexedDB would keep: sql.js holds it in memory.
+      resolverOptions.priority = ['sqljs'];
+    } else if (isBrowser && isCapacitorNative()) {
+      // A Capacitor app keeps its database in the native SQLite plugin, as
+      // the resolver chooses; IndexedDB where the plugin cannot open.
+      resolverOptions.priority = ['capacitor', 'indexeddb', 'sqljs'];
+    } else if (isBrowser) {
+      // A browser cannot reach PostgreSQL, so a URL here changes nothing. The
+      // database is kept in IndexedDB; sql.js in memory where it cannot open.
+      resolverOptions.priority = ['indexeddb', 'sqljs'];
+    } else if (isDeno) {
       resolverOptions.priority = ['sqljs'];
     } else if (isNode && namesPostgresServer(resolverOptions.postgres)) {
       resolverOptions.priority = ['postgres'];
@@ -284,8 +328,8 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
  * string pg reads is accepted (a `postgres://` or `postgresql://` URL, a
  * `socket:` URL, a socket path).
  *
- * @throws Error when the configuration names no server: an empty or unset
- *   connection string and no host, database or user, as
+ * @throws Error when the configuration names no server: no pool, an empty or
+ *   unset connection string, and no host, database or user, as
  *   `connectDatabase(process.env.DATABASE_URL)` gives with DATABASE_URL unset.
  *   Nothing is opened then; the call does not read DATABASE_URL on its own.
  *
@@ -313,7 +357,7 @@ export async function connectDatabase(
   if (!hasPostgresConnection(postgres)) {
     throw new Error(
       'connectDatabase() was given no PostgreSQL server to connect to: pass a connection string, or options with ' +
-        'a connectionString, host, database or user. An unset DATABASE_URL gives an empty connection string.',
+        'a pool, connectionString, host, database or user. An unset DATABASE_URL gives an empty connection string.',
     );
   }
   return createDatabase({ postgres, priority: ['postgres'] });

@@ -14,9 +14,9 @@ describe('SqliteDialect', () => {
       .toBe('INSERT OR IGNORE INTO brain_meta (key, value) VALUES (?, ?)');
   });
 
-  it('insertOrReplace returns INSERT OR REPLACE', () => {
+  it('insertOrReplace updates the row in place instead of INSERT OR REPLACE, which deletes it first', () => {
     expect(d.insertOrReplace('brain_meta', ['key', 'value'], ['?', '?']))
-      .toBe('INSERT OR REPLACE INTO brain_meta (key, value) VALUES (?, ?)');
+      .toBe('INSERT INTO brain_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value');
   });
 
   it('jsonExtract returns json_extract()', () => {

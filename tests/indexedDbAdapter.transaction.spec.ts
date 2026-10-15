@@ -600,9 +600,10 @@ describe('IndexedDbAdapter transactions and saving', () => {
         const adapter = await openWithItems('overlap');
         await adapter.run('INSERT INTO items (label) VALUES (?)', ['older']);
 
+        // Each save puts the image and its version stamp; count the images.
         let puts = 0;
         IDBObjectStore.prototype.put = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['put']>) {
-          puts += 1;
+          if (args[1] === 'db') puts += 1;
           return originalPut.apply(this, args);
         };
         // The tick's save finds the object store gone once, as when another tab

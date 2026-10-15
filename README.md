@@ -30,6 +30,9 @@ The SQL Storage Adapter provides a single, ergonomic interface over SQLite (nati
 - [Electron Adapter](#electron-adapter)
 - [Cross-Platform Sync](#cross-platform-sync)
 - [Configuration & Resolution](#configuration--resolution)
+- [Segments](#segments)
+- [A PostgreSQL Pool of Your Own](#a-postgresql-pool-of-your-own)
+- [Key-Value Store](#key-value-store)
 - [Platform Strategy](#platform-strategy)
 - [SQL Dialect & Feature Abstractions](#sql-dialect--feature-abstractions)
 - [CI, Releases, and Badges](#ci-releases-and-badges)
@@ -246,9 +249,10 @@ await sync.connect();
   - runtime hints (Capacitor detection, browser globals, IndexedDB availability).
 - Adapters are attempted in priority order until one opens successfully; a `StorageResolutionError` includes the full failure chain.
 - The resolver builds `postgres`, `better-sqlite3`, `capacitor`, `indexeddb` and `sqljs`, and builds sql.js for `memory`. Any other kind (`electron-main`, `electron-renderer`, `supabase`, or an unknown name, from `priority` or `STORAGE_ADAPTER`) fails as a candidate with an error that names it, and the next candidate is tried.
-- On Node, `createDatabase({ url })` and `createDatabase({ postgres })` open PostgreSQL when the options name a server: a `postgres://` or `postgresql://` URL or connection string, or a host, database or user. Every Postgres option (pool size, SSL, timeouts, application name, or host, port, database, user and password without a connection string) is passed on, and there is no fallback to SQLite. A connection string of another scheme names no server (`file:./dev.db`, which `DATABASE_URL` holds in a project that runs SQLite through Prisma, or `sqlite:...`), and neither does an empty or unset one: the local default opens, or, with `strict`, the call fails. For a `socket:` URL or a socket path, pass `type: 'postgres'` or use `connectDatabase()`. In a browser and on Deno, `createDatabase()` opens sql.js whatever the options say. `DATABASE_URL` in the environment does not change what `createDatabase()` picks; `resolveStorageAdapter()` without a `priority` tries Postgres first when it is set.
-- **Behaviour change in 0.6.14, a patch release:** through 0.6.13, `createDatabase({ url })` and `createDatabase({ postgres: { connectionString } })` with no `priority` or `type` opened the SQLite file `db_data/app.sqlite3` under the working directory on Node, whatever the URL said; since 0.6.14 they open PostgreSQL. A caller whose data is in that file passes `priority: ['better-sqlite3', 'sqljs']` or `type: 'sqlite'` to keep opening it.
-- `connectDatabase()` opens PostgreSQL alone, in every runtime, from any connection string pg reads or from options with a host, database or user; a server it cannot reach fails the call. Given no server, as `connectDatabase(process.env.DATABASE_URL)` is with the variable unset, it throws before it opens anything. It does not read `DATABASE_URL` on its own.
+- On Node, `createDatabase({ url })` and `createDatabase({ postgres })` open PostgreSQL when the options name a server: a `pool` of your own, a `postgres://` or `postgresql://` URL or connection string, or a host, database or user. Every Postgres option (pool size, SSL, timeouts, application name, or host, port, database, user and password without a connection string) is passed on, and there is no fallback to SQLite. A connection string of another scheme names no server (`file:./dev.db`, which `DATABASE_URL` holds in a project that runs SQLite through Prisma, or `sqlite:...`), and neither does an empty or unset one: the local default opens, or, with `strict`, the call fails. For a `socket:` URL or a socket path, pass `type: 'postgres'` or use `connectDatabase()`. `DATABASE_URL` in the environment does not change what `createDatabase()` picks; `resolveStorageAdapter()` without a `priority` tries Postgres first when it is set.
+- In a browser, `createDatabase()` keeps the database in IndexedDB (`['indexeddb', 'sqljs']`, sql.js in memory where IndexedDB cannot open), whatever the Postgres options say; `createDatabase({ file: ':memory:' })` and `createMemoryDatabase()` keep sql.js in memory. In a Capacitor app on a phone it chooses `['capacitor', 'indexeddb', 'sqljs']`, as the resolver does. On Deno it opens sql.js. `indexedDb` options (`dbName`, `durability`, `crossTab` and the rest) reach the IndexedDB adapter whole.
+- **Behaviour change in 0.6.14, a patch release:** through 0.6.13, `createDatabase({ url })` and `createDatabase({ postgres: { connectionString } })` with no `priority` or `type` opened the SQLite file `db_data/app.sqlite3` under the working directory on Node, whatever the URL said. Since 0.6.14 a `postgres://` or `postgresql://` URL opens PostgreSQL, with no fallback to that file. A caller whose data is in that file passes `priority: ['better-sqlite3', 'sqljs']` or `type: 'sqlite'` to keep opening it. From 0.6.14 to 0.7.1 a URL of any other scheme (`file:./dev.db`) chose PostgreSQL too and failed at start; since 0.7.2 it opens the local default again.
+- `connectDatabase()` opens PostgreSQL alone, in every runtime, from any connection string pg reads, from a `pool` of your own, or from options with a host, database or user; a server it cannot reach fails the call. Given no server, as `connectDatabase(process.env.DATABASE_URL)` is with the variable unset, it throws before it opens anything. It does not read `DATABASE_URL` on its own.
 - `strict: true` (on `createDatabase` and `resolveStorageAdapter`) is for servers: only the database the options name opens. A postgres candidate that fails ends resolution with a `StorageResolutionError`, whatever `priority` lists after it; with `DATABASE_URL` or Postgres options that name a server and no `priority`, `['postgres']` is the whole list; an explicit file path (`file`, `filePath`) outranks `DATABASE_URL`; and a `url` or `postgres` option that names no server fails instead of opening the local default, unless a file is given. Without `strict`, `resolveStorageAdapter()` falls back from a failed Postgres to better-sqlite3, IndexedDB and sql.js, and `DATABASE_URL` comes before a `filePath`.
 - `foreignKeys` (on `createDatabase`, or in `openOptions` for the resolver and `open()`) sets SQLite's foreign-key enforcement when a SQLite adapter opens: `true` turns it on and `false` off, on better-sqlite3, sql.js, IndexedDB and Capacitor. The setting holds across the sql.js saves, exports and imports, which reopen the connection and reset its PRAGMAs. Left out, each engine keeps its default, and the defaults differ: better-sqlite3 enforces foreign keys (it is built with `SQLITE_DEFAULT_FOREIGN_KEYS=1`, per its [compilation options](https://github.com/WiseLibs/better-sqlite3/blob/v13.0.3/docs/compilation.md)), while sql.js, IndexedDB and Capacitor do not, as SQLite leaves [foreign keys off by default](https://www.sqlite.org/foreignkeys.html#fk_enable). Until a product passes `foreignKeys`, the same schema behaves differently per engine. Pass `foreignKeys: true` for the same behaviour everywhere. PostgreSQL always enforces foreign keys and ignores the option.
 - Provide `priority: ['indexeddb', 'sqljs']` for browser bundles or tests where native modules shouldn't load.
@@ -269,6 +273,58 @@ The IndexedDB, Capacitor and better-sqlite3 adapters run every transaction on on
 
 The PostgreSQL adapter runs each transaction on its own pooled connection, so transactions run side by side. When the connection breaks during a transaction and its ROLLBACK fails too, `transaction()` still throws the transaction's own error (the callback's, or COMMIT's), with the ROLLBACK error on it as a non-enumerable `rollbackError` property. The broken connection is closed, not returned to the pool. A connection the server closes while a callback holds it, between statements, does not end the process. Once a transaction has ended, its handle runs on the pool, as the adapter's own statements do, and its `transaction()` begins a new transaction.
 
+### Segments
+
+A segment keeps one user's tables apart from another's in a database they share: AgentOS's tables beside an app's, in one PostgreSQL database or one browser.
+
+```typescript
+import { createDatabase } from '@framers/sql-storage-adapter';
+
+// The app's own tables, and AgentOS's in a segment of the same database
+const app = await createDatabase({ url: process.env.DATABASE_URL });
+const agentos = await createDatabase({ url: process.env.DATABASE_URL, segment: 'agentos' });
+```
+
+| Backend | What a segment is | `segment: 'agentos'` |
+| --- | --- | --- |
+| PostgreSQL | A schema of its own | Every connection of the pool starts with `search_path` set to `agentos, public`; `open()` creates the schema when it is missing |
+| better-sqlite3, sql.js, Electron | A file of its own | `app.sqlite3` becomes `app-agentos.sqlite3`; `:memory:` stays as it is |
+| IndexedDB | A database of its own | `app-db` becomes `app-db-agentos` |
+| Capacitor | A database of its own | `app` becomes `app-agentos` |
+
+A segment name is lower-case letters, digits and underscores, starts with a letter or an underscore, and has at most 63 characters; it is not `public`, `information_schema` or a name beginning with `pg_`. A name outside that is refused before any adapter is tried. `segment` goes on `createDatabase()`, `resolveStorageAdapter()` and each adapter's own options, and `segmentName()` and `segmentFilePath()` give the name a segment's database or file has.
+
+On PostgreSQL:
+
+- The `search_path` is a startup option of each connection, so a connection the pool opens to replace one the server ended starts in the segment too, and `RESET search_path` and `DISCARD ALL` return to it. `PGOPTIONS` is kept beside it. A connection string that sets its own `options` parameter is refused with a segment, since pg would send it in place of the segment's.
+- `public` stays on the path, so the types, functions and operators of extensions installed there resolve in every segment: pgvector's `vector` and `<->`. A `CREATE EXTENSION` that names no schema installs the extension into `public`, as it would without a segment, instead of into the segment, where no other segment and not the host would find it. When an extension a segment asks for is already installed in another segment's schema, the adapter warns once and names the `ALTER EXTENSION ... SET SCHEMA public` that moves it.
+- A name the segment does not hold falls through to `public`. Create a segment's tables before reading them (`CREATE TABLE IF NOT EXISTS` creates the table in the segment even when `public` has one of that name), and name the schema in a `DROP` or `ALTER` that `public` could also answer.
+- `exportData()` exports the tables of the current schema: the segment's, or `public` without one.
+- A segment cannot run on a pool of your own: the adapter sets `search_path` when it starts a connection, and it does not start the connections of a pool it did not make. `createDatabase()` and `resolveStorageAdapter()` refuse a segment with `postgres.pool` before they try any adapter.
+
+On the Electron main adapter, a segmented adapter serves the main process alone: the renderer's IPC channels are one set per process, and they stay with the adapter without a segment.
+
+### A PostgreSQL Pool of Your Own
+
+The Postgres adapter runs on a `pg` `Pool` you made, from the start, with no `open()` needed:
+
+```typescript
+import pg from 'pg';
+import { PostgresAdapter } from '@framers/sql-storage-adapter';
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
+const db = new PostgresAdapter({ pool, onError: (error) => console.warn('idle connection failed', error) });
+
+await db.close(); // leaves the pool open; pool.end() is yours
+```
+
+- `close()` leaves a pool of yours open. Pass `ownsPool: true` when the adapter is the pool's one holder and closing the adapter is how the pool ends: `close()` then ends it once, however often it is called. `open()` after `close()` takes the pool up again, unless it has ended.
+- `onError` is called with the error an idle connection of the pool reports (the server ended it, the network dropped). pg raises such an error as an event that ends the process when nothing listens. On a pool of yours the adapter listens only when given `onError`, and takes its listener off on `close()`; on a pool it makes or owns it listens anyway, and logs a warning when no `onError` was given.
+- `getPool()` returns the pool the adapter runs on: yours, or the one it made, while it is open.
+- The settings that configure a pool when one is made (`connectionString`, `host`, `max`, `ssl`, the timeouts, `typeParsers` and the rest) and `segment` cannot be given with `pool`: set them on the pool (`typeParsers` as the pool's own `types`).
+- `createDatabase({ postgres: { pool } })` opens PostgreSQL on it.
+
+A host on 0.6 that wrote its Pool into the adapter's `pool` field before `open()` keeps working: the adapter runs on that Pool and ends it on `close()`, as 0.6 did. Moving to `{ pool }`, such a host passes `ownsPool: true` to keep `close()` ending the Pool.
 
 ### Placeholders
 
@@ -380,6 +436,7 @@ if (db instanceof PostgresAdapter) {
 - `withConnection(fn)` returns the connection to the pool when `fn` resolves, with whatever session state `fn` left (undo `SET` and release session locks before returning, or use `SET LOCAL` inside a transaction). When `fn` throws, the connection is closed, and `fn`'s error is rethrown. When `fn` returns inside a transaction it began and did not end, the connection is closed (rolling it back) and the call rejects; pg 8.21 and later report the transaction status this needs. The connection refuses statements once `fn` has ended, and `connection.transaction()` runs one transaction at a time.
 - `transaction(fn, options)` refuses an isolation level outside `'read uncommitted'`, `'read committed'`, `'repeatable read'` and `'serializable'` before it checks out a connection.
 - `allowExitOnIdle` is pg's option: Node can exit while every pooled connection is idle. Without it, idle connections keep the process running until `idleTimeoutMillis` (10 seconds by default) closes them.
+- On a segmented adapter, `withConnection()` and `transaction()` run in the segment, as every connection of its pool does, and a `CREATE EXTENSION` that names no schema still installs into `public`. `getPoolStats()` counts a pool of yours too.
 
 ### IndexedDB-Specific Config
 
@@ -389,11 +446,15 @@ import { IndexedDbAdapter } from '@framers/sql-storage-adapter';
 const adapter = new IndexedDbAdapter({
   dbName: 'my-app-db',       // IndexedDB database name
   storeName: 'sqliteDb',     // Object store name
-  autoSave: true,            // Auto-save to IndexedDB after writes
+  autoSave: true,            // Auto-save to IndexedDB on a timer
   saveIntervalMs: 5000,      // Batch writes every 5s
+  durability: 'commit',      // Or 'interval' (the default): see below
+  crossTab: true,            // Two tabs of the site keep each other's writes
 });
 
 await adapter.open();
+await adapter.run('INSERT INTO notes (text) VALUES (?)', ['kept']); // in IndexedDB when this resolves
+await adapter.flush();                                              // stores every write made so far
 ```
 
 **Key Features:**
@@ -402,7 +463,13 @@ await adapter.open();
 - ✅ JSON support (SQLite JSON1 extension: json_extract, json_object, json_array, etc.)
 - ✅ Prepared statements for performance and security
 - ✅ Export/import (Uint8Array SQLite file format)
-- ✅ Auto-save with batching (reduce IDB overhead)
+- ✅ Auto-save with batching (reduce IDB overhead), or each write stored before it resolves (`durability: 'commit'`)
+- ✅ Several tabs on one database (`crossTab`)
+- ✅ A database of its own per segment (`segment`)
+
+**Durability.** With `durability: 'interval'`, the default, the auto-save tick stores the writes made since the last save every `saveIntervalMs`, and a write can be lost when the page goes before the next tick. With `durability: 'commit'`, `run()`, `exec()`, a write through `all()` or `get()` (`INSERT ... RETURNING`), `transaction()` and `importDatabase()` resolve once their write is in IndexedDB, committed there (the IndexedDB transaction's `complete` event, not the put request's success), and reject when IndexedDB refuses or aborts it; the write stays in the database and the next save stores it. Each save writes the whole database image, so batch many writes in one `transaction()`. While a transaction begun with `BEGIN` is open nothing can be saved: its statements resolve at once, and its rows are stored when its `COMMIT` resolves. `flush()` stores every write made so far in either mode: it waits for an open `transaction()`, and rejects while a transaction begun with `BEGIN` is open, which sql.js's export would end.
+
+**Several tabs.** Each tab holds the whole database in memory and writes it back whole, so without coordination the tab that saves last overwrites the other's writes. With `crossTab`, every statement and transaction runs under a [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) on the database, on the newest stored image (a tab reloads it when a version stamp stored beside the image says another tab has saved), and is stored before the lock is let go: `durability` is `'commit'` whatever it says, and a tab reads what another tab stored. A transaction holds the other tabs' statements until it commits or rolls back. A transaction begun with `BEGIN` through `run()` or `exec()` cannot be held across tabs: it is rolled back and refused, so use `transaction()`. Web Locks need a secure context and are in Chrome 69, Firefox 96 and Safari 15.4 and later (on WebKit the feature is on by default and off in Lockdown Mode). Where there are none, the version stamp alone keeps both tabs' writes: a statement that finds another tab saved first runs again on that tab's image, and a `transaction()` another tab saved over is refused with `IndexedDbConflictError`, storing nothing of it, for its caller to run again. The adapter says once when it runs without Web Locks. A tab running a version of this package before 0.7 writes no stamp, so a tab with `crossTab` does not see its saves.
 
 **When it saves:** every `saveIntervalMs`, the adapter writes the database image to IndexedDB if anything changed. It skips the tick while a transaction is open, its own or one begun with `BEGIN`, because sql.js's export closes and reopens the connection, which would end the transaction; the next tick saves it once it has committed. A save counts as done when IndexedDB commits it, not when the put request succeeds. A save that fails or aborts is reported once, and the next tick tries again. A write made while a save is in flight is saved by the next one. A transaction's commit marks its writes for saving, including writes made through `all()` or `get()` (`INSERT ... RETURNING`). Outside a transaction, a statement through `all()` or `get()` marks the database changed unless it is a `SELECT`, `VALUES` or `EXPLAIN`; a `WITH` statement does when it changed rows. `close()` rolls back a transaction still open and saves the committed state. `exportDatabase()` throws while a transaction is open.
 
@@ -468,6 +535,30 @@ const db = await createDatabase({
 - `enableWal` (default true) sends `PRAGMA journal_mode = WAL` through the plugin's `query()` and warns when SQLite answers another mode.
 - The plugin runs `execute()` and `run()` inside a transaction of its own, where SQLite ignores `PRAGMA foreign_keys` and refuses to change the journal mode, and on Android through `execSQL`, which fails on a statement that answers a row. So a `PRAGMA` in `run()`, or at the start or the end of an `exec()` script, goes through `query()` instead, outside that transaction. A script that turns foreign keys off, rebuilds a table and turns them on again runs as SQLite's procedure for changing a table expects. A `PRAGMA` between two other statements of a script stays inside the plugin's transaction.
 - The plugin turns foreign keys on when it opens a database.
+
+## Key-Value Store
+
+`@framers/sql-storage-adapter/kv` holds one key-value contract and its stores. It imports no adapter, so a page that loads it for its key-value store loads neither sql.js nor pg.
+
+```typescript
+import { createDatabase } from '@framers/sql-storage-adapter';
+import { createSqlKeyValueStore, namespaced, openIndexedDbStore } from '@framers/sql-storage-adapter/kv';
+
+// In a SQL table, on any adapter: a file, IndexedDB, Capacitor or PostgreSQL
+const db = await createDatabase({ segment: 'agentos' });
+const kv = await createSqlKeyValueStore(db, { table: 'agentos_kv' });
+await kv.set('notes/1', { title: 'One', saved: new Date() });
+const mine = namespaced(kv, 'user-42/');
+
+// In one IndexedDB object store, where a page already keeps its values
+const page = await openIndexedDbStore({ dbName: 'sayshere', storeName: 'kv' });
+```
+
+`KeyValueStore` has `get`, `set`, `delete`, `keys(prefix)` and `deletePrefix(prefix)`, and `memoryOnly`, true when nothing outlives the page or the process. `namespaced(store, prefix)` scopes a store to a prefix: end each prefix with a character no id holds (`ann/`, `anna/`), since the keys under `anna` are among those under `ann`.
+
+- `openIndexedDbStore({ dbName, storeName, version })` keeps values in one IndexedDB object store with out-of-line keys. It opens the database at `version` (1 by default) and creates the object store only when the open upgrades the database, so a database another page made at that version is read in place. A browser that refuses IndexedDB gets the memory store, and `memoryOnly` says so. This is the store AgentOS's `src/core/storage/browser` held, moved unchanged: the same database, object store, version and keys.
+- `createSqlKeyValueStore(adapter, { table })` keeps values in a table it makes when it is missing, with a `key` and a `value` column. Each call is one statement on the adapter, and through a transaction's handle it joins the transaction. Keys are listed in the order of their UTF-16 code units, as IndexedDB orders them, and a prefix is read literally (`%`, `_` and `*` are characters). Each value is kept as text and comes back as the structured clone, which IndexedDB applies to every value it stores, gives it back: `undefined`, `-0`, `NaN`, bigints, `Date`, `RegExp`, `Map`, `Set`, `ArrayBuffer`, typed arrays and `DataView`, boxed primitives, errors with their message, stack and cause, objects reached twice and cycles. A value the structured clone refuses (a function, a symbol, a `WeakMap`, a promise) is refused with a `DataCloneError` before anything is written, as are the host objects text cannot hold (`Blob`, `File`, `CryptoKey`).
+- `MemoryKeyValueStore` holds values for the page alone, copied in and out with `structuredClone`.
 
 ## Platform Strategy
 
@@ -566,25 +657,44 @@ const features = createStorageFeatures(adapter);
 
 ### SqlDialect — Cross-Platform SQL
 
+Each form below returns the same rows on PostgreSQL, better-sqlite3 and sql.js; `tests/dialect.parity.spec.ts` runs every one on all three.
+
 ```typescript
-const { dialect } = features;
+const { dialect: d } = features;
 
-// INSERT OR IGNORE (SQLite) → ON CONFLICT DO NOTHING (Postgres)
-const sql = dialect.insertOrIgnore('users', ['id', 'name'], ['?', '?']);
+// Upserts that update the row in place on both engines (ON CONFLICT ... DO UPDATE)
+await db.run(d.upsert('users', ['id', 'email', 'name'], ['?', '?', '?'], ['email']), [1, 'a@x.io', 'Ann']);
+await db.run(d.insertOrReplace('users', ['id', 'name'], ['?', '?'], 'id'), [1, 'Ann']);
+await db.run(d.insertOrIgnore('users', ['id', 'name'], ['?', '?']), [1, 'Ann']);
 
-// INSERT OR REPLACE (SQLite) → ON CONFLICT DO UPDATE (Postgres)
-const upsert = dialect.insertOrReplace('users', ['id', 'name'], ['?', '?'], 'id');
+// Times: now() and arithmetic in exact seconds, buckets as ISO 8601 UTC text
+const recent = `created_at > ${d.addInterval(d.now(), -7, 'days')}`;
+const perDay = `SELECT ${d.dateBucket('day', 'created_at')} AS day, count(*) AS n FROM events GROUP BY 1`;
 
-// json_extract(col, '$.key') (SQLite) → (col::jsonb)->>'key' (Postgres)
-const expr = dialect.jsonExtract('metadata', '$.theme');
+// Matching and membership
+const byName = `${d.ilike('name', '?')}`;                    // ILIKE / LIKE
+const someIds = d.inList('id', ['?', '?']);                  // an empty list matches nothing
+const idsFromArray = d.inArray('id', '?');                   // bind one JavaScript array
+const tagged = d.jsonArrayContains(d.jsonExtractAs('doc', '$.tags', 'json'), '?');
 
-// ifnull(expr, fallback) (SQLite) → COALESCE(expr, fallback) (Postgres)
-const safe = dialect.ifnull(dialect.jsonExtract('config', '$.lang'), "'en'");
+// JSON values with a type, from a checked path
+const count = d.jsonExtractAs('doc', '$.stats.count', 'integer');
 
-// PRAGMA (SQLite) → null/no-op (Postgres)
-const pragma = dialect.pragma('journal_mode', 'WAL');
-if (pragma) await adapter.exec(pragma);
+// Locks: FOR UPDATE ... and pg_advisory_xact_lock on PostgreSQL, nothing on SQLite
+const lock = d.advisoryTransactionLock('?');
+const claim = `SELECT id FROM jobs WHERE state = 'queued' LIMIT 1${d.rowLock('update', 'skipLocked')}`;
+
+// Values and DDL
+const best = d.greatest('a', 'b', 'c');                      // NULLs skipped on both engines
+const asInt = d.cast('?', 'integer');
+const ddl = `CREATE TABLE notes (id ${d.columnType('uuid')} PRIMARY KEY DEFAULT (${d.uuid()}), body ${d.columnType('json')}, at ${d.columnType('timestamp')})`;
 ```
+
+- `insertOrReplace` updates the existing row in place on SQLite as on PostgreSQL. `INSERT OR REPLACE` deletes the conflicting row first, which fires `ON DELETE` actions on its dependents and resets the columns the statement does not name.
+- Times on SQLite are ISO 8601 UTC text with milliseconds (`2026-10-15T12:34:56.789Z`), the form a bound `Date` takes, so text comparisons order correctly; on PostgreSQL they are `timestamptz`. `addInterval` takes seconds, minutes, hours and days, as exact seconds on both engines; months and years are left out because the engines clamp a month's end differently.
+- SQLite's LIKE folds only ASCII letters. `jsonArrayContains` compares elements as text, so strings and numbers match on both engines.
+- Column values follow each engine: a PostgreSQL `BOOLEAN` returns `true` and the SQLite `INTEGER` returns `1`, and a `TIMESTAMPTZ` returns a `Date` where SQLite returns text. `typeParsers` (see "Values") narrows the PostgreSQL side.
+- `pragma()` returns null on PostgreSQL and `advisoryTransactionLock()` returns null on SQLite: skip the statement when it is null.
 
 ### IFullTextSearch — FTS5 & tsvector
 

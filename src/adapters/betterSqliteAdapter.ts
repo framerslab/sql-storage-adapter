@@ -15,7 +15,7 @@ const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'u
 
 import type { StorageAdapter, StorageOpenOptions, StorageParameters, StorageRunResult, StorageCapability, BatchOperation, BatchResult } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
-import { toSqliteStatement } from '../shared/sqlPlaceholders';
+import { integersAsBigInt, toSqliteStatement } from '../shared/sqlPlaceholders';
 import {
   createSerializedTransactionRunner,
   createSharedConnectionTransactionAdapter,
@@ -26,6 +26,17 @@ import {
   type ConnectionGate,
   type TransactionContextStore,
 } from '../shared/connectionGate';
+import { segmentFilePath, validateSegment } from '../shared/segment';
+
+/** Options of the better-sqlite3 adapter. */
+export interface BetterSqliteAdapterOptions {
+  /**
+   * A database file of its own: the segment goes into the file's name, before
+   * its extension (`app.sqlite3` becomes `app-agentos.sqlite3`), for the
+   * default path and for a path given to `open()`. `:memory:` stays as it is.
+   */
+  segment?: string;
+}
 
 type BetterSqliteModule = typeof import('better-sqlite3');
 type BetterSqliteDatabase = import('better-sqlite3').Database;
@@ -192,14 +203,19 @@ export class BetterSqliteAdapter implements StorageAdapter {
    * AsyncLocalStorage, which tells the transaction's own statements apart.
    */
   private gate: ConnectionGate = createConnectionGate(null);
+  private readonly segment: string | undefined;
 
   /**
    * Creates a new better-sqlite3 adapter instance.
    *
    * @param defaultFilePath - Absolute path to the SQLite database file.
    *                         Will be created if it doesn't exist.
+   * @param options - The adapter's segment.
+   * @throws {Error} When `options.segment` is not a name a segment can take.
    */
-  constructor(private readonly defaultFilePath: string) {}
+  constructor(private readonly defaultFilePath: string, options: BetterSqliteAdapterOptions = {}) {
+    this.segment = options.segment === undefined ? undefined : validateSegment(options.segment);
+  }
 
   /**
    * Open (or no-op if already open) the underlying native database.
@@ -228,7 +244,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
     // Handle ESM/CJS interop for better-sqlite3 constructor
     const moduleReference = this.module as BetterSqliteModule & { default?: BetterSqliteModule };
     const DatabaseCtor = moduleReference.default ?? moduleReference;
-    const resolvedPath = options?.filePath ?? this.defaultFilePath;
+    const resolvedPath = segmentFilePath(options?.filePath ?? this.defaultFilePath, this.segment);
 
     // Ensure parent directory exists (skip for :memory: and file: URIs)
     if (resolvedPath !== ':memory:' && !resolvedPath.startsWith('file:')) {
@@ -265,6 +281,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
 
   private runNow(statement: string, parameters?: StorageParameters): StorageRunResult {
     ({ statement, parameters } = toSqliteStatement(statement, parameters));
+    parameters = integersAsBigInt(parameters);
     const stmt = this.prepareInternal(statement);
     const { named, positional } = normaliseParameters(parameters);
     const result = named ? stmt.run(named) : stmt.run(positional ?? []);
@@ -273,6 +290,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
 
   private getNow<T>(statement: string, parameters?: StorageParameters): T | null {
     ({ statement, parameters } = toSqliteStatement(statement, parameters));
+    parameters = integersAsBigInt(parameters);
     const stmt = this.prepareInternal(statement);
     const { named, positional } = normaliseParameters(parameters);
     const row = named ? stmt.get(named) : stmt.get(positional ?? []);
@@ -281,6 +299,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
 
   private allNow<T>(statement: string, parameters?: StorageParameters): T[] {
     ({ statement, parameters } = toSqliteStatement(statement, parameters));
+    parameters = integersAsBigInt(parameters);
     const stmt = this.prepareInternal(statement);
     const { named, positional } = normaliseParameters(parameters);
     const rows = named ? stmt.all(named) : stmt.all(positional ?? []);
@@ -383,7 +402,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
         try {
           const prepared = toSqliteStatement(op.statement, op.parameters);
           const stmt = this.prepareInternal(prepared.statement);
-          const { named, positional } = normaliseParameters(prepared.parameters);
+          const { named, positional } = normaliseParameters(integersAsBigInt(prepared.parameters));
           const result = named ? stmt.run(named) : stmt.run(positional ?? []);
           results.push({
             changes: result.changes,
@@ -446,13 +465,17 @@ export class BetterSqliteAdapter implements StorageAdapter {
  * - Relative paths are resolved against the current working directory instead
  *   of the adapter file location (simpler & bundler neutral).
  * - Special values like ':memory:' and 'file:' URIs are passed through.
+ * - With `options.segment`, the file's name carries the segment
+ *   (`app.sqlite3` becomes `app-agentos.sqlite3`).
+ *
+ * @throws {Error} When `options.segment` is not a name a segment can take.
  */
-export const createBetterSqliteAdapter = (filePath: string): StorageAdapter => {
+export const createBetterSqliteAdapter = (filePath: string, options?: BetterSqliteAdapterOptions): StorageAdapter => {
   if (filePath === ':memory:' || filePath.startsWith('file:')) {
-    return new BetterSqliteAdapter(filePath);
+    return new BetterSqliteAdapter(filePath, options);
   }
   const resolved = path.isAbsolute(filePath)
     ? filePath
     : path.resolve(process.cwd(), filePath);
-  return new BetterSqliteAdapter(resolved);
+  return new BetterSqliteAdapter(resolved, options);
 };
