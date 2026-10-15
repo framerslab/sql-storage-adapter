@@ -10,11 +10,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     # The Postgres specs that need a server (createDatabase.postgres,
-    # postgres.segment, postgres.pool and the key-value store's) run against this
-    # one. They read POSTGRES_TEST_URL; the older Postgres suites read
-    # TEST_POSTGRES_URL and DATABASE_URL, which stay unset here. The image is
-    # PostgreSQL 16 with the pgvector extension available, so the segment specs
-    # can check that the vector type resolves through public.
+    # postgres.integration, postgres.dialect.integration, postgres.segment,
+    # postgres.pool and the key-value store's) run against this one. They read
+    # POSTGRES_TEST_URL. DATABASE_URL stays unset here: it moves the resolver's
+    # default to Postgres for every other suite. The image is PostgreSQL 16 with
+    # the pgvector extension available, so the segment specs can check that the
+    # vector type resolves through public.
     services:
       postgres:
         image: pgvector/pgvector:0.8.7-pg16

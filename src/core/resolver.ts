@@ -80,6 +80,25 @@ export interface StorageResolutionOptions {
   /** Suppress fallback chain logs (adapter not-found warnings). Default: false. */
   quiet?: boolean;
   /**
+   * Strict resolution, for servers: only the database the options name opens.
+   * Default: false.
+   *
+   * - The postgres candidate is the last one tried. When it fails to open,
+   *   resolution throws a `StorageResolutionError` instead of trying a local
+   *   SQLite database, whatever `priority` lists after it.
+   * - A Postgres server named by `postgres` or `DATABASE_URL`, with no
+   *   `priority`, makes `['postgres']` the whole list.
+   * - An explicit `filePath` outranks `DATABASE_URL`: with a `filePath` and no
+   *   `postgres` options that name a server, `DATABASE_URL` is not read.
+   * - `postgres` options that name no server, with no `DATABASE_URL` to fill
+   *   in and no `filePath`, fail instead of opening the local default.
+   *
+   * Without `strict`, a postgres candidate that fails falls through to the
+   * next candidate, and `DATABASE_URL` puts Postgres first even when a
+   * `filePath` is given.
+   */
+  strict?: boolean;
+  /**
    * Keeps the resolved adapter's tables apart from other users of the same
    * database: on PostgreSQL a schema of the segment's name, on better-sqlite3
    * and sql.js a file with the segment in its name (`app.sqlite3` becomes
@@ -168,13 +187,16 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
     return chosen === undefined ? {} : { segment: chosen };
   };
   const envOverride = getEnv('STORAGE_ADAPTER') as AdapterKind | undefined;
+  const strict = options.strict === true;
   const postgresOptions = options.postgres;
   const explicitConnection = postgresOptions?.connectionString;
+  // In strict resolution an explicit file path outranks DATABASE_URL.
+  const fileOutranksEnv = strict && isNonEmpty(options.filePath);
   // Explicit options that name a server are the target; DATABASE_URL fills in
   // only when they name none.
   const postgresConnection = isNonEmpty(explicitConnection)
     ? explicitConnection
-    : namesPostgresServer(postgresOptions)
+    : namesPostgresServer(postgresOptions) || fileOutranksEnv
       ? undefined
       : getEnv('DATABASE_URL') || undefined;
   const postgresTarget = isNonEmpty(postgresConnection) || namesPostgresServer(postgresOptions);
@@ -211,7 +233,12 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
       return ['capacitor', 'indexeddb', 'sqljs'];
     }
     if (postgresTarget) {
-      return ['postgres', 'better-sqlite3', 'indexeddb', 'sqljs'];
+      return strict ? ['postgres'] : ['postgres', 'better-sqlite3', 'indexeddb', 'sqljs'];
+    }
+    if (strict && postgresOptions !== undefined && !isNonEmpty(options.filePath)) {
+      // Postgres is configured but names no server: the postgres candidate
+      // fails with the reason, where the local default would hide it.
+      return ['postgres'];
     }
     // Browser detection (check for IndexedDB)
     if (typeof window !== 'undefined' && window.indexedDB) {
@@ -228,7 +255,11 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
           name,
           factory: async () => {
             if (!postgresTarget) {
-              throw new Error('DATABASE_URL, a postgres connection string, or a postgres host, database or user is required.');
+              throw new Error(
+                fileOutranksEnv
+                  ? 'A postgres connection string, or a postgres host, database or user is required. Strict resolution does not read DATABASE_URL when a filePath is given.'
+                  : 'DATABASE_URL, a postgres connection string, or a postgres host, database or user is required.',
+              );
             }
             return createPostgresAdapter({
               ...postgresOptions,
@@ -299,11 +330,18 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
       }
       return adapter;
     } catch (error) {
+      errors.push(error);
+      if (strict && candidate.name === 'postgres') {
+        const msg = error instanceof Error ? error.message : String(error);
+        throw new StorageResolutionError(
+          `PostgreSQL could not be opened, and strict resolution does not fall back to a local database. ${msg}`,
+          errors,
+        );
+      }
       if (!quiet) {
         const msg = error instanceof Error ? error.message : String(error);
         console.warn(`[StorageAdapter] ${candidate.name} not available, trying next. ${msg}`);
       }
-      errors.push(error);
       continue;
     }
   }
