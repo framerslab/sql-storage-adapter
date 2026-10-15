@@ -281,6 +281,26 @@ await db.all('SELECT * FROM notes WHERE id = $1 OR parent_id = $1', [1]);
 - On PostgreSQL, `??` is the jsonb `?` (key exists) operator, and `?|` and `?&` stay operators; put a space between a placeholder and a following `|` or `&`. A statement that already uses `$n` is sent as written, so its `?` operators need no escape, and a statement run without parameters keeps its `?`.
 - On SQLite, `$1`, `$2`, ... become `?` with the values in their order, repeats included. A statement that mixes `?` and `$n` is refused.
 
+### Errors
+
+`isUniqueViolation(error)` recognises a unique or primary-key violation from any adapter:
+- PostgreSQL's SQLSTATE 23505;
+- better-sqlite3's `SQLITE_CONSTRAINT_UNIQUE` and `SQLITE_CONSTRAINT_PRIMARYKEY`;
+- the "UNIQUE constraint failed" message from sql.js, IndexedDB and Capacitor.
+
+It follows `cause`, so an error your code wraps still counts.
+
+```typescript
+import { isUniqueViolation } from '@framers/sql-storage-adapter';
+
+try {
+  await db.run('INSERT INTO users (email) VALUES (?)', [email]);
+} catch (error) {
+  if (isUniqueViolation(error)) return { taken: true };
+  throw error;
+}
+```
+
 ### PostgreSQL pool control
 
 `PostgresAdapter` holds a `pg` pool. Narrow an adapter to it with `db instanceof PostgresAdapter` (or `db.kind === 'postgres'`) to reach these:
