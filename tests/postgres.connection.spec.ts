@@ -95,6 +95,21 @@ describe.skipIf(!POSTGRES_TEST_URL)('PostgresAdapter pool control', () => {
       expect(seen.name).toBe('with_connection_spec');
     });
 
+    it('keeps a temporary table for the callback, which other connections do not see', async () => {
+      const adapter = await openAdapter(2);
+      const temp = unique('temp_rows');
+
+      const rows = await adapter.withConnection(async (connection) => {
+        await connection.exec(`CREATE TEMPORARY TABLE ${temp} (n INTEGER); INSERT INTO ${temp} (n) VALUES (1), (2);`);
+        const seen = await connection.all<{ n: number }>(`SELECT n FROM ${temp} ORDER BY n`);
+        await expect(other.all(`SELECT n FROM ${temp}`)).rejects.toMatchObject({ code: '42P01' });
+        await connection.exec(`DROP TABLE ${temp}`);
+        return seen;
+      });
+
+      expect(rows).toEqual([{ n: 1 }, { n: 2 }]);
+    });
+
     it('holds a session advisory lock against other connections until the callback unlocks it', async () => {
       const adapter = await openAdapter(2);
       const key = Math.floor(Math.random() * 1_000_000_000);
@@ -254,6 +269,24 @@ describe.skipIf(!POSTGRES_TEST_URL)('PostgresAdapter pool control', () => {
         .transaction((trx) => trx.run(`INSERT INTO ${table} (id, label) VALUES (4, 'read only')`), { readOnly: true })
         .catch((error: { code?: string }) => error);
       expect(refused).toMatchObject({ code: '25006' });
+    });
+
+    it('begins read-write when asked, over a session default of read-only', async () => {
+      const adapter = await openAdapter(1);
+
+      await adapter.withConnection(async (connection) => {
+        await connection.run('SET default_transaction_read_only = on');
+        await expect(
+          connection.transaction((trx) => trx.run(`INSERT INTO ${table} (id, label) VALUES (5, 'default')`)),
+        ).rejects.toMatchObject({ code: '25006' });
+        await connection.transaction(
+          (trx) => trx.run(`INSERT INTO ${table} (id, label) VALUES (5, 'read write')`),
+          { readOnly: false, deferrable: false },
+        );
+        await connection.run('RESET default_transaction_read_only');
+      });
+
+      expect(await other.all(`SELECT label FROM ${table} WHERE id = 5`)).toEqual([{ label: 'read write' }]);
     });
 
     it('takes the same options on a held connection', async () => {
