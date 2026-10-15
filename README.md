@@ -338,6 +338,29 @@ await db.all('SELECT * FROM notes WHERE id = $1 OR parent_id = $1', [1]);
 - On PostgreSQL, `??` is the jsonb `?` (key exists) operator, and `?|` and `?&` stay operators; put a space between a placeholder and a following `|` or `&`. A statement that already uses `$n` is sent as written, so its `?` operators need no escape, and a statement run without parameters keeps its `?`.
 - On SQLite, `$1`, `$2`, ... become `?` with the values in their order, repeats included. A statement that mixes `?` and `$n` is refused.
 
+### Schema migrations
+
+`runSchemaMigrations()` applies hand-written SQL files in number order, on PostgreSQL and SQLite alike:
+- each file runs in its own transaction and is recorded in a ledger table with the SHA-256 of its text;
+- a file already in the ledger is skipped;
+- an applied file whose text changed is refused, as is a ledger row the list lacks (the database is ahead of the code);
+- a failing file is rolled back, and the error names it.
+
+```typescript
+import { readSchemaMigrations, runSchemaMigrations, schemaMigrationStatus } from '@framers/sql-storage-adapter';
+
+// migrations/0001_accounts.sql, migrations/0002_billing.sql, ...; or migrations/postgres/ and migrations/sqlite/ per dialect
+const migrations = await readSchemaMigrations('migrations', { dialect: 'postgres' });
+const report = await runSchemaMigrations(db, migrations);              // { applied, skipped, ... }
+const status = await schemaMigrationStatus(db, migrations);            // { applied, pending, changed, unknown }; applies nothing
+```
+
+- **Files.** File names are digits, an underscore and a lower-case name (`001_init.sql`, `0001_accounts.sql`). They are ordered by number, and a number used twice is refused. `readSchemaMigrations(dir, { dialect })` reads `dir/postgres` or `dir/sqlite` when that folder exists, else `dir`. A file holds no `BEGIN` or `COMMIT`.
+- **Ledger.** `table` (default `schema_migrations`) and `checksumColumn` (default `checksum`) name the ledger. An existing ledger with `name` and a SHA-256 column is read as it is, for example `{ table: '_migrations', checksumColumn: 'content_hash' }`.
+- **Locking.** On PostgreSQL each file's transaction takes `pg_advisory_xact_lock(lockKey)` and checks the ledger again, so two runners at once apply each file once. `lockKey` is an integer, or text hashed with `hashtext()`. On SQLite the file's write transaction is the lock.
+- **Outside a transaction.** A file whose first line is `-- outside transaction` (`outsideTransactionMarker`) runs outside a transaction, for `CREATE INDEX CONCURRENTLY` or `VACUUM`. On PostgreSQL it runs under the session lock on one held connection (`withConnection`).
+- **Unknown rows.** `unknown: 'ignore'` lets a run go on past ledger rows the list lacks.
+
 ### Values
 
 On SQLite, values convert as they bind, positional and named alike:

@@ -1,3 +1,13 @@
+## [Unreleased]
+
+### Added
+- A versioned schema-migration runner: `runSchemaMigrations(adapter, migrations, options)`, `schemaMigrationStatus()` and `readSchemaMigrations(dir, { dialect })`, on PostgreSQL and SQLite.
+  - Files run in number order, each in its own transaction, and are recorded in a configurable ledger (`table`, `checksumColumn`) with the SHA-256 of their text.
+  - The runner refuses an applied file whose text changed, and a ledger row the list lacks unless `unknown: 'ignore'`. It stops at the first error, which names the file.
+  - On PostgreSQL each file takes a transaction-scoped advisory lock (`lockKey`) and checks the ledger again under it, so two runners at once apply each file once. On SQLite the write transaction is the lock.
+  - A file marked `-- outside transaction` runs outside one, on PostgreSQL under the session lock on a held connection.
+  - Existing ledgers with a name and a SHA-256 column, such as `schema_migrations(name, checksum)` or `_migrations(name, content_hash)`, are read as they are.
+
 ## [0.7.1] - 2026-10-15
 
 ### Added
