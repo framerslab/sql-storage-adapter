@@ -165,6 +165,20 @@ describe('IndexedDbAdapter transactions and saving', () => {
       expect(await labels(reopened)).toEqual(['committed']);
     });
 
+    it('saves a transaction whose writes went through all(), as INSERT ... RETURNING does', async () => {
+      const adapter = await openWithItems('returning');
+      tick();
+      expect(await storedLabels('returning')).toEqual([]);
+
+      const rows = await adapter.transaction((trx) =>
+        trx.all<{ id: number }>('INSERT INTO items (label) VALUES (?) RETURNING id', ['returned']),
+      );
+      expect(rows).toEqual([{ id: 1 }]);
+
+      tick();
+      expect(await storedLabels('returning')).toEqual(['returned']);
+    });
+
     it('refuses exportDatabase() while a transaction is open instead of ending it', async () => {
       const adapter = await openWithItems('export-open');
 
@@ -334,6 +348,28 @@ describe('IndexedDbAdapter transactions and saving', () => {
       IDBObjectStore.prototype.put = originalPut;
       tick();
       expect(await storedLabels('save-abort')).toEqual(['kept']);
+    });
+
+    it('saves an imported database before importDatabase() resolves, with no tick', async () => {
+      const source = await openWithItems('import-source');
+      await source.run('INSERT INTO items (label) VALUES (?)', ['imported']);
+      const image = source.exportDatabase();
+
+      const adapter = await openAdapter('import-target');
+      await adapter.importDatabase(image);
+
+      expect(await storedLabels('import-target')).toEqual(['imported']);
+      expect(await labels(adapter)).toEqual(['imported']);
+    });
+
+    it('closes once when close() is called twice at once, and keeps the rows', async () => {
+      const adapter = await openWithItems('double-close');
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['kept']);
+
+      await Promise.all([adapter.close(), adapter.close()]);
+
+      const reopened = await openAdapter('double-close');
+      expect(await labels(reopened)).toEqual(['kept']);
     });
 
     it('saves a write that lands while a save is in flight with the next save', async () => {
