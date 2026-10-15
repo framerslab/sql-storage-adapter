@@ -503,7 +503,7 @@ On Postgres, `features.exporter` requires a Node runtime plus an adapter that wa
 ## CI, Releases, and Badges
 
 - GitHub Actions workflows:
-  - `ci.yml` runs lint, tests, and coverage on every branch.
+  - `ci.yml` runs on pushes and pull requests to `master`: lint, type check, tests with coverage and the build, then it packs the package, installs the tarball into a new ES module project and type-checks a consumer with `--module nodenext --moduleResolution nodenext`.
   - `release.yml` publishes new versions to npm, tags the commit (`vX.Y.Z`), and creates/updates the GitHub Release when `CHANGELOG.md` and `package.json` bump the version.
 - Check badge health whenever builds fail:
   - CI badge should be green for `master`.
