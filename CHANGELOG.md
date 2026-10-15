@@ -1,3 +1,14 @@
+## [Unreleased]
+
+### Added
+- Per-adapter entries (`./postgres`, `./better-sqlite3`, `./sqljs`, `./indexeddb`, `./capacitor`), `./backup`, and an adapter-free `./core`. A server that takes its adapter from its own entry, with the rest from `./core`, bundles neither sql.js nor `@aws-sdk/client-s3`. The root entry imports every adapter, as before.
+- `./electron/renderer`: the renderer adapter alone, with nothing from the main process.
+- A CommonJS build. Every entry has a `require` condition to `dist/cjs`, transformed from the ES module build file by file and carrying its own declarations, and `main` points at it. `require('@framers/sql-storage-adapter/electron/preload')` gives one bundled CommonJS file that requires only `electron`, as a sandboxed preload must.
+
+### Changed
+- `@capacitor-community/sqlite` is accepted as a peer at `^6.0.0 || ^7.0.0 || ^8.0.0`. The connection calls the adapter makes are the same in 7 and 8.
+- `sideEffects` names the preload files, which expose their API on import. With `sideEffects: false` a bundler could drop `import '@framers/sql-storage-adapter/electron/preload'`.
+
 ## [0.7.2] - 2026-10-15
 
 ### Added

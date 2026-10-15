@@ -78,6 +78,26 @@ npm install sql.js                    # WASM SQLite (auto-included for IndexedDB
 
 > `better-sqlite3` 13 needs Node-API 10: Node.js 22.14+ or 23.6+, or Electron 35+ (whose Node is 22.14). On an older runtime (Node.js 20, Node.js 22.13 and earlier, Electron 34 and earlier) install `better-sqlite3@12`; with 13 installed there, the adapter refuses to open, so the resolver falls back to `sql.js`, rather than letting the native binding crash the process. `better-sqlite3` 13 ships prebuilt binaries, but npm can still run `node-gyp rebuild` for it, which needs the build tools above (Python, and make and a C++ compiler, or the Visual Studio Build Tools on Windows): always when it installs from a lockfile (`npm ci`, or `npm install` with a `package-lock.json`), and on some platforms on a fresh install too ([WiseLibs/better-sqlite3#1516](https://github.com/WiseLibs/better-sqlite3/issues/1516)).
 
+### Entries
+
+The root entry exports everything and imports every adapter. A server takes its adapter from that adapter's own entry, with the rest from `./core`, so its bundle carries neither sql.js nor the S3 client:
+
+```typescript
+import { createPostgresAdapter } from '@framers/sql-storage-adapter/postgres';
+import { createStorageFeatures, runSchemaMigrations, isUniqueViolation } from '@framers/sql-storage-adapter/core';
+```
+
+| Entry | Holds |
+| --- | --- |
+| `@framers/sql-storage-adapter` | Everything, with `createDatabase` and the resolver |
+| `./core` | Contracts and errors, dialects, full-text search, codecs, exporters, `createStorageFeatures`, the schema-migration runner, `isUniqueViolation`, the logger. No adapter |
+| `./postgres`, `./better-sqlite3`, `./sqljs`, `./indexeddb`, `./capacitor` | One adapter each |
+| `./backup` | S3-compatible backups (`@aws-sdk/client-s3`) |
+| `./electron`, `./electron/renderer`, `./electron/preload` | The Electron adapters. `./electron/renderer` holds only what a window uses; `require('./electron/preload')` gives one bundled CommonJS file for a sandboxed preload |
+| `./sync`, `./kv`, `./types` | Cross-platform sync, the key-value store, the types |
+
+Every entry has an `import` and a `require` condition. The CommonJS build under `dist/cjs` is made from the ES module build file by file, so a class has one identity whichever entry a caller takes it from. It carries its own declarations, so a CommonJS TypeScript consumer under `node16` resolution type-checks against them. CI packs the package, installs it in a new project and checks each of these: `require()` of every entry, what each server entry bundles, and the preload.
+
 ## Quick Start
 
 ```typescript
