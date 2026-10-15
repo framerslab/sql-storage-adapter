@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import type { StorageAdapter, StorageCapability, StorageOpenOptions, StorageParameters, StorageRunResult } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
+import { toSqliteStatement } from '../shared/sqlPlaceholders';
 import {
   createSerializedTransactionRunner,
   createSharedConnectionTransactionAdapter,
@@ -100,6 +101,7 @@ export class SqlJsAdapter implements StorageAdapter {
   }
 
   public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
+    ({ statement, parameters } = toSqliteStatement(statement, parameters));
     // Detect caller-managed transaction control (BEGIN / SAVEPOINT /
     // COMMIT / ROLLBACK / RELEASE) so we can keep the tx depth in
     // sync regardless of whether the caller uses {@link transaction}
@@ -155,6 +157,7 @@ export class SqlJsAdapter implements StorageAdapter {
   }
 
   public async all<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
+    ({ statement, parameters } = toSqliteStatement(statement, parameters));
     const stmt = this.prepareInternal(statement);
     try {
       const { named, positional } = normaliseParameters(parameters);

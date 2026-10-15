@@ -267,6 +267,20 @@ The IndexedDB, Capacitor and better-sqlite3 adapters run every transaction on on
 The PostgreSQL adapter runs each transaction on its own pooled connection, so transactions run side by side. When the connection breaks during a transaction and its ROLLBACK fails too, `transaction()` still throws the transaction's own error (the callback's, or COMMIT's), with the ROLLBACK error on it as a non-enumerable `rollbackError` property. The broken connection is closed, not returned to the pool. A connection the server closes while a callback holds it, between statements, does not end the process. Once a transaction has ended, its handle runs on the pool, as the adapter's own statements do, and its `transaction()` begins a new transaction.
 
 
+### Placeholders
+
+Bind `?` placeholders from an array, `@name` placeholders from an object, or `$1`, `$2`, ... from an array on PostgreSQL and SQLite alike:
+
+```typescript
+await db.run('INSERT INTO notes (id, body) VALUES (?, ?)', [1, 'Is this saved?']);
+await db.get('SELECT * FROM notes WHERE id = @id', { id: 1 });
+await db.all('SELECT * FROM notes WHERE id = $1 OR parent_id = $1', [1]);
+```
+
+- A `?`, `@name` or `$1` inside a string literal, a quoted identifier, a PostgreSQL dollar-quoted string or a comment is text, never a placeholder.
+- On PostgreSQL, `??` is the jsonb `?` (key exists) operator, and `?|` and `?&` stay operators; put a space between a placeholder and a following `|` or `&`. A statement that already uses `$n` is sent as written, so its `?` operators need no escape, and a statement run without parameters keeps its `?`.
+- On SQLite, `$1`, `$2`, ... become `?` with the values in their order, repeats included. A statement that mixes `?` and `$n` is refused.
+
 ### PostgreSQL pool control
 
 `PostgresAdapter` holds a `pg` pool. Narrow an adapter to it with `db instanceof PostgresAdapter` (or `db.kind === 'postgres'`) to reach these:
