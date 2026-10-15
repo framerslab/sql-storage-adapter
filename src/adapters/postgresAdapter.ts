@@ -22,6 +22,13 @@ export interface PostgresQueryResultLike {
 export interface PostgresPoolClientLike {
   query(text: string, values?: unknown[]): Promise<PostgresQueryResultLike>;
   release(error?: Error | boolean): void;
+  /**
+   * pg's client is an event emitter: while the adapter holds a client, it
+   * listens for the client's connection error. A client without these emits
+   * nothing for the adapter to hear.
+   */
+  on?(event: 'error', listener: (error: Error) => void): unknown;
+  removeListener?(event: 'error', listener: (error: Error) => void): unknown;
 }
 
 /**
@@ -396,6 +403,51 @@ const unqualifiedCreateExtension = (statement: string): string | null => {
   return name.identifier;
 };
 
+/** An unknown thrown value as an Error. */
+const asError = (value: unknown): Error => (value instanceof Error ? value : new Error(String(value)));
+
+/**
+ * Puts a failed ROLLBACK's error on the transaction's error, as a
+ * non-enumerable `rollbackError` property, when that error can take one.
+ */
+const keepRollbackError = (error: unknown, rollbackError: Error): void => {
+  if (typeof error !== 'object' || error === null || !Object.isExtensible(error)) return;
+  try {
+    Object.defineProperty(error, 'rollbackError', {
+      value: rollbackError,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  } catch {
+    // A non-configurable rollbackError is already there: keep it.
+  }
+};
+
+/**
+ * Listens for a connection error on a checked-out client until `stop()`. pg
+ * emits a client's connection error (the server ending the session, a broken
+ * socket) on the client when no query is running, and pg-pool listens only on
+ * idle clients, so without this an unheard error event would end the process.
+ */
+const watchClient = (client: PostgresPoolClientLike): { failure: () => Error | undefined; stop: () => void } => {
+  let failure: Error | undefined;
+  // A pg-compatible pool whose clients are not event emitters emits nothing to hear.
+  if (typeof client.on !== 'function' || typeof client.removeListener !== 'function') {
+    return { failure: () => undefined, stop: () => undefined };
+  }
+  const onError = (error: Error): void => {
+    if (!failure) failure = error;
+  };
+  client.on('error', onError);
+  return {
+    failure: () => failure,
+    stop: () => {
+      client.removeListener?.('error', onError);
+    },
+  };
+};
+
 /** Where an installed extension's objects are, and whether ALTER EXTENSION ... SET SCHEMA can move them. */
 const EXTENSION_PLACE =
   'SELECT n.nspname AS schema, e.extrelocatable AS relocatable FROM pg_extension e ' +
@@ -418,17 +470,26 @@ class SegmentStatements {
 
   constructor(public readonly segment: string) {}
 
-  /** Runs `text` on the pool. */
+  /**
+   * Runs `text` on the pool. The connection that runs a `CREATE EXTENSION`
+   * goes back to the pool unless its BEGIN or ROLLBACK failed or it broke
+   * while held, in which case it is closed.
+   */
   async onPool(pool: PostgresPoolLike, text: string, values: unknown[]): Promise<PostgresQueryResultLike> {
     const extension = unqualifiedCreateExtension(text);
     if (extension === null) {
       return pool.query(text, values);
     }
     const client = await pool.connect();
+    const watch = watchClient(client);
+    let brokenBy: Error | undefined;
     try {
-      return await this.inOwnTransaction(client, text, values, extension);
+      return await this.inOwnTransaction(client, text, values, extension, (error) => {
+        if (!brokenBy) brokenBy = error;
+      });
     } finally {
-      client.release();
+      watch.stop();
+      client.release(brokenBy ?? watch.failure());
     }
   }
 
@@ -447,8 +508,15 @@ class SegmentStatements {
    * one in a transaction of its own, as on the pool. On a pg that does not
    * report a connection's transaction status (before 8.21), the session's
    * search_path is set to `public` around the statement and set back after it.
+   * `onBroken` hears when the connection cannot be trusted any more, so
+   * `withConnection()` closes it instead of returning it to the pool.
    */
-  async onConnection(client: PostgresPoolClientLike, text: string, values: unknown[]): Promise<PostgresQueryResultLike> {
+  async onConnection(
+    client: PostgresPoolClientLike,
+    text: string,
+    values: unknown[],
+    onBroken: (error: Error) => void,
+  ): Promise<PostgresQueryResultLike> {
     const extension = unqualifiedCreateExtension(text);
     if (extension === null) {
       return client.query(text, values);
@@ -457,32 +525,47 @@ class SegmentStatements {
       case 'T':
         return this.withinTransaction(client, text, values, extension);
       case 'I':
-        return this.inOwnTransaction(client, text, values, extension);
+        return this.inOwnTransaction(client, text, values, extension, onBroken);
       case 'E':
         // The transaction has failed: the statement fails with its reason.
         return client.query(text, values);
       default:
-        return this.aroundSession(client, text, values, extension);
+        return this.aroundSession(client, text, values, extension, onBroken);
     }
   }
 
-  /** In a transaction of its own on `client`, whose COMMIT or ROLLBACK ends the setting. */
+  /**
+   * In a transaction of its own on `client`, whose COMMIT or ROLLBACK ends the
+   * setting. A BEGIN or ROLLBACK that fails leaves the connection in a state
+   * nobody knows, so `onBroken` hears of it.
+   */
   private async inOwnTransaction(
     client: PostgresPoolClientLike,
     text: string,
     values: unknown[],
     extension: string,
+    onBroken: (error: Error) => void,
   ): Promise<PostgresQueryResultLike> {
-    let result: PostgresQueryResultLike;
     try {
       await client.query('BEGIN');
+    } catch (error) {
+      onBroken(asError(error));
+      throw error;
+    }
+    let result: PostgresQueryResultLike;
+    try {
       // set_config(..., true) is SET LOCAL: the COMMIT or ROLLBACK below ends it,
       // so the connection goes back to the pool on the segment's search_path.
       await client.query("SELECT set_config('search_path', 'public', true)");
       result = await client.query(text, values);
       await client.query('COMMIT');
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        onBroken(asError(rollbackError));
+        keepRollbackError(error, asError(rollbackError));
+      }
       throw error;
     }
     await this.checkReach((t, v) => client.query(t, v), extension);
@@ -510,26 +593,39 @@ class SegmentStatements {
   /**
    * With the session's search_path set to `public` for the statement, and set
    * back after it. When the statement fails inside a transaction, setting it
-   * back fails too, and that transaction's rollback restores it.
+   * back fails too, and that transaction's rollback restores it. Without the
+   * transaction status this cannot tell that case from a connection whose
+   * search_path stays on `public`, so a failed set-back tells `onBroken`, and
+   * the connection is closed rather than returned to the pool outside the
+   * segment.
    */
   private async aroundSession(
     client: PostgresPoolClientLike,
     text: string,
     values: unknown[],
     extension: string,
+    onBroken: (error: Error) => void,
   ): Promise<PostgresQueryResultLike> {
     const saved = await client.query("SELECT current_setting('search_path') AS path");
     const savedPath = (saved.rows[0] as { path?: unknown } | undefined)?.path;
     const path = typeof savedPath === 'string' ? savedPath : `${this.segment}, public`;
     await client.query("SELECT set_config('search_path', 'public', false)");
+    const setBack = async (): Promise<void> => {
+      try {
+        await client.query('SELECT set_config($1, $2, false)', ['search_path', path]);
+      } catch (error) {
+        onBroken(asError(error));
+        throw error;
+      }
+    };
     let result: PostgresQueryResultLike;
     try {
       result = await client.query(text, values);
     } catch (error) {
-      await client.query('SELECT set_config($1, $2, false)', ['search_path', path]).catch(() => undefined);
+      await setBack().catch(() => undefined);
       throw error;
     }
-    await client.query('SELECT set_config($1, $2, false)', ['search_path', path]);
+    await setBack();
     await this.checkReach((t, v) => client.query(t, v), extension);
     return result;
   }
@@ -603,18 +699,23 @@ const createSchema = async (client: PostgresPoolClientLike, segment: string): Pr
 };
 
 /**
- * Adapter view permanently bound to one checked-out transaction client.
- * Each concurrent transaction receives its own instance, so callback queries
- * cannot leak onto another callback's client through shared mutable state.
+ * Adapter view bound to one checked-out transaction client while its
+ * transaction runs. Each concurrent transaction receives its own instance, so
+ * callback queries cannot leak onto another callback's client through shared
+ * mutable state. Once its transaction has ended, the client may be another
+ * caller's, so the view sends its statements to `afterEnd` instead: the
+ * adapter's pool, or the held connection the transaction ran on.
  */
 class PostgresTransactionAdapter implements StorageAdapter {
   public readonly kind = 'postgres';
+  private ended = false;
   private readonly query: QueryRunner;
 
   constructor(
     client: PostgresPoolClientLike,
     public readonly capabilities: ReadonlySet<StorageCapability>,
     segment: SegmentStatements | null,
+    private readonly afterEnd: StorageAdapter,
   ) {
     this.query = segment
       ? (text, values) => segment.inTransaction(client, text, values)
@@ -629,22 +730,28 @@ class PostgresTransactionAdapter implements StorageAdapter {
     statement: string,
     parameters?: StorageParameters
   ): Promise<StorageRunResult> {
+    if (this.ended) return this.afterEnd.run(statement, parameters);
     return runWith(this.query, statement, parameters);
   }
 
   public async get<T>(statement: string, parameters?: StorageParameters): Promise<T | null> {
+    if (this.ended) return this.afterEnd.get<T>(statement, parameters);
     return getWith<T>(this.query, statement, parameters);
   }
 
   public async all<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
+    if (this.ended) return this.afterEnd.all<T>(statement, parameters);
     return allWith<T>(this.query, statement, parameters);
   }
 
   public async exec(script: string): Promise<void> {
+    if (this.ended) return this.afterEnd.exec(script);
     await execWith(this.query, script);
   }
 
   public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
+    // After the transaction has ended, a new one begins where afterEnd runs it.
+    if (this.ended) return this.afterEnd.transaction(fn);
     // Nested callbacks share the outer transaction. Errors still reach the
     // owning adapter, which rolls the entire transaction back.
     return fn(this);
@@ -653,24 +760,55 @@ class PostgresTransactionAdapter implements StorageAdapter {
   public async close(): Promise<void> {
     // The owning transaction releases the checked-out client after completion.
   }
+
+  /** @internal runTransaction() calls this when the transaction has ended. */
+  public end(): void {
+    this.ended = true;
+  }
 }
 
-/** Runs `fn` in a transaction that `begin` opens on `client`. */
+/**
+ * Runs `fn` in a transaction that `begin` opens on `client`: COMMIT when `fn`
+ * resolves, ROLLBACK when `fn` or COMMIT throws, and that error is rethrown.
+ * `onBroken` hears when the connection cannot be trusted any more (BEGIN or
+ * ROLLBACK failed), so the caller closes it instead of returning it to the
+ * pool. When ROLLBACK fails, the original error is still the one thrown, with
+ * the ROLLBACK error on it as `rollbackError`.
+ */
 const runTransaction = async <T>(
   client: PostgresPoolClientLike,
   begin: string,
   fn: (trx: StorageAdapter) => Promise<T>,
   capabilities: ReadonlySet<StorageCapability>,
   segment: SegmentStatements | null,
+  afterEnd: StorageAdapter,
+  onBroken: (error: Error) => void
 ): Promise<T> => {
   try {
     await client.query(begin);
-    const result = await fn(new PostgresTransactionAdapter(client, capabilities, segment));
+  } catch (error) {
+    onBroken(asError(error));
+    throw error;
+  }
+  const handle = new PostgresTransactionAdapter(client, capabilities, segment, afterEnd);
+  try {
+    const result = await fn(handle);
     await client.query('COMMIT');
     return result;
   } catch (error) {
-    await client.query('ROLLBACK');
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      const failure = asError(rollbackError);
+      onBroken(failure);
+      keepRollbackError(error, failure);
+      console.warn(
+        `[StorageAdapter] PostgreSQL ROLLBACK failed after a transaction error, so the connection was closed; the transaction's own error is rethrown. ${failure.message}`
+      );
+    }
     throw error;
+  } finally {
+    handle.end();
   }
 };
 
@@ -681,6 +819,12 @@ const runTransaction = async <T>(
  */
 class PostgresConnectionAdapter implements PostgresConnection {
   public readonly kind = 'postgres';
+  /**
+   * @internal Why the connection cannot be trusted any more: a transaction's
+   * BEGIN or ROLLBACK failed on it, or a segment's search_path could not be
+   * set back. withConnection() closes it instead of returning it to the pool.
+   */
+  public brokenBy: Error | undefined;
   private ended = false;
   private transactionOpen = false;
   private readonly query: QueryRunner;
@@ -692,9 +836,14 @@ class PostgresConnectionAdapter implements PostgresConnection {
   ) {
     this.query = (text, values) => {
       const live = this.live();
-      return segment ? segment.onConnection(live, text, values) : live.query(text, values);
+      return segment ? segment.onConnection(live, text, values, this.onBroken) : live.query(text, values);
     };
   }
+
+  /** Keeps the first reason the connection cannot be trusted any more. */
+  private readonly onBroken = (error: Error): void => {
+    if (!this.brokenBy) this.brokenBy = error;
+  };
 
   public async open(): Promise<void> {
     // withConnection() checks the connection out before the callback runs.
@@ -729,7 +878,7 @@ class PostgresConnectionAdapter implements PostgresConnection {
     }
     this.transactionOpen = true;
     try {
-      return await runTransaction(client, begin, fn, this.capabilities, this.segment);
+      return await runTransaction(client, begin, fn, this.capabilities, this.segment, this, this.onBroken);
     } finally {
       this.transactionOpen = false;
     }
@@ -1123,9 +1272,14 @@ export class PostgresAdapter implements StorageAdapter {
 
   /**
    * Runs `fn` in a transaction on one pooled connection: COMMIT when it
-   * resolves, ROLLBACK when it throws. `options` sets the isolation level and
-   * the read-only and deferrable modes; an unknown isolation level is refused
-   * before a connection is checked out.
+   * resolves, ROLLBACK when it or COMMIT throws, and that error is rethrown.
+   * `options` sets the isolation level and the read-only and deferrable modes;
+   * an unknown isolation level is refused before a connection is checked out.
+   *
+   * When ROLLBACK fails too (the connection broke), the error thrown is still
+   * the transaction's own, with the ROLLBACK error on it as `rollbackError`,
+   * and the connection is closed instead of returned to the pool. The handle
+   * `fn` receives runs on the pool once the transaction has ended.
    */
   public async transaction<T>(
     fn: (trx: StorageAdapter) => Promise<T>,
@@ -1133,10 +1287,15 @@ export class PostgresAdapter implements StorageAdapter {
   ): Promise<T> {
     const begin = beginStatement(options);
     const client = await this.requirePool().connect();
+    const watch = watchClient(client);
+    let brokenBy: Error | undefined;
     try {
-      return await runTransaction(client, begin, fn, this.capabilities, this.segmentStatements);
+      return await runTransaction(client, begin, fn, this.capabilities, this.segmentStatements, this, (error) => {
+        if (!brokenBy) brokenBy = error;
+      });
     } finally {
-      client.release();
+      watch.stop();
+      client.release(brokenBy ?? watch.failure());
     }
   }
 
@@ -1154,11 +1313,14 @@ export class PostgresAdapter implements StorageAdapter {
    * When `fn` resolves inside a transaction it began and did not end, the
    * connection is closed, which rolls the transaction back, and the call
    * rejects (pg 8.21 and later report the transaction status). The connection
-   * refuses statements once `fn` has ended. On a segmented adapter the
-   * connection starts in the segment, as every connection of its pool does.
+   * refuses statements once `fn` has ended. A connection that broke while `fn`
+   * held it (the server ended the session) is closed, not returned. On a
+   * segmented adapter the connection starts in the segment, as every
+   * connection of its pool does.
    */
   public async withConnection<T>(fn: (connection: PostgresConnection) => Promise<T>): Promise<T> {
     const client = await this.requirePool().connect();
+    const watch = watchClient(client);
     const connection = new PostgresConnectionAdapter(client, this.capabilities, this.segmentStatements);
     let releaseError: Error | undefined;
     try {
@@ -1180,7 +1342,8 @@ export class PostgresAdapter implements StorageAdapter {
       throw error;
     } finally {
       connection.end();
-      client.release(releaseError);
+      watch.stop();
+      client.release(releaseError ?? connection.brokenBy ?? watch.failure());
     }
   }
 

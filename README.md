@@ -268,6 +268,8 @@ await db.transaction(async (trx) => {
 
 The IndexedDB, Capacitor and better-sqlite3 adapters run every transaction on one connection, so they run transactions one at a time, and a statement from another caller waits until the open transaction ends: it neither joins the transaction (and vanishes in its rollback) nor reads what the transaction has not committed. A browser or a WebView has no async context to tell the callback's own statements apart, so on the IndexedDB and Capacitor adapters a statement the callback issues through the adapter itself, not through its handle, waits for the transaction too. The two then wait on each other, and the adapter logs a warning after 10 seconds. (On Node, better-sqlite3 tells them apart with `AsyncLocalStorage`.) Inside a callback, run every statement through the handle, and do not await work that itself needs the database.
 
+The PostgreSQL adapter runs each transaction on its own pooled connection, so transactions run side by side. When the connection breaks during a transaction and its ROLLBACK fails too, `transaction()` still throws the transaction's own error (the callback's, or COMMIT's), with the ROLLBACK error on it as a non-enumerable `rollbackError` property. The broken connection is closed, not returned to the pool. A connection the server closes while a callback holds it, between statements, does not end the process. Once a transaction has ended, its handle runs on the pool, as the adapter's own statements do, and its `transaction()` begins a new transaction.
+
 ### Segments
 
 A segment keeps one user's tables apart from another's in a database they share: AgentOS's tables beside an app's, in one PostgreSQL database or one browser.
@@ -461,34 +463,13 @@ See [**PLATFORM_STRATEGY.md**](./PLATFORM_STRATEGY.md) for a comprehensive guide
 
 ## Performance Tiers & Cost Optimization
 
-The adapter supports configurable performance tiers for different use cases:
+The package exports performance-tier types, the tier presets (`TIER_DEFAULTS`) and `resolvePerformanceConfig()`, which turns a tier and overrides into settings. `createDatabase()` takes no `performance` option, and no adapter applies a tier: a host that wants one reads the settings and acts on them itself.
 
 ```typescript
-import { createDatabase } from '@framers/sql-storage-adapter';
+import { resolvePerformanceConfig } from '@framers/sql-storage-adapter';
 
-// Development: Fast tier - prioritize speed
-const devDb = await createDatabase({
-  type: 'memory',
-  performance: { tier: 'fast' }
-});
-
-// Production: Balanced tier (default)
-const prodDb = await createDatabase({
-  priority: ['indexeddb', 'sqljs'],
-  performance: { tier: 'balanced' }
-});
-
-// Analytics/Reporting: Accurate tier - no caching, full validation
-const analyticsDb = await createDatabase({
-  postgres: { connectionString: process.env.DATABASE_URL },
-  performance: { tier: 'accurate', trackMetrics: true }
-});
-
-// Mobile: Efficient tier - battery optimization
-const mobileDb = await createDatabase({
-  priority: ['capacitor', 'indexeddb'],
-  performance: { tier: 'efficient', batchWrites: true }
-});
+// Analytics/Reporting: the accurate tier's settings (no caching, full validation)
+const settings = resolvePerformanceConfig({ tier: 'accurate' });
 ```
 
 | Tier | Caching | Batching | Validation | Use Case |
@@ -502,10 +483,10 @@ See [**guides/OPTIMIZATION_GUIDE.md**](./guides/OPTIMIZATION_GUIDE.md) for detai
 
 ## Lifecycle Hooks
 
-The adapter provides lifecycle hooks for extending behavior:
+The package exports the `StorageHooks` types and the `combineHooks()` and `filterHooks()` helpers. `createDatabase()` takes no `hooks` option, and no adapter runs hooks: a host that wants them calls them around its own adapter calls.
 
 ```typescript
-import { createDatabase, type StorageHooks } from '@framers/sql-storage-adapter';
+import { combineHooks, type StorageHooks } from '@framers/sql-storage-adapter';
 
 const myHooks: StorageHooks = {
   // Log all writes
@@ -531,10 +512,8 @@ const myHooks: StorageHooks = {
   }
 };
 
-const db = await createDatabase({
-  performance: { tier: 'balanced' },
-  hooks: myHooks
-});
+// One StorageHooks object from several; the host calls its hooks itself
+const hooks = combineHooks(myHooks);
 ```
 
 ### Available Hooks
