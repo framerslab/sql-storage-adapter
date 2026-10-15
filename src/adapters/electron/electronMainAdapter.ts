@@ -37,6 +37,7 @@ import { BrowserWindow, app } from 'electron';
 import { BetterSqliteAdapter, createBetterSqliteAdapter } from '../betterSqliteAdapter';
 import { initializeIpcProtocol, disposeIpcProtocol } from './ipc/protocol';
 import { BROADCAST_CHANNELS } from './ipc/channels';
+import { segmentFilePath } from '../../shared/segment';
 import type {
   StorageAdapter,
   StorageCapability,
@@ -144,6 +145,14 @@ export interface ElectronMainAdapterOptions {
   multiWindow?: MultiWindowConfig;
   /** Enable verbose logging (default: false) */
   verbose?: boolean;
+  /**
+   * A database file of its own: the segment goes into the file's name, before
+   * its extension (`app.db` becomes `app-agentos.db`), and `getFilePath()`
+   * and the backups name that file. The renderer's IPC channels are one set
+   * per process, so a segmented adapter leaves them to the app's adapter
+   * without a segment: it serves the main process alone.
+   */
+  segment?: string;
 }
 
 // ============================================================================
@@ -190,6 +199,8 @@ export class ElectronMainAdapter implements StorageAdapter {
   private backupTimer: NodeJS.Timeout | null = null;
 
   private readonly options: ElectronMainAdapterOptions;
+  /** The database file: `options.filePath` with the segment in its name. */
+  private readonly filePath: string;
   private readonly walConfig: Required<WalConfig>;
   private readonly recoveryConfig: Required<RecoveryConfig>;
   private readonly multiWindowConfig: Required<MultiWindowConfig>;
@@ -202,8 +213,9 @@ export class ElectronMainAdapter implements StorageAdapter {
     this.recoveryConfig = { ...DEFAULT_RECOVERY_CONFIG, ...options.recovery };
     this.multiWindowConfig = { ...DEFAULT_MULTI_WINDOW_CONFIG, ...options.multiWindow };
 
-    // Create inner adapter
-    this.innerAdapter = createBetterSqliteAdapter(options.filePath);
+    // Create inner adapter; it puts the segment into the file's name.
+    this.filePath = segmentFilePath(options.filePath, options.segment);
+    this.innerAdapter = createBetterSqliteAdapter(options.filePath, { segment: options.segment });
 
     // Add electron-specific capabilities
     const baseCapabilities = new Set(this.innerAdapter.capabilities);
@@ -239,8 +251,12 @@ export class ElectronMainAdapter implements StorageAdapter {
         this.startWalCheckpointTimer();
       }
 
-      // Initialize IPC protocol for renderer communication
-      initializeIpcProtocol(this);
+      // Initialize IPC protocol for renderer communication. The channels are
+      // one set per process: a segmented adapter would take the app's windows
+      // over to its segment, so it leaves them to the adapter without one.
+      if (this.options.segment === undefined) {
+        initializeIpcProtocol(this);
+      }
 
       // Start backup scheduler if enabled
       if (this.options.backup?.enabled && this.options.backup.provider) {
@@ -280,8 +296,10 @@ export class ElectronMainAdapter implements StorageAdapter {
         await this.runWalCheckpoint();
       }
 
-      // Dispose IPC handlers
-      disposeIpcProtocol();
+      // Dispose IPC handlers, which a segmented adapter never registered
+      if (this.options.segment === undefined) {
+        disposeIpcProtocol();
+      }
 
       // Close inner adapter
       await this.innerAdapter.close();
@@ -496,8 +514,8 @@ export class ElectronMainAdapter implements StorageAdapter {
       throw new Error('No backup provider configured');
     }
 
-    const backupPath = `${this.options.filePath}.backup`;
-    const remotePath = `backups/${path.basename(this.options.filePath)}_${Date.now()}.db`;
+    const backupPath = `${this.filePath}.backup`;
+    const remotePath = `backups/${path.basename(this.filePath)}_${Date.now()}.db`;
 
     // Create a backup using VACUUM INTO
     await this.innerAdapter.exec(`VACUUM INTO '${backupPath}'`);
@@ -575,11 +593,12 @@ export class ElectronMainAdapter implements StorageAdapter {
    */
   private extractTables(statement: string): string[] {
     const tables: string[] = [];
+    // matchAll() takes global patterns only; it throws for any other.
     const patterns = [
       /FROM\s+([^\s,;(]+)/gi,
-      /INSERT\s+INTO\s+([^\s(]+)/i,
-      /UPDATE\s+([^\s]+)/i,
-      /DELETE\s+FROM\s+([^\s]+)/i,
+      /INSERT\s+INTO\s+([^\s(]+)/gi,
+      /UPDATE\s+([^\s]+)/gi,
+      /DELETE\s+FROM\s+([^\s]+)/gi,
     ];
 
     for (const pattern of patterns) {
@@ -618,7 +637,7 @@ export class ElectronMainAdapter implements StorageAdapter {
    * Get the database file path.
    */
   public getFilePath(): string {
-    return this.options.filePath;
+    return this.filePath;
   }
 }
 
