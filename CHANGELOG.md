@@ -1,3 +1,11 @@
+## [0.6.13] - 2026-10-15
+
+### Fixed
+- The declaration files name the files they import. tsc copies relative specifiers as the source writes them, and the build gave them their extensions in the JavaScript files only, so `dist/index.d.ts` carried `export * from './types'`. Under `--moduleResolution node16` or `nodenext`, TypeScript reads the package's declarations as ES modules, where a relative specifier resolves only when it names its file, so a consumer on those settings saw none of the package's exports (`error TS2305: Module '"@framers/sql-storage-adapter"' has no exported member 'createPostgresAdapter'`). The build now gives every relative specifier in the declarations the `.js` file or `/index.js` folder index it names, as it does in the JavaScript. Consumers on `bundler` or `node10` resolution read the same declarations as before.
+
+### Changed
+- CI packs the package, installs the tarball into a new ES module project and type-checks a consumer of `createDatabase`, `resolveStorageAdapter`, `createPostgresAdapter` and `StorageAdapter` with `--module nodenext --moduleResolution nodenext --strict`.
+
 ## [0.6.12] - 2026-10-12
 
 ### Fixed
