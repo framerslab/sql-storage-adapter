@@ -57,17 +57,27 @@ describe('foreignKeys on the SQLite adapters', () => {
     vi.unstubAllGlobals();
   });
 
-  it('turns enforcement on for better-sqlite3 through createDatabase, and leaves it off without the option', async () => {
+  it('sets enforcement on better-sqlite3 through createDatabase, which enforces foreign keys by default', async () => {
+    // better-sqlite3 is built with SQLITE_DEFAULT_FOREIGN_KEYS=1.
+    const byDefault = keep(await createDatabase({ type: 'memory' }));
     const on = keep(await createDatabase({ type: 'memory', foreignKeys: true }));
-    const off = keep(await createDatabase({ type: 'memory' }));
-    await on.exec(SCHEMA);
-    await off.exec(SCHEMA);
+    const off = keep(await createDatabase({ type: 'memory', foreignKeys: false }));
+    for (const db of [byDefault, on, off]) await db.exec(SCHEMA);
 
     expect(on.kind).toBe('better-sqlite3');
-    expect(await enforced(on)).toBe(true);
+    expect(await enforced(byDefault)).toBe(true);
     expect(await refusesOrphan(on, 1)).toBe(true);
     expect(await enforced(off)).toBe(false);
     expect(await refusesOrphan(off, 1)).toBe(false);
+  });
+
+  it('leaves sql.js without enforcement when the option is left out, as before', async () => {
+    const db = keep(createSqlJsAdapter());
+    await db.open();
+    await db.exec(SCHEMA);
+
+    expect(await enforced(db)).toBe(false);
+    expect(await refusesOrphan(db, 1)).toBe(false);
   });
 
   it('takes the option through resolveStorageAdapter openOptions', async () => {

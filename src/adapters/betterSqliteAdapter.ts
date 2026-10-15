@@ -242,8 +242,8 @@ export class BetterSqliteAdapter implements StorageAdapter {
     const databaseOptions = options?.readOnly ? { readonly: true } : undefined;
     this.gate = createConnectionGate(await loadTransactionContext());
     this.db = new DatabaseCtor(resolvedPath, databaseOptions);
-    if (options?.foreignKeys) {
-      this.db.exec('PRAGMA foreign_keys = ON');
+    if (options?.foreignKeys !== undefined) {
+      this.db.exec(`PRAGMA foreign_keys = ${options.foreignKeys ? 'ON' : 'OFF'}`);
     }
   }
 

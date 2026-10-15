@@ -151,9 +151,9 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
       }
     }
 
-    if (options?.foreignKeys) {
+    if (options?.foreignKeys !== undefined) {
       // Outside the plugin's own transaction: SQLite ignores this PRAGMA inside one.
-      await this.connection.execute('PRAGMA foreign_keys = ON;', false);
+      await this.connection.execute(`PRAGMA foreign_keys = ${options.foreignKeys ? 'ON' : 'OFF'};`, false);
     }
   }
 

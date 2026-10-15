@@ -188,8 +188,8 @@ export class IndexedDbAdapter implements StorageAdapter {
 
   private SQL: SqlJsStatic | null = null;
   private db: SqlJsDatabase | null = null;
-  /** Whether open() was asked to enforce foreign keys; sql.js forgets the PRAGMA when export() reopens the connection. */
-  private foreignKeys = false;
+  /** Foreign-key enforcement as open() was asked for it (undefined: the engine default); sql.js forgets the PRAGMA when export() reopens the connection. */
+  private foreignKeys: boolean | undefined;
   private idb: IDBDatabase | null = null;
   private saveTimer: ReturnType<typeof setInterval> | null = null;
   /** Bumped by every statement that can change the database. */
@@ -249,7 +249,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     if (this.db) {
       return; // Already open
     }
-    this.foreignKeys = options?.foreignKeys === true;
+    this.foreignKeys = options?.foreignKeys;
 
     // Initialize sql.js using global singleton (prevents race conditions)
     this.SQL = await getGlobalSQL(this.sqlJsConfig);
@@ -540,8 +540,8 @@ export class IndexedDbAdapter implements StorageAdapter {
 
   /** Applies the connection settings open() was asked for: sql.js loses them whenever export() reopens the connection. */
   private applyConnectionSettings(): void {
-    if (this.foreignKeys) {
-      this.db!.run('PRAGMA foreign_keys = ON;');
+    if (this.foreignKeys !== undefined) {
+      this.db!.run(`PRAGMA foreign_keys = ${this.foreignKeys ? 'ON' : 'OFF'};`);
     }
   }
 
