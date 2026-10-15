@@ -350,6 +350,44 @@ describe('IndexedDbAdapter transactions and saving', () => {
       expect(await storedLabels('save-abort')).toEqual(['kept']);
     });
 
+    it('DIAG abort timeline', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const adapter = await openWithItems('save-abort-diag');
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['kept']);
+      const internals = adapter as unknown as {
+        saving: Promise<void> | null;
+        savedGeneration: number;
+        writeGeneration: number;
+      };
+      const save = vi.spyOn(adapter as unknown as { saveToIndexedDb: () => Promise<void> }, 'saveToIndexedDb');
+      const state = (label: string): void => {
+        console.log(
+          `DIAG ${label}: saving=${internals.saving !== null} saved=${internals.savedGeneration} ` +
+            `written=${internals.writeGeneration} saves=${save.mock.calls.length} warnings=${warn.mock.calls.length}`,
+        );
+      };
+
+      IDBObjectStore.prototype.put = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['put']>) {
+        const request = originalPut.apply(this, args);
+        request.addEventListener('success', () => this.transaction.abort());
+        return request;
+      };
+      tick();
+      state('after tick 1');
+      const first = await storedLabels('save-abort-diag');
+      state(`after read 1 ${JSON.stringify(first)}`);
+      for (let i = 0; i < 50 && warn.mock.calls.length === 0; i += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      state('after waiting for the warning');
+      IDBObjectStore.prototype.put = originalPut;
+      tick();
+      state('after tick 2');
+      const second = await storedLabels('save-abort-diag');
+      state(`after read 2 ${JSON.stringify(second)}`);
+      warn.mockRestore();
+    });
+
     it('saves an imported database before importDatabase() resolves, with no tick', async () => {
       const source = await openWithItems('import-source');
       await source.run('INSERT INTO items (label) VALUES (?)', ['imported']);
