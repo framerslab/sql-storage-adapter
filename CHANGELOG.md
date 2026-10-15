@@ -1,3 +1,12 @@
+## [Unreleased]
+
+### Added
+- `isUniqueViolation(error)` recognises a unique or primary-key violation from any adapter: PostgreSQL's SQLSTATE 23505, better-sqlite3's `SQLITE_CONSTRAINT_UNIQUE` and `SQLITE_CONSTRAINT_PRIMARYKEY`, and the "UNIQUE constraint failed" message from sql.js, IndexedDB and Capacitor. It follows `cause` up to ten levels and does not loop on a cycle, so an error a product wraps still counts.
+- The SQLite adapters (better-sqlite3, sql.js, IndexedDB, Capacitor) take `$1`, `$2`, ... bound from a positional array, as PostgreSQL does, so one statement runs on both. SQLite reads `$1` as a named parameter: better-sqlite3 refused to bind it from an array ("Too many parameter values were provided"), and sql.js bound it in order of first appearance, so `$2, $1` got the values swapped. Each `$n` outside literals and comments becomes `?` with the values in `$n` order, repeats included. A statement that mixes `?` and `$n` is refused with an error.
+
+### Fixed
+- PostgreSQL placeholder rewriting reads SQL as the server does. A `?` or `@name` inside a string literal (`'What should this week hold?'`), an `E'...'` string, a quoted identifier, a dollar-quoted string or a comment was rewritten to `$n`. The text was stored corrupted, or the statement failed with a parameter-count error. Such text is left as written now. The jsonb operators work: `??` is the `?` operator in a statement with `?` placeholders, and `?|` and `?&` are never placeholders. A statement that already uses `$n` is sent as written, where its `?` operators were rewritten. A statement run without parameters keeps its `?`, where each became an unbound `$n`.
+
 ## [0.6.15] - 2026-10-15
 
 ### Added

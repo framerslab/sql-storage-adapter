@@ -53,6 +53,7 @@ import type {
   StorageRunResult,
 } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
+import { toSqliteStatement } from '../shared/sqlPlaceholders';
 import {
   createSerializedTransactionRunner,
   createSharedConnectionTransactionAdapter,
@@ -360,6 +361,7 @@ export class IndexedDbAdapter implements StorageAdapter {
   }
 
   private runNow(statement: string, parameters?: StorageParameters): StorageRunResult {
+    ({ statement, parameters } = toSqliteStatement(statement, parameters));
     this.ensureOpen();
     const stmt = this.db!.prepare(statement);
     try {
@@ -407,6 +409,7 @@ export class IndexedDbAdapter implements StorageAdapter {
   }
 
   private allNow<T>(statement: string, parameters?: StorageParameters): T[] {
+    ({ statement, parameters } = toSqliteStatement(statement, parameters));
     this.ensureOpen();
     // all() and get() run writes too (INSERT, UPDATE or DELETE ... RETURNING),
     // which are saved like a write through run(). SELECT, VALUES and EXPLAIN
