@@ -37,6 +37,14 @@ describe('createDatabase - adapter priority', () => {
     expect(last().postgres).toEqual({ connectionString: POSTGRES_URL, max: 4, ssl: true, statement_timeout: 5000 });
   });
 
+  it('chooses Postgres alone on Node for a pool of the caller', async () => {
+    const pool = { query: async () => ({ rows: [], rowCount: 0 }) };
+
+    await createDatabase({ postgres: { pool } as never });
+
+    expect(last().priority).toEqual(['postgres']);
+  });
+
   it('chooses Postgres alone on Node for options that name a host, database and user', async () => {
     await connectDatabase({ host: 'db.internal', database: 'app', user: 'app' });
 
@@ -49,12 +57,23 @@ describe('createDatabase - adapter priority', () => {
     expect(last().priority).toEqual(['better-sqlite3', 'sqljs']);
   });
 
-  it('keeps sql.js in a browser, which cannot reach a Postgres URL', async () => {
+  it('chooses IndexedDB, then sql.js, in a browser, and no Postgres for a URL it cannot reach', async () => {
     vi.stubGlobal('window', { document: {} });
 
     await createDatabase({ url: POSTGRES_URL });
+    expect(last().priority).toEqual(['indexeddb', 'sqljs']);
 
-    expect(last().priority).toEqual(['sqljs']);
+    await createDatabase();
+    expect(last().priority).toEqual(['indexeddb', 'sqljs']);
+  });
+
+  it('hands the IndexedDB options and the segment to the resolver in a browser', async () => {
+    vi.stubGlobal('window', { document: {} });
+
+    await createDatabase({ indexedDb: { dbName: 'notes', durability: 'commit' }, segment: 'agentos' });
+
+    expect(last().indexedDb).toEqual({ dbName: 'notes', durability: 'commit' });
+    expect(last().segment).toBe('agentos');
   });
 
   it('keeps sql.js on Deno', async () => {

@@ -48,6 +48,7 @@
     "format:check": "prettier --check \"src/**/*.{ts,tsx,json,md}\"",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:browser": "vitest run --config vitest.browser.config.ts",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "coverage": "npm run test:coverage",
@@ -121,7 +122,9 @@
     "typedoc": "^0.26.11",
     "typescript": "^5.6.3",
     "typescript-eslint": "^8.46.2",
-    "vitest": "^3.2.7"
+    "vitest": "^3.2.7",
+    "@vitest/browser": "^3.2.7",
+    "playwright": "~1.63.0"
   },
   "dependencies": {
     "pg": "^8.13.1",

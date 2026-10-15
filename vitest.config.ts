@@ -31,7 +31,9 @@ export default defineConfig({
     exclude: [
       'node_modules',
       'dist',
-      'coverage'
+      'coverage',
+      // Run in Chromium and WebKit by vitest.browser.config.ts.
+      'tests/browser/**'
       // better-sqlite3 is a dev dependency, so its suites run here. Without the
       // native module, betterSqliteAdapter.spec skips itself and the dataExport,
       // dataImport and migration specs fall back to sql.js.

@@ -9,12 +9,15 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # The Postgres specs that need a server (tests/createDatabase.postgres.spec.ts)
-    # run against this one. They read POSTGRES_TEST_URL; the older Postgres suites
-    # read TEST_POSTGRES_URL and DATABASE_URL, which stay unset here.
+    # The Postgres specs that need a server (createDatabase.postgres,
+    # postgres.segment, postgres.pool and the key-value store's) run against this
+    # one. They read POSTGRES_TEST_URL; the older Postgres suites read
+    # TEST_POSTGRES_URL and DATABASE_URL, which stay unset here. The image is
+    # PostgreSQL 16 with the pgvector extension available, so the segment specs
+    # can check that the vector type resolves through public.
     services:
       postgres:
-        image: postgres:16
+        image: pgvector/pgvector:0.8.7-pg16
         env:
           POSTGRES_USER: adapter
           POSTGRES_PASSWORD: adapter
@@ -69,19 +72,54 @@ jobs:
           npm pack --pack-destination "$pack_dir"
           cd "$consumer_dir"
           echo '{ "name": "nodenext-consumer", "private": true, "type": "module" }' > package.json
-          npm install --no-audit --no-fund "$pack_dir"/*.tgz
+          # @types/pg so that a pg Pool, as a host holds one, is checked against the adapter's pool option.
+          npm install --no-audit --no-fund "$pack_dir"/*.tgz @types/pg
           cat > index.ts <<'EOF'
+          import type { Pool } from 'pg';
           import {
             createDatabase,
             createPostgresAdapter,
             resolveStorageAdapter,
+            type PostgresAdapter,
             type StorageAdapter,
           } from '@framers/sql-storage-adapter';
+          import {
+            createSqlKeyValueStore,
+            namespaced,
+            openIndexedDbStore,
+            type KeyValueStore,
+          } from '@framers/sql-storage-adapter/kv';
 
-          export const openDefault = (): Promise<StorageAdapter> => createDatabase();
+          export const openDefault = (): Promise<StorageAdapter> => createDatabase({ segment: 'agentos' });
           export const openResolved = (): Promise<StorageAdapter> => resolveStorageAdapter();
           export const openPostgres = (url: string): StorageAdapter => createPostgresAdapter(url);
+          export const openOnPool = (pool: Pool): StorageAdapter =>
+            createPostgresAdapter({ pool, ownsPool: true, onError: (error: Error) => console.error(error) });
+          export const poolOf = (adapter: PostgresAdapter) => adapter.getPool();
+          export const openKv = async (adapter: StorageAdapter): Promise<KeyValueStore> =>
+            namespaced(await createSqlKeyValueStore(adapter, { table: 'agentos_kv' }), 'user/');
+          export const openBrowserKv = (): Promise<KeyValueStore> => openIndexedDbStore({ dbName: 'app', storeName: 'kv' });
           EOF
           tsc="$GITHUB_WORKSPACE/node_modules/.bin/tsc"
           "$tsc" --version
           "$tsc" --module nodenext --moduleResolution nodenext --strict --skipLibCheck --noEmit index.ts
+
+  # The IndexedDB adapter's cross-tab coordination and durability, and the
+  # key-value module, on the browsers' own IndexedDB, Web Locks and structured
+  # clone: Chromium and WebKit, through Playwright.
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Chromium and WebKit
+        run: npx playwright install --with-deps chromium webkit
+
+      - name: Run the browser specs
+        run: npx vitest run --config vitest.browser.config.ts
