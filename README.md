@@ -264,6 +264,38 @@ await db.transaction(async (trx) => {
 
 The IndexedDB, Capacitor and better-sqlite3 adapters run every transaction on one connection, so they run transactions one at a time, and a statement from another caller waits until the open transaction ends: it neither joins the transaction (and vanishes in its rollback) nor reads what the transaction has not committed. A browser or a WebView has no async context to tell the callback's own statements apart, so on the IndexedDB and Capacitor adapters a statement the callback issues through the adapter itself, not through its handle, waits for the transaction too. The two then wait on each other, and the adapter logs a warning after 10 seconds. (On Node, better-sqlite3 tells them apart with `AsyncLocalStorage`.) Inside a callback, run every statement through the handle, and do not await work that itself needs the database.
 
+### PostgreSQL pool control
+
+`PostgresAdapter` holds a `pg` pool. Narrow an adapter to it with `db instanceof PostgresAdapter` (or `db.kind === 'postgres'`) to reach these:
+
+```typescript
+import { createDatabase, PostgresAdapter } from '@framers/sql-storage-adapter';
+
+const db = await createDatabase({ url: process.env.DATABASE_URL, strict: true, postgres: { max: 10, allowExitOnIdle: true } });
+
+if (db instanceof PostgresAdapter) {
+  // One connection for the callback: a session advisory lock, then statements on the same session
+  await db.withConnection(async (connection) => {
+    await connection.get('SELECT pg_advisory_lock(?)', [42]);
+    try {
+      await connection.run('UPDATE jobs SET owner = ? WHERE owner IS NULL', ['worker-1']);
+    } finally {
+      await connection.get('SELECT pg_advisory_unlock(?)', [42]);
+    }
+  });
+
+  // Isolation level and read-only and deferrable modes
+  await db.transaction(async (trx) => trx.all('SELECT * FROM ledger'), { isolationLevel: 'serializable', readOnly: true, deferrable: true });
+
+  // { total, idle, waiting }, or null before open() and after close()
+  console.log(db.getPoolStats());
+}
+```
+
+- `withConnection(fn)` returns the connection to the pool when `fn` resolves, with whatever session state `fn` left (undo `SET` and release session locks before returning, or use `SET LOCAL` inside a transaction). When `fn` throws, the connection is closed, and `fn`'s error is rethrown. When `fn` returns inside a transaction it began and did not end, the connection is closed (rolling it back) and the call rejects; pg 8.21 and later report the transaction status this needs. The connection refuses statements once `fn` has ended, and `connection.transaction()` runs one transaction at a time.
+- `transaction(fn, options)` refuses an isolation level outside `'read uncommitted'`, `'read committed'`, `'repeatable read'` and `'serializable'` before it checks out a connection.
+- `allowExitOnIdle` is pg's option: Node can exit while every pooled connection is idle. Without it, idle connections keep the process running until `idleTimeoutMillis` (10 seconds by default) closes them.
+
 ### IndexedDB-Specific Config
 
 ```typescript
