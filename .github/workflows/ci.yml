@@ -9,6 +9,25 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # The Postgres specs that need a server (tests/createDatabase.postgres.spec.ts)
+    # run against this one. They read POSTGRES_TEST_URL; the older Postgres suites
+    # read TEST_POSTGRES_URL and DATABASE_URL, which stay unset here.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: adapter
+          POSTGRES_PASSWORD: adapter
+          POSTGRES_DB: adapter_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U adapter -d adapter_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_TEST_URL: postgresql://adapter:adapter@localhost:5432/adapter_test
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5

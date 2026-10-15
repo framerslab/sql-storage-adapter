@@ -12,9 +12,11 @@
  * callback's handle it carries the transaction's token, so it is admitted
  * whatever async context runs it. Through the adapter itself, from code the
  * callback runs, the callback's async context tells it apart, so the gate needs
- * a context store (Node's AsyncLocalStorage); without one it admits every
- * statement that carries no token at once, which is how the adapters behaved
- * before the gate.
+ * a context store (Node's AsyncLocalStorage). Without one, the gate either
+ * admits every statement that carries no token at once, which is how the
+ * adapters behaved before the gate, or makes it wait like any outside caller,
+ * so that the handle is the only way into an open transaction: the adapters
+ * that run in a browser or a WebView, where there is no context store, wait.
  *
  * This module imports nothing from Node, so browser bundles can include it;
  * the adapter that runs on Node passes the store in.
@@ -53,20 +55,36 @@ export interface ConnectionGate {
   dispose(): void;
 }
 
+/** How a gate treats a statement that carries no token. */
+export interface ConnectionGateOptions {
+  /**
+   * When there is no context store: 'admit' runs such a statement at once (the
+   * default, how the adapters behaved before the gate); 'wait' holds it until
+   * the open transaction ends, so only the transaction's handle reaches it.
+   */
+  withoutContext?: 'admit' | 'wait';
+}
+
 /**
  * Creates the gate of one shared connection.
  *
- * @param context - Node's AsyncLocalStorage, or null where there is none (the
- *   gate then admits every statement at once).
+ * @param context - Node's AsyncLocalStorage, or null where there is none.
+ * @param options - What the gate does with a token-less statement when there
+ *   is no context store.
  */
-export const createConnectionGate = (context: TransactionContextStore | null): ConnectionGate => {
+export const createConnectionGate = (
+  context: TransactionContextStore | null,
+  options: ConnectionGateOptions = {},
+): ConnectionGate => {
   let open: { id: symbol; done: Promise<void> } | null = null;
+  const waitWithoutContext = options.withoutContext === 'wait';
 
   return {
     blocks: (token) => {
       if (open === null) return false;
       if (token !== undefined) return token !== open.id;
-      return context !== null && context.getStore() !== open.id;
+      if (context === null) return waitWithoutContext;
+      return context.getStore() !== open.id;
     },
     inside: () => open !== null && context !== null && context.getStore() === open.id,
     openToken: () => open?.id ?? null,
@@ -91,19 +109,43 @@ export const createConnectionGate = (context: TransactionContextStore | null): C
   };
 };
 
+/** Reports a statement that is still waiting for an open transaction after a while. */
+export interface LongWaitWatch {
+  /** How long a statement may wait before `onLongWait` is called. */
+  afterMs: number;
+  /** Called once per waiting statement that passes `afterMs`. */
+  onLongWait: () => void;
+}
+
 /**
- * Runs `work`, a synchronous statement, once the gate admits it. The last check
- * and the work happen in the same turn, so no transaction can open between
+ * Runs `work` once the gate admits it. `work` starts the statement: it runs it
+ * (a synchronous adapter) or sends it (an asynchronous one), and the last check
+ * and that start happen in the same turn, so no transaction can open between
  * them; a caller woken when a transaction ends checks again, since the next
  * transaction may already be open.
  *
  * @param token - The transaction's token when the statement comes through a
  *   transaction handle; a handle whose transaction has ended waits like any
  *   outside caller.
+ * @param watch - Reports a statement that waits long, which is how a callback
+ *   that issues a statement through the adapter instead of its handle shows
+ *   on an adapter whose gate makes such statements wait.
  */
-export const whenAdmitted = async <T>(gate: ConnectionGate, work: () => T, token?: symbol): Promise<T> => {
-  while (gate.blocks(token)) {
-    await gate.ended();
+export const whenAdmitted = async <T>(
+  gate: ConnectionGate,
+  work: () => T | PromiseLike<T>,
+  token?: symbol,
+  watch?: LongWaitWatch,
+): Promise<T> => {
+  if (gate.blocks(token)) {
+    const timer = watch ? setTimeout(watch.onLongWait, watch.afterMs) : undefined;
+    try {
+      while (gate.blocks(token)) {
+        await gate.ended();
+      }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
   return work();
 };
