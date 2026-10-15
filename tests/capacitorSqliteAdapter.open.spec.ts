@@ -358,6 +358,16 @@ describe('CapacitorSqliteAdapter open() and close() on @capacitor-community/sqli
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it("keeps the plugin's foreign keys on by default, and foreignKeys false turns them off", async () => {
+    const byDefault = await openAdapter('foreign-keys-default', { enableWal: false });
+    expect(await byDefault.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
+
+    const off = new CapacitorSqliteAdapter({ database: 'foreign-keys-off', enableWal: false });
+    adapters.push(off);
+    await off.open({ foreignKeys: false });
+    expect(await off.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 0 });
+  });
+
   it('closes its native connection, so the database opens again with its rows', async () => {
     const first = await openAdapter('reopen');
     await first.exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)');

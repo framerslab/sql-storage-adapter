@@ -410,6 +410,30 @@ describe('IndexedDbAdapter transactions and saving', () => {
       await adapter.run('DELETE FROM parent WHERE id = 2');
       expect(await childParents(adapter)).toEqual([3]);
     });
+
+    it('keeps PRAGMA foreign_keys = OFF run after foreignKeys: true at open, across a save', async () => {
+      // SQLite's procedure for changing a table turns enforcement off around the rebuild.
+      const adapter = new IndexedDbAdapter({ dbName: 'foreign-keys-off', saveIntervalMs: SAVE_INTERVAL_MS });
+      opened.push(adapter);
+      await adapter.open({ foreignKeys: true });
+      expect(await adapter.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
+
+      await adapter.exec('PRAGMA foreign_keys = OFF');
+      tick();
+      expect(await readStoredImage('foreign-keys-off')).not.toBeNull();
+
+      expect(await adapter.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 0 });
+    });
+
+    it('keeps PRAGMA secure_delete = FAST, which reads back as 2', async () => {
+      const adapter = await openAdapter('secure-delete');
+      await adapter.exec('PRAGMA secure_delete = FAST');
+      expect(await adapter.get('PRAGMA secure_delete')).toEqual({ secure_delete: 2 });
+
+      adapter.exportDatabase();
+
+      expect(await adapter.get('PRAGMA secure_delete')).toEqual({ secure_delete: 2 });
+    });
   });
 
   describe('importDatabase()', () => {
