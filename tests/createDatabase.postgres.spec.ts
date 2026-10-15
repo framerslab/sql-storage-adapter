@@ -65,7 +65,8 @@ describe('createDatabase - choosing Postgres', () => {
   });
 
   it('does not move createDatabase({ file }) to Postgres when DATABASE_URL is set', async () => {
-    // paracosm's stores rely on this.
+    // Stores that keep a local file run in processes where DATABASE_URL names
+    // another database.
     vi.stubEnv('DATABASE_URL', UNREACHABLE_URL);
 
     const adapter = keep(await createDatabase({ file: tempFile() }));

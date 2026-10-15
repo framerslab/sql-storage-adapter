@@ -6,9 +6,9 @@ import { resolveStorageAdapter, StorageResolutionError, type AdapterKind, type S
 
 // The adapter kinds a priority list (or STORAGE_ADAPTER) may name. The resolver
 // builds postgres, better-sqlite3, capacitor, indexeddb and sqljs, and builds
-// sql.js for memory, which hosts pass (agentos-workbench, quarry's codex
-// viewer, promptmachine). A kind it cannot build fails as a candidate with an
-// error that names it, and the resolver goes on to the next one.
+// sql.js for memory, which hosts pass at the end of their browser lists. A kind
+// it cannot build fails as a candidate with an error that names it, and the
+// resolver goes on to the next one.
 
 describe('Resolver - adapter kinds', () => {
   const dirs: string[] = [];

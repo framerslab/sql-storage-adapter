@@ -59,6 +59,14 @@ const settle = async (): Promise<void> => {
   }
 };
 
+/** Lets queued work run until `done` holds, for a bounded number of turns. */
+const until = async (done: () => boolean): Promise<void> => {
+  for (let i = 0; i < 100 && !done(); i += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  expect(done()).toBe(true);
+};
+
 /** Fires the auto-save interval once. */
 const tick = (): void => {
   vi.advanceTimersByTime(SAVE_INTERVAL_MS);
@@ -138,7 +146,7 @@ describe('IndexedDbAdapter transactions and saving', () => {
     });
 
     it("keeps a caller's own BEGIN open across a tick and saves its rows after COMMIT", async () => {
-      // The pattern Quarry's plugin API and frame.dev's block database use.
+      // Hosts that manage their own transactions through exec() do this.
       const adapter = await openWithItems('caller-begin');
       tick();
 
@@ -333,59 +341,33 @@ describe('IndexedDbAdapter transactions and saving', () => {
       IDBObjectStore.prototype.put = originalPut;
     });
 
-    it('tries again when its transaction aborts after the put succeeded', async () => {
-      const adapter = await openWithItems('save-abort');
-      await adapter.run('INSERT INTO items (label) VALUES (?)', ['kept']);
-
-      IDBObjectStore.prototype.put = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['put']>) {
-        const request = originalPut.apply(this, args);
-        request.addEventListener('success', () => this.transaction.abort());
-        return request;
-      };
-      tick();
-      expect(await storedLabels('save-abort')).toBeNull();
-
-      IDBObjectStore.prototype.put = originalPut;
-      tick();
-      expect(await storedLabels('save-abort')).toEqual(['kept']);
-    });
-
-    it('DIAG abort timeline', async () => {
+    it('reports a save whose transaction aborts after the put succeeded once, and saves on the next tick', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-      const adapter = await openWithItems('save-abort-diag');
-      await adapter.run('INSERT INTO items (label) VALUES (?)', ['kept']);
-      const internals = adapter as unknown as {
-        saving: Promise<void> | null;
-        savedGeneration: number;
-        writeGeneration: number;
-      };
-      const save = vi.spyOn(adapter as unknown as { saveToIndexedDb: () => Promise<void> }, 'saveToIndexedDb');
-      const state = (label: string): void => {
-        console.log(
-          `DIAG ${label}: saving=${internals.saving !== null} saved=${internals.savedGeneration} ` +
-            `written=${internals.writeGeneration} saves=${save.mock.calls.length} warnings=${warn.mock.calls.length}`,
-        );
-      };
+      try {
+        const adapter = await openWithItems('save-abort');
+        await adapter.run('INSERT INTO items (label) VALUES (?)', ['kept']);
 
-      IDBObjectStore.prototype.put = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['put']>) {
-        const request = originalPut.apply(this, args);
-        request.addEventListener('success', () => this.transaction.abort());
-        return request;
-      };
-      tick();
-      state('after tick 1');
-      const first = await storedLabels('save-abort-diag');
-      state(`after read 1 ${JSON.stringify(first)}`);
-      for (let i = 0; i < 50 && warn.mock.calls.length === 0; i += 1) {
-        await new Promise<void>((resolve) => setImmediate(resolve));
+        IDBObjectStore.prototype.put = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['put']>) {
+          const request = originalPut.apply(this, args);
+          request.addEventListener('success', () => this.transaction.abort());
+          return request;
+        };
+        tick();
+        expect(await storedLabels('save-abort')).toBeNull();
+        // The adapter learns of the abort from its transaction's abort event,
+        // which can arrive after another connection's read has finished; until
+        // then the save is in progress and a tick starts no other.
+        await until(() => warn.mock.calls.length > 0);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(String(warn.mock.calls[0][0])).toContain('"save-abort"');
+
+        IDBObjectStore.prototype.put = originalPut;
+        tick();
+        expect(await storedLabels('save-abort')).toEqual(['kept']);
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
       }
-      state('after waiting for the warning');
-      IDBObjectStore.prototype.put = originalPut;
-      tick();
-      state('after tick 2');
-      const second = await storedLabels('save-abort-diag');
-      state(`after read 2 ${JSON.stringify(second)}`);
-      warn.mockRestore();
     });
 
     it('saves an imported database before importDatabase() resolves, with no tick', async () => {
