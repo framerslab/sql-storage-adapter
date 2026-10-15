@@ -7,12 +7,23 @@
  * - openDatabase() - Simple file-based database
  */
 
-import type { StorageAdapter } from './contracts';
+import { StorageResolutionError, type StorageAdapter } from './contracts';
 import { resolveStorageAdapter, type StorageResolutionOptions, type AdapterKind } from './resolver';
 import { namesPostgresServer } from '../shared/postgresTarget';
 import type { PostgresAdapterOptions } from '../adapters/postgresAdapter';
 import type { CapacitorAdapterOptions } from '../adapters/capacitorSqliteAdapter';
 import type { IndexedDbAdapterOptions } from '../adapters/indexedDbAdapter';
+
+/**
+ * The options that configure Postgres: `url` when the caller set the key, even
+ * to undefined (`{ url: process.env.DATABASE_URL }`), and `postgres`.
+ */
+const configuredPostgresOptions = (options: DatabaseOptions): Array<'url' | 'postgres'> => {
+  const named: Array<'url' | 'postgres'> = [];
+  if (Object.prototype.hasOwnProperty.call(options, 'url')) named.push('url');
+  if (options.postgres !== undefined) named.push('postgres');
+  return named;
+};
 
 /**
  * Database connection options.
@@ -76,6 +87,21 @@ export interface DatabaseOptions {
    * Advanced: Only use if you need fine-grained control.
    */
   priority?: AdapterKind[];
+
+  /**
+   * Strict resolution, for servers: no local database stands in for a
+   * Postgres the options configure. Default: false.
+   *
+   * - A `url` or `postgres` option that names no server (an empty or unset
+   *   connection string and no host, database or user) fails on Node instead
+   *   of opening the local default, unless `file` is given.
+   * - A postgres candidate that fails ends resolution with an error, whatever
+   *   `priority` lists after it.
+   *
+   * `DATABASE_URL` in the environment does not count here, strict or not.
+   * See `StorageResolutionOptions.strict` for the resolver's side.
+   */
+  strict?: boolean;
 }
 
 /**
@@ -84,12 +110,15 @@ export interface DatabaseOptions {
  * 
  * @example
  * ```typescript
- * // Auto-detect (PostgreSQL in prod, SQLite locally)
+ * // The local default: better-sqlite3 (sql.js without it) on Node, sql.js in a
+ * // browser. DATABASE_URL in the environment does not change it.
  * const db = await createDatabase();
- * 
- * // Specify database URL
+ *
+ * // PostgreSQL from DATABASE_URL on a server; strict fails when it is unset
+ * // instead of opening a local file
  * const db = await createDatabase({
- *   url: process.env.DATABASE_URL
+ *   url: process.env.DATABASE_URL,
+ *   strict: true
  * });
  * 
  * // Specify file path
@@ -122,6 +151,10 @@ export interface DatabaseOptions {
  *      would land in a local file. DATABASE_URL in the environment does not
  *      count here.
  *    - Node.js otherwise: ['better-sqlite3', 'sqljs'] (native first, wasm fallback)
+ *
+ * With `strict` on Node, a `url` or `postgres` option that names no server
+ * throws instead of choosing the local default (unless `file` is given), and a
+ * postgres candidate that fails ends resolution.
  *
  * The function never throws solely due to a native adapter absence; it falls
  * back to next candidates. Only when no candidate can open will it bubble an error.
@@ -180,6 +213,10 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
     resolverOptions.priority = options.priority;
   }
 
+  if (options.strict) {
+    resolverOptions.strict = true;
+  }
+
   // Auto-detect environment ONLY if no priority already set
   if (!resolverOptions.priority || resolverOptions.priority.length === 0) {
     if (isBrowser || isDeno) {
@@ -187,6 +224,12 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
       resolverOptions.priority = ['sqljs'];
     } else if (isNode && namesPostgresServer(resolverOptions.postgres)) {
       resolverOptions.priority = ['postgres'];
+    } else if (isNode && options.strict && !options.file && configuredPostgresOptions(options).length > 0) {
+      const named = configuredPostgresOptions(options);
+      throw new StorageResolutionError(
+        `[StorageAdapter] Strict resolution: the ${named.join(' and ')} option${named.length > 1 ? 's name' : ' names'} no server. ` +
+          'Give a connection string, or a host, database or user, or pass file to open a local database.',
+      );
     } else if (isNode) {
       resolverOptions.priority = ['better-sqlite3', 'sqljs'];
     } else {

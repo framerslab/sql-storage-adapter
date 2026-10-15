@@ -7,15 +7,13 @@ This guide covers connecting to remote PostgreSQL databases from any environment
 ```typescript
 import { createDatabase } from '@framers/sql-storage-adapter';
 
-// Auto-detect from DATABASE_URL environment variable
-const db = await createDatabase();
-
-// Or explicit connection
+// PostgreSQL from DATABASE_URL. createDatabase() opens the database it
+// returns, and does not read DATABASE_URL on its own: pass it as url.
+// strict fails when DATABASE_URL is unset, instead of opening a local file.
 const db = await createDatabase({
-  url: process.env.DATABASE_URL
+  url: process.env.DATABASE_URL,
+  strict: true
 });
-
-await db.open();
 ```
 
 ## Connection Methods
@@ -55,10 +53,15 @@ const db = await createDatabase({
 DATABASE_URL=postgresql://user:pass@prod.db.com/myapp?sslmode=require
 
 // .env.development
-DATABASE_URL=  # Empty = falls back to SQLite
+DATABASE_URL=  # Empty: a local SQLite file (without strict)
 
-// Your code (works in both environments!)
-const db = await createDatabase();
+// Your code: PostgreSQL where DATABASE_URL is set, a local SQLite file where it
+// is empty. Pass strict: true in production, so an unset DATABASE_URL fails
+// instead of writing to a local file.
+const db = await createDatabase({
+  url: process.env.DATABASE_URL,
+  strict: process.env.NODE_ENV === 'production'
+});
 ```
 
 ## Cloud Provider Examples

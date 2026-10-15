@@ -119,9 +119,11 @@ const desktopDb = await createDatabase({ priority: ['better-sqlite3', 'sqljs'] }
 // Mobile (Capacitor): Uses native SQLite
 const mobileDb = await createDatabase({ priority: ['capacitor', 'indexeddb'] });
 
-// Cloud (Node): Uses PostgreSQL
-const cloudDb = await createDatabase({ 
-  postgres: { connectionString: process.env.DATABASE_URL }
+// Cloud (Node): Uses PostgreSQL. strict fails when DATABASE_URL is unset,
+// where it would otherwise open a local SQLite file.
+const cloudDb = await createDatabase({
+  url: process.env.DATABASE_URL,
+  strict: true
 });
 ```
 
@@ -147,7 +149,7 @@ See [Platform Strategy Guide](./PLATFORM_STRATEGY.md) for detailed pros/cons and
 | **Electron (Desktop)** | electron | better-sqlite3 | Desktop apps, dev tools |
 | **Capacitor (Mobile)** | capacitor | IndexedDB | iOS/Android native apps |
 | **Node.js** | better-sqlite3 | Postgres, sql.js | CLI tools, local servers |
-| **Cloud (Serverless)** | Postgres | better-sqlite3 | Multi-tenant SaaS, APIs |
+| **Cloud (Serverless)** | Postgres | None with `strict` or `createDatabase({ url })`; better-sqlite3 from `resolveStorageAdapter()` otherwise | Multi-tenant SaaS, APIs |
 
 ## Electron Adapter
 
@@ -245,6 +247,7 @@ await sync.connect();
 - Adapters are attempted in priority order until one opens successfully; a `StorageResolutionError` includes the full failure chain.
 - The resolver builds `postgres`, `better-sqlite3`, `capacitor`, `indexeddb` and `sqljs`, and builds sql.js for `memory`. Any other kind (`electron-main`, `electron-renderer`, `supabase`, or an unknown name, from `priority` or `STORAGE_ADAPTER`) fails as a candidate with an error that names it, and the next candidate is tried.
 - On Node, `createDatabase({ url })`, `createDatabase({ postgres })` and `connectDatabase()` open PostgreSQL, with every Postgres option (pool size, SSL, timeouts, application name, or host, port, database, user and password without a connection string) passed on, and do not fall back to SQLite. In a browser and on Deno, `createDatabase()` opens sql.js whatever the options say. `DATABASE_URL` in the environment does not change what `createDatabase()` picks; `resolveStorageAdapter()` without a `priority` tries Postgres first when it is set.
+- `strict: true` (on `createDatabase` and `resolveStorageAdapter`) is for servers: only the database the options name opens. A postgres candidate that fails ends resolution with a `StorageResolutionError`, whatever `priority` lists after it; with `DATABASE_URL` or Postgres options that name a server and no `priority`, `['postgres']` is the whole list; an explicit file path (`file`, `filePath`) outranks `DATABASE_URL`; and a `url` or `postgres` option that names no server fails instead of opening the local default, unless a file is given. Without `strict`, `resolveStorageAdapter()` falls back from a failed Postgres to better-sqlite3, IndexedDB and sql.js, and `DATABASE_URL` comes before a `filePath`.
 - Provide `priority: ['indexeddb', 'sqljs']` for browser bundles or tests where native modules shouldn't load.
 - Use `createCloudBackupManager` for S3-compatible backups with gzip compression and retention limits.
 

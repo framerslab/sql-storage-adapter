@@ -1,7 +1,13 @@
 ## [Unreleased]
 
+### Added
+- `strict` on `createDatabase()` and `resolveStorageAdapter()`, for servers: only the database the options name opens. A postgres candidate that fails ends resolution with a `StorageResolutionError` whose `causes` hold its error, whatever `priority` lists after it; without `strict` it falls through to better-sqlite3, IndexedDB and sql.js. With `DATABASE_URL` or Postgres options that name a server and no `priority`, `['postgres']` is the whole list. An explicit file path outranks `DATABASE_URL`, which is then not read. A `url` or `postgres` option that names no server (`{ url: process.env.DATABASE_URL }` with the variable unset), or Postgres options given to the resolver with no `DATABASE_URL` to fill them in, fails instead of opening the local default, unless a file is given. `strict` is off by default, and resolution without it is unchanged.
+
 ### Changed
 - CI runs the PostgreSQL integration suite (17 tests) and the dialect and full-text search suite (9 tests) against its PostgreSQL 16 service; both skipped in CI before. They read `POSTGRES_TEST_URL`, as the `createDatabase` specs do: the integration suite read `TEST_POSTGRES_URL`, which it still reads when `POSTGRES_TEST_URL` is unset, and the dialect suite read `DATABASE_URL`, which also moves the resolver's default to Postgres. The integration suite fails when its server cannot be reached, where its tests returned early and passed, and its granular-configuration test takes the host, port, database, user and password from the URL.
+
+### Fixed
+- The `createDatabase()` documentation and the remote-connection guide said that `createDatabase()` with no options opens PostgreSQL when `DATABASE_URL` is set. It opens the local default; pass `url: process.env.DATABASE_URL`. The README's cloud example passed `postgres: { connectionString: process.env.DATABASE_URL }`, which opens a local SQLite file when the variable is unset; it passes `url` with `strict` now.
 
 ## [0.6.14] - 2026-10-15
 
