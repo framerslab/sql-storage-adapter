@@ -91,3 +91,11 @@ export const checkColumnName = (column: string): string => {
   }
   return column;
 };
+
+/** Checks a notification channel's name: 1 to 63 characters (PostgreSQL's NAMEDATALEN less one), without NUL. */
+export const checkChannelName = (channel: string): string => {
+  if (typeof channel !== 'string' || channel.length === 0 || channel.length > 63 || channel.includes('\0')) {
+    throw new Error(`A notification channel is 1 to 63 characters without NUL; got ${JSON.stringify(channel)}.`);
+  }
+  return channel;
+};

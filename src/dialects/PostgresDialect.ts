@@ -9,6 +9,7 @@ import type {
   SqlDialect,
 } from '../core/contracts/dialect.js';
 import {
+  checkChannelName,
   checkChoice,
   checkColumnName,
   checkDateBucketUnit,
@@ -101,6 +102,23 @@ export class PostgresDialect implements SqlDialect {
 
   autoIncrementPrimaryKey(options: AutoIncrementOptions = {}): string {
     return `INTEGER GENERATED ${options.acceptExplicitIds ? 'BY DEFAULT' : 'ALWAYS'} AS IDENTITY PRIMARY KEY`;
+  }
+
+  changeNotificationSql(table: string, channel: string): string[] {
+    const name = checkTableName(table);
+    const literal = `'${checkChannelName(channel).replace(/'/g, "''")}'`;
+    return [
+      'CREATE OR REPLACE FUNCTION storage_adapter_notify_change() RETURNS trigger LANGUAGE plpgsql AS $storage_adapter$\n' +
+        'BEGIN\n' +
+        "  PERFORM pg_notify(TG_ARGV[0], json_build_object('schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'operation',\n" +
+        "    CASE TG_OP WHEN 'TRUNCATE' THEN 'delete' ELSE lower(TG_OP) END)::text);\n" +
+        '  RETURN NULL;\n' +
+        'END;\n' +
+        '$storage_adapter$',
+      `DROP TRIGGER IF EXISTS storage_adapter_change ON ${name}`,
+      `CREATE TRIGGER storage_adapter_change AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON ${name} ` +
+        `FOR EACH STATEMENT EXECUTE FUNCTION storage_adapter_notify_change(${literal})`,
+    ];
   }
 
   syncIdentitySequence(table: string, column: string): string {

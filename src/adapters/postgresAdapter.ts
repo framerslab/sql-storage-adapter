@@ -12,6 +12,10 @@ import { toPostgresStatement } from '../shared/sqlPlaceholders';
 import { splitSqlStatements } from '../shared/splitSqlStatements';
 import { validateSegment } from '../shared/segment';
 import { getStorageLogger } from '../shared/logger';
+import { checkChannelName } from '../dialects/shared';
+import { PostgresListener, type PostgresNotificationHandler } from './postgresListener';
+
+export type { PostgresNotificationHandler } from './postgresListener';
 
 /** What the adapter reads from the answer to a query. */
 export interface PostgresQueryResultLike {
@@ -1161,6 +1165,8 @@ export class PostgresAdapter implements StorageAdapter {
   private listening: { pool: PostgresPoolLike; listener: (error: Error) => void } | null = null;
   private opening: Promise<void> | null = null;
   private closing: Promise<void> | null = null;
+  /** The LISTEN side, made by the first listen(). */
+  private notifications: PostgresListener | null = null;
 
   constructor(options: PostgresAdapterOptions | string) {
     // Support both string and object initialization
@@ -1475,6 +1481,40 @@ export class PostgresAdapter implements StorageAdapter {
   }
 
   /**
+   * Calls `handler` with each notification sent on `channel` (PostgreSQL
+   * LISTEN) from any session: `notify()`, `pg_notify()`, or the trigger the
+   * dialect's `changeNotificationSql` installs. The channel name is exact,
+   * case included, as pg_notify() takes it.
+   *
+   * One connection of the pool is held while any channel has a handler. When
+   * the server ends it, the adapter listens again on a new one after 1 second,
+   * then 2, up to 30, and logs it; notifications sent meanwhile are lost
+   * (https://www.postgresql.org/docs/current/sql-notify.html). `close()`
+   * stops every channel. Resolves, once listening, to a function that stops
+   * this handler.
+   *
+   * @example
+   * ```typescript
+   * const stop = await db.listen('notes_changes', (payload) => refresh(JSON.parse(payload)));
+   * ```
+   */
+  public listen(channel: string, handler: PostgresNotificationHandler): Promise<() => Promise<void>> {
+    this.requirePool();
+    if (!this.notifications) this.notifications = new PostgresListener(() => this.requirePool().connect());
+    return this.notifications.listen(channel, handler);
+  }
+
+  /**
+   * Sends `payload` on `channel` (pg_notify) to every session listening
+   * there. PostgreSQL delivers it when the sending transaction commits, and
+   * refuses a payload of 8000 bytes or more.
+   */
+  public async notify(channel: string, payload = ''): Promise<void> {
+    checkChannelName(channel);
+    await this.get('SELECT pg_notify(?, ?)', [channel, payload]);
+  }
+
+  /**
    * The pool's counts, or null when the adapter is not open. A pool of the
    * caller's that does not count its connections, as pg's Pool does, reads 0.
    */
@@ -1504,6 +1544,9 @@ export class PostgresAdapter implements StorageAdapter {
     if (this.opening) {
       await this.opening.catch(() => undefined);
     }
+    // The listening connection goes back first: the pool's end() waits for it.
+    this.notifications?.close();
+    this.notifications = null;
     const pool = this.pool;
     this.pool = null;
     if (!pool) {

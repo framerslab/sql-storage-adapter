@@ -8,6 +8,7 @@ import type {
   SqlDialect,
 } from '../core/contracts/dialect.js';
 import {
+  checkChannelName,
   checkChoice,
   checkColumnName,
   checkDateBucketUnit,
@@ -99,6 +100,12 @@ export class SqliteDialect implements SqlDialect {
 
   autoIncrementPrimaryKey(_options: AutoIncrementOptions = {}): string {
     return 'INTEGER PRIMARY KEY AUTOINCREMENT';
+  }
+
+  changeNotificationSql(table: string, channel: string): null {
+    checkTableName(table);
+    checkChannelName(channel);
+    return null;
   }
 
   syncIdentitySequence(table: string, column: string): null {

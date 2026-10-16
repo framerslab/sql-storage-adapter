@@ -52,4 +52,12 @@ export { PostgresExporter } from './exporters/PostgresExporter';
 export { createStorageFeatures } from './core/contracts/features';
 export { isUniqueViolation } from './shared/errors';
 export { withHooks } from './shared/withHooks';
+export {
+  withChangeEvents,
+  type ChangeEvents,
+  type RowChange,
+  type RowChangeListener,
+  type RowChangeOperation,
+  type RowChangeOptions,
+} from './shared/changeEvents';
 export { setStorageLogger, getStorageLogger, type StorageLogger } from './shared/logger';

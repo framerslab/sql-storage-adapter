@@ -94,6 +94,16 @@ export interface SqlDialect {
   syncIdentitySequence?(table: string, column: string): string | null;
 
   /**
+   * Statements that make every write to `table`, from any session, send a
+   * notification on `channel`: one per statement, its payload JSON
+   * `{"schema", "table", "operation"}` with the operation `insert`,
+   * `update` or `delete` (TRUNCATE too). Postgres: a trigger function and a
+   * statement-level trigger, which `PostgresAdapter.listen` hears. SQLite:
+   * null, since SQLite has no notifications between connections.
+   */
+  changeNotificationSql(table: string, channel: string): string[] | null;
+
+  /**
    * A column type for DDL. PostgreSQL: TEXT, INTEGER, BIGINT, DOUBLE
    * PRECISION, BOOLEAN, TIMESTAMPTZ, JSONB, UUID, BYTEA. SQLite: TEXT,
    * INTEGER, INTEGER, REAL, INTEGER, TEXT, TEXT, TEXT, BLOB. The values a
