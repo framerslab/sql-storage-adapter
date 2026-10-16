@@ -1,4 +1,5 @@
 import type {
+  AutoIncrementOptions,
   CastType,
   ColumnKind,
   DateBucketUnit,
@@ -6,7 +7,15 @@ import type {
   JsonValueType,
   SqlDialect,
 } from '../core/contracts/dialect.js';
-import { checkChoice, checkDateBucketUnit, intervalSeconds, parseJsonPath, upsertUpdateColumns } from './shared.js';
+import {
+  checkChoice,
+  checkColumnName,
+  checkDateBucketUnit,
+  checkTableName,
+  intervalSeconds,
+  parseJsonPath,
+  upsertUpdateColumns,
+} from './shared.js';
 
 const COLUMN_TYPES: Record<ColumnKind, string> = {
   text: 'TEXT',
@@ -89,8 +98,19 @@ export class PostgresDialect implements SqlDialect {
     return `COALESCE(${expr}, ${fallback})`;
   }
 
-  autoIncrementPrimaryKey(): string {
-    return 'INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY';
+  autoIncrementPrimaryKey(options: AutoIncrementOptions = {}): string {
+    return `INTEGER GENERATED ${options.acceptExplicitIds ? 'BY DEFAULT' : 'ALWAYS'} AS IDENTITY PRIMARY KEY`;
+  }
+
+  syncIdentitySequence(table: string, column: string): string {
+    const name = checkTableName(table);
+    const col = checkColumnName(column);
+    // pg_get_serial_sequence parses its first argument as SQL does (unquoted
+    // names fold to lower case) and takes the column name literally.
+    return (
+      `SELECT setval(pg_get_serial_sequence('${name}', '${col.toLowerCase()}'), ` +
+      `GREATEST(COALESCE(MAX(${col}), 0), 0) + 1, false) FROM ${name}`
+    );
   }
 
   columnType(kind: ColumnKind): string {

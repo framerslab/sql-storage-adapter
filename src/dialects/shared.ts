@@ -72,3 +72,22 @@ export const upsertUpdateColumns = (columns: string[], conflictColumns: string[]
   }
   return updateColumns ?? columns.filter((column) => !conflictColumns.includes(column));
 };
+
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** Checks a table name: an SQL identifier, schema-qualified or not. */
+export const checkTableName = (table: string): string => {
+  const parts = typeof table === 'string' ? table.split('.') : [];
+  if (parts.length < 1 || parts.length > 2 || !parts.every((part) => IDENTIFIER.test(part))) {
+    throw new Error(`A table name must be an SQL identifier, optionally schema-qualified; got ${JSON.stringify(table)}.`);
+  }
+  return table;
+};
+
+/** Checks a column name: an SQL identifier. */
+export const checkColumnName = (column: string): string => {
+  if (typeof column !== 'string' || !IDENTIFIER.test(column)) {
+    throw new Error(`A column name must be an SQL identifier; got ${JSON.stringify(column)}.`);
+  }
+  return column;
+};
