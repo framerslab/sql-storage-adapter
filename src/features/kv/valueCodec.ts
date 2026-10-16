@@ -164,7 +164,7 @@ export function encodeValue(value: unknown): string {
   // from the value itself, so what comes back does not change.
   const runtimeClone = (globalThis as unknown as { structuredClone?: (input: unknown) => unknown }).structuredClone;
   if (typeof runtimeClone === 'function') {
-    runtimeClone(value);
+    runtimeClone.call(globalThis, value);
   }
 
   /** Each object met so far, by the order it was met in, which the decoder repeats. */
