@@ -171,7 +171,7 @@ const unsupportedKind = (kind: string): Error => {
       );
     case 'supabase':
       return new Error(
-        `The resolver cannot build adapter kind "${kind}". Use kind "postgres" with the Supabase connection string, or create a SupabaseAdapter.`,
+        `The resolver cannot build adapter kind "${kind}". Use kind "postgres" with the Supabase connection string (SupabaseAdapter is deprecated).`,
       );
     default:
       return new Error(

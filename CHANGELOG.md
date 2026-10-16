@@ -1,7 +1,7 @@
-## [0.7.6] - 2026-10-16
+## [0.7.7] - 2026-10-16
 
 ### Changed
-- `createDatabase()` on Node treats only a `postgres://` or `postgresql://` URL or connection string as naming a PostgreSQL server, besides a pool, host, database or user. A URL of another scheme (`file:./dev.db`, which `DATABASE_URL` holds in a project that runs SQLite through Prisma, or `sqlite:...`) opens the local default again, as through 0.6.13, and with `strict` fails with an error that says the option names no server. From 0.6.14 to 0.7.5 such a URL chose `['postgres']` with no fallback and failed at start. To open PostgreSQL from a `socket:` URL or a socket path, pass `type: 'postgres'` or use `connectDatabase()`.
+- `createDatabase()` on Node treats only a `postgres://` or `postgresql://` URL or connection string as naming a PostgreSQL server, besides a pool, host, database or user. A URL of another scheme (`file:./dev.db`, which `DATABASE_URL` holds in a project that runs SQLite through Prisma, or `sqlite:...`) opens the local default again, as through 0.6.13, and with `strict` fails with an error that says the option names no server. From 0.6.14 to 0.7.6 such a URL chose `['postgres']` with no fallback and failed at start. To open PostgreSQL from a `socket:` URL or a socket path, pass `type: 'postgres'` or use `connectDatabase()`.
 - `connectDatabase()` opens PostgreSQL alone, in every runtime, from any connection string pg reads, and refuses a configuration that names no server (no pool, an empty or unset connection string, and no host, database or user, as `connectDatabase(process.env.DATABASE_URL)` gives with the variable unset): it throws an error that names the missing setting before it opens anything. Given no server, it opened the SQLite file `db_data/app.sqlite3` under the working directory on Node, though it is documented as connecting to a remote database, and in a browser it opened IndexedDB whatever it was given. `createSyncManager()` calls it only with a URL, as before.
 - One Capacitor adapter at a time holds a database: `open()` fails while another adapter of the page has the same database open (`notes` and `notes.db` are one database to the plugin), and `close()` closes the plugin's connection too.
 
@@ -17,6 +17,16 @@
 - IndexedDB adapter: `importDatabase()` checks the image with SQLite's `quick_check`, which reads every page, after the SQLite header, before it replaces anything. It read the schema alone, so an image with a damaged page past the schema replaced the database and was saved over the stored one. An import waits for a save already running before its own, so that older image is never the last stored.
 - The documentation said that Capacitor leaves foreign keys off by default. The plugin turns them on when it opens a database, on Android, iOS and Electron, so Capacitor enforces them unless `foreignKeys: false` is given.
 - `examples/remote-postgres.ts` connected with `createDatabase()` and no options, which opens the local default, not `DATABASE_URL`; it calls `connectDatabase()`. The capability matrix in ARCHITECTURE.md lists what each adapter's `capabilities` holds (only better-sqlite3 has `batch()`), and its Capacitor configuration takes the options the adapter has.
+
+## [0.7.6] - 2026-10-16
+
+### Deprecated
+- `SupabaseAdapter`. The PostgreSQL adapter reaches Supabase with its connection string (`createPostgresAdapter({ connectionString, ssl: { rejectUnauthorized: true, ca } })`), with pool control, transaction error handling and `strict` resolution. `open()` says so once per process through the host logger, and adds that `SupabaseAdapter` does not verify the server certificate unless `ssl` is `{ rejectUnauthorized: true, ca }`.
+
+### Fixed
+- `SupabaseAdapter` reads `?` and `@name` placeholders as the PostgreSQL adapter does, in and out of a transaction. It passed the statement to pg as written, so a `?` failed with a syntax error and named parameters were dropped.
+- `SupabaseAdapter` keeps PostgreSQL's error code (`code`) and the database error (`cause`) on the errors it throws, so `isUniqueViolation` reads a duplicate. It threw a new Error carrying only the message.
+- `SupabaseAdapter` passes an `ssl` object it is given to pg. It replaced any `ssl` option other than `false` with `{ rejectUnauthorized: false }`, so certificate verification could not be turned on.
 
 ## [0.7.5] - 2026-10-16
 
@@ -157,7 +167,7 @@
 - `createDatabase()` and `resolveStorageAdapter()` pass every Postgres option to the pool: its size, SSL, the timeouts and the application name, and host, port, database, user and password without a connection string. Only the connection string reached it. Options that name a server are used instead of `DATABASE_URL`.
 
 ### Changed
-- **Behaviour change in a patch release.** On Node, `createDatabase({ url })` and `createDatabase({ postgres: { connectionString } })` with a `postgres://` or `postgresql://` URL and no `priority` or `type` open PostgreSQL, with no fallback to SQLite; through 0.6.13 they opened the SQLite file `db_data/app.sqlite3` under the working directory, whatever the URL said. A caller whose data is in that file passes `priority: ['better-sqlite3', 'sqljs']` or `type: 'sqlite'` to keep opening it. Through 0.7.5 a URL of any other scheme (`file:./dev.db`) chose PostgreSQL too and failed at start; 0.7.6 opens the local default for it again.
+- **Behaviour change in a patch release.** On Node, `createDatabase({ url })` and `createDatabase({ postgres: { connectionString } })` with a `postgres://` or `postgresql://` URL and no `priority` or `type` open PostgreSQL, with no fallback to SQLite; through 0.6.13 they opened the SQLite file `db_data/app.sqlite3` under the working directory, whatever the URL said. A caller whose data is in that file passes `priority: ['better-sqlite3', 'sqljs']` or `type: 'sqlite'` to keep opening it. Through 0.7.6 a URL of any other scheme (`file:./dev.db`) chose PostgreSQL too and failed at start; 0.7.7 opens the local default for it again.
 - On the IndexedDB and Capacitor adapters, a statement that a transaction's callback issues through the adapter itself, not through the handle it receives, waits for the transaction like any other caller's: a browser or a WebView has no async context to tell the two apart. The callback then waits on itself, and the adapter logs a warning after 10 seconds. Run a callback's statements through its handle.
 - A `STORAGE_ADAPTER` value or a `priority` entry outside the kinds above no longer opens sql.js on the resolver's file path. When it was the only candidate, resolution fails with an error that names it; `sqljs` opens the same file as before.
 - `createSyncManager()` with a `primary.url` or a `remote` URL opens PostgreSQL on Node, as its documentation says; both opened the local SQLite file.
