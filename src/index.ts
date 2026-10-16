@@ -25,6 +25,7 @@ export * from './features/migrations/dataExport';
 export * from './features/migrations/dataImport';
 export * from './features/migrations/migration';
 export * from './features/migrations/schemaMigrations';
+export * from './features/auth/authJsAdapter';
 export * from './features/sync/syncManager';
 
 // Note: Cross-platform sync is available via separate entry point for cleaner imports.
@@ -41,6 +42,7 @@ export { segmentFilePath, segmentName, validateSegment } from './shared/segment'
 export { SqliteDialect } from './dialects/SqliteDialect';
 export { PostgresDialect } from './dialects/PostgresDialect';
 export { SqliteFts5 } from './fts/SqliteFts5';
+export { SqliteFts4 } from './fts/SqliteFts4';
 export { PostgresFts } from './fts/PostgresFts';
 export { NodeBlobCodec } from './codecs/NodeBlobCodec';
 export { BrowserBlobCodec } from './codecs/BrowserBlobCodec';

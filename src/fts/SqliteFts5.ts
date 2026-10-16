@@ -27,6 +27,10 @@ export class SqliteFts5 implements IFullTextSearch {
     return `${indexName}.rank`;
   }
 
+  relevanceOrder(indexName: string, _queryPlaceholder?: string): string {
+    return `${indexName}.rank`;
+  }
+
   rebuildCommand(indexName: string): string {
     return `INSERT INTO ${indexName}(${indexName}) VALUES('rebuild')`;
   }
