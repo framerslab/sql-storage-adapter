@@ -16,6 +16,8 @@ import { CapacitorSqliteAdapter } from '../src/adapters/capacitorSqliteAdapter';
  * - execute and run with `transaction` true, the default, run inside a
  *   transaction of their own, which cannot nest in an open one;
  * - SQLite refuses to change into WAL inside a transaction;
+ * - SQLiteConnection drops a trailing ".db" from a database name, so "notes.db"
+ *   and "notes" name one connection;
  * - on Android, execute and run go through execSQL, which fails on a statement
  *   that answers a row, as PRAGMA journal_mode = WAL does; query reads it.
  */
@@ -297,6 +299,7 @@ const plugin = vi.hoisted(() => {
     constructor(private readonly sqlite: Plugin) {}
 
     async createConnection(database: string, encrypted: boolean, mode: string, version: number, readonly: boolean) {
+      if (database.endsWith('.db')) database = database.slice(0, -3);
       await this.sqlite.createConnection({ database, encrypted, mode, version, readonly });
       const connection = new SQLiteDBConnection(database, readonly, this.sqlite);
       this.held.set(`${readonly ? 'RO' : 'RW'}_${database}`, connection);
@@ -304,11 +307,13 @@ const plugin = vi.hoisted(() => {
     }
 
     async closeConnection(database: string, readonly: boolean) {
+      if (database.endsWith('.db')) database = database.slice(0, -3);
       await this.sqlite.closeConnection({ database, readonly });
       this.held.delete(`${readonly ? 'RO' : 'RW'}_${database}`);
     }
 
     async isConnection(database: string, readonly: boolean) {
+      if (database.endsWith('.db')) database = database.slice(0, -3);
       return { result: this.held.has(`${readonly ? 'RO' : 'RW'}_${database}`) };
     }
   }
@@ -427,6 +432,22 @@ describe('CapacitorSqliteAdapter open() and close() on @capacitor-community/sqli
 
     await first.run('INSERT INTO notes (body) VALUES (?)', ['still open']);
     expect(await first.all('SELECT body FROM notes')).toEqual([{ body: 'still open' }]);
+  });
+
+  it('refuses a second adapter that names the open database with ".db", which the plugin reads as the same database', async () => {
+    const first = await openAdapter('journal');
+    await first.exec('CREATE TABLE notes (body TEXT NOT NULL)');
+
+    await expect(openAdapter('journal.db')).rejects.toThrow(/already has database "journal" open/);
+
+    await first.run('INSERT INTO notes (body) VALUES (?)', ['still open']);
+    expect(await first.all('SELECT body FROM notes')).toEqual([{ body: 'still open' }]);
+    expect(plugin.connections.has('RW_journal')).toBe(true);
+
+    // Closed, the database opens again under either name.
+    await first.close();
+    const second = await openAdapter('journal.db');
+    expect(await second.all('SELECT body FROM notes')).toEqual([{ body: 'still open' }]);
   });
 
   it("runs PRAGMA statements from exec() and run() outside the plugin's own transaction", async () => {
