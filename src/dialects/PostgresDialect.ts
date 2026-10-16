@@ -8,6 +8,7 @@ import type {
   SqlDialect,
 } from '../core/contracts/dialect.js';
 import {
+  checkChannelName,
   checkChoice,
   checkColumnName,
   checkDateBucketUnit,
@@ -100,6 +101,103 @@ export class PostgresDialect implements SqlDialect {
 
   autoIncrementPrimaryKey(options: AutoIncrementOptions = {}): string {
     return `INTEGER GENERATED ${options.acceptExplicitIds ? 'BY DEFAULT' : 'ALWAYS'} AS IDENTITY PRIMARY KEY`;
+  }
+
+  changeNotificationSql(table: string, channel: string): string[] {
+    const name = checkTableName(table);
+    const literal = `'${checkChannelName(channel).replace(/'/g, "''")}'`;
+    return [
+      'CREATE OR REPLACE FUNCTION storage_adapter_notify_change() RETURNS trigger LANGUAGE plpgsql AS $storage_adapter$\n' +
+        'BEGIN\n' +
+        "  PERFORM pg_notify(TG_ARGV[0], json_build_object('schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'operation',\n" +
+        "    CASE TG_OP WHEN 'TRUNCATE' THEN 'delete' ELSE lower(TG_OP) END)::text);\n" +
+        '  RETURN NULL;\n' +
+        'END;\n' +
+        '$storage_adapter
+    const name = checkTableName(table);
+    const col = checkColumnName(column);
+    // pg_get_serial_sequence parses its first argument as SQL does (unquoted
+    // names fold to lower case) and takes the column name literally.
+    return (
+      `SELECT setval(pg_get_serial_sequence('${name}', '${col.toLowerCase()}'), ` +
+      `GREATEST(COALESCE(MAX(${col}), 0), 0) + 1, false) FROM ${name}`
+    );
+  }
+
+  columnType(kind: ColumnKind): string {
+    checkChoice('columnType kind', kind, Object.keys(COLUMN_TYPES) as ColumnKind[]);
+    return COLUMN_TYPES[kind];
+  }
+
+  pragma(_key: string, _value: string): string | null {
+    return null;
+  }
+
+  placeholder(index: number): string {
+    return `$${index + 1}`;
+  }
+
+  now(): string {
+    return 'now()';
+  }
+
+  cast(expr: string, type: CastType): string {
+    checkChoice('cast type', type, ['text', 'integer', 'real', 'timestamp']);
+    return `CAST(${expr} AS ${CAST_TYPES[type]})`;
+  }
+
+  addInterval(expr: string, amount: number, unit: IntervalUnit): string {
+    // Seconds, not days: a day added to a timestamptz follows the session's
+    // time zone across a DST change, while SQLite adds 86400 seconds.
+    return `((${expr})::timestamptz + interval '${intervalSeconds(amount, unit)} seconds')`;
+  }
+
+  dateBucket(unit: DateBucketUnit, expr: string): string {
+    return `to_char(date_trunc('${checkDateBucketUnit(unit)}', (${expr})::timestamptz AT TIME ZONE 'UTC'), ${ISO_TEXT})`;
+  }
+
+  ilike(expr: string, pattern: string): string {
+    return `${expr} ILIKE ${pattern}`;
+  }
+
+  inList(expr: string, items: string[]): string {
+    return items.length ? `${expr} IN (${items.join(', ')})` : '(1 = 0)';
+  }
+
+  inArray(expr: string, arrayParam: string): string {
+    return `${expr} = ANY(${arrayParam})`;
+  }
+
+  rowLock(mode: 'update' | 'share', wait: 'wait' | 'skipLocked' | 'noWait' = 'wait'): string {
+    checkChoice('rowLock mode', mode, ['update', 'share']);
+    checkChoice('rowLock wait', wait, ['wait', 'skipLocked', 'noWait']);
+    const lock = mode === 'update' ? ' FOR UPDATE' : ' FOR SHARE';
+    return wait === 'skipLocked' ? `${lock} SKIP LOCKED` : wait === 'noWait' ? `${lock} NOWAIT` : lock;
+  }
+
+  advisoryTransactionLock(keyExpr: string): string | null {
+    return `SELECT pg_advisory_xact_lock(${keyExpr})`;
+  }
+
+  greatest(...exprs: string[]): string {
+    if (exprs.length === 0) throw new Error('greatest needs at least one expression.');
+    return `GREATEST(${exprs.join(', ')})`;
+  }
+
+  least(...exprs: string[]): string {
+    if (exprs.length === 0) throw new Error('least needs at least one expression.');
+    return `LEAST(${exprs.join(', ')})`;
+  }
+
+  uuid(): string {
+    return 'gen_random_uuid()';
+  }
+}
+,
+      `DROP TRIGGER IF EXISTS storage_adapter_change ON ${name}`,
+      `CREATE TRIGGER storage_adapter_change AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON ${name} ` +
+        `FOR EACH STATEMENT EXECUTE FUNCTION storage_adapter_notify_change(${literal})`,
+    ];
   }
 
   syncIdentitySequence(table: string, column: string): string {

@@ -768,6 +768,45 @@ const db = await createDatabase({ url: process.env.DATABASE_URL, strict: true, h
 
 See [**guides/OPTIMIZATION_GUIDE.md**](./guides/OPTIMIZATION_GUIDE.md) for complete configuration options.
 
+## Row-Change Events
+
+`withChangeEvents(adapter)` reports each write made through the adapter, on every engine:
+
+```typescript
+import { createDatabase, withChangeEvents } from '@framers/sql-storage-adapter';
+
+const db = withChangeEvents(await createDatabase());
+const stop = db.onChange((change) => cache.invalidate(change.table), { tables: ['notes'] });
+// change: { table: 'notes', operation: 'insert' | 'update' | 'delete', changes?, lastInsertRowid?, statement }
+
+await db.run('UPDATE notes SET title = ? WHERE id = ?', ['Plans', 7]); // reports { table: 'notes', operation: 'update', changes: 1 }
+stop();
+```
+
+- **What counts.** An INSERT (with `OR REPLACE`, `REPLACE` and upserts), UPDATE, DELETE or TRUNCATE, through `run()`, `batch()`, `get()`, `all()`, `exec()`, `transaction()` and, on PostgreSQL, `withConnection()`. A `WITH` clause before the statement and quoted or schema-qualified names are read as SQL reads them.
+- **When.** At once outside a transaction; when `transaction()` commits inside one; not at all when it rolls back.
+- **Counts.** `run()` and `batch()` give the engine's count and report only a statement that changed a row. `get()`, `all()` and `exec()` report the statement without a count.
+- **Scope.** Writes made through this adapter. Another adapter, another process, prepared statements, and a transaction begun with `BEGIN` through `run()` (reported as its statements run) are outside it.
+- **Listeners.** A listener that throws, or whose promise rejects, is logged through the host logger, and the write stands.
+
+On PostgreSQL, `listen()` and `notify()` carry notifications between sessions ([LISTEN](https://www.postgresql.org/docs/current/sql-listen.html), [NOTIFY](https://www.postgresql.org/docs/current/sql-notify.html)), and the dialect's `changeNotificationSql(table, channel)` installs a statement-level trigger that sends one for each write to the table, from any session:
+
+```typescript
+const db = new PostgresAdapter(process.env.DATABASE_URL);
+await db.open();
+for (const statement of createStorageFeatures(db).dialect.changeNotificationSql('runs', 'run_changes') ?? []) {
+  await db.exec(statement);
+}
+const stop = await db.listen('run_changes', (payload) => {
+  const { schema, table, operation } = JSON.parse(payload); // operation: 'insert' | 'update' | 'delete'
+});
+await db.notify('run_changes', 'any text under 8000 bytes');
+```
+
+- One connection of the pool is held while any channel has a handler. When the server ends it, the adapter listens again on a new one after 1 second, then 2, up to 30, and logs it; notifications sent meanwhile are lost, since PostgreSQL keeps none for a session that is not listening.
+- A notification arrives when the transaction that sent it commits. PostgreSQL delivers identical payloads sent on one channel in one transaction once, so the trigger sends one notification per table and operation per transaction.
+- The channel name is exact, case included. `close()` stops every channel. SQLite has no notifications between connections: its `changeNotificationSql` returns null.
+
 ## SQL Dialect & Feature Abstractions
 
 Write cross-platform SQL that works on both SQLite and PostgreSQL without changing your application code.
