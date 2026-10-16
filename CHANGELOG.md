@@ -1,4 +1,4 @@
-## [0.7.5] - 2026-10-16
+## [0.7.6] - 2026-10-16
 
 ### Added
 - `PostgresExporterOptions`, the second argument of `new PostgresExporter(connectionString, { schema })`: `schema` exports one schema alone, by its exact name (`pg_dump --schema`). It is exported from the root and `./core`.
@@ -16,6 +16,22 @@
 - `resolveStorageAdapter()` and `createDatabase()` refuse a segment name in `postgres`, `indexedDb` or `capacitor` that cannot be a segment before any adapter is tried, as they refuse their own. A candidate whose options name no segment, tried after a candidate whose options named one, opens in that segment: without `strict`, an unreachable PostgreSQL with `postgres.segment` fell through to better-sqlite3 on the shared file, outside the segment.
 - IndexedDB adapter: a PRAGMA through `all()` or `get()` that sets `user_version`, `application_id`, `schema_version`, `page_size`, `auto_vacuum` or `encoding`, or runs `incremental_vacuum` or `optimize`, is saved. SQLite's `total_changes()` counts no PRAGMA, so `get('PRAGMA user_version = 3')` was stored neither with `durability: 'commit'` nor by `flush()` or `close()`. PRAGMA reads and connection settings still write nothing.
 - `createSqlKeyValueStore()` refuses a `Proxy` with a `DataCloneError`, as the structured clone and IndexedDB's put do. A proxy reads as the object it wraps to every check but the runtime's own `structuredClone`, which now runs first, so `set()` stored `new Proxy({ x: 1 }, {})` as `{ x: 1 }`.
+
+## [0.7.5] - 2026-10-16
+
+### Added
+- `SqliteFts4`, the full-text search `createStorageFeatures` gives sql.js and the IndexedDB adapter.
+- `relevanceOrder(indexName, placeholder)` on every full-text search: an ORDER BY fragment that puts the best match first on every engine.
+- `weights` in the PostgreSQL `createIndex` config: a weight per column (A to D) that `ts_rank` uses.
+
+### Changed
+- `createStorageFeatures` gives sql.js and IndexedDB FTS4, where it gave FTS5. Their stock sql.js build has no FTS5, so every FTS5 statement there failed with "no such module: fts5".
+- `createStorageFeatures` treats the Supabase adapter (`supabase-postgres`) as PostgreSQL: the PostgreSQL dialect, full-text search and exporter, where it gave the SQLite ones.
+- PostgreSQL full-text queries use `websearch_to_tsquery` instead of `plainto_tsquery`. Words are still ANDed, but `or`, `-word` and quoted phrases are now operators.
+- `PostgresFts.sanitizeQuery` returns the words quoted and joined with `or`, as the SQLite implementations join them with OR, where it returned the text unchanged.
+
+### Fixed
+- `PostgresFts` kept each index's table, columns and language on the instance, from the last `createIndex` call. A second index with another tokenizer changed the first one's language, and a features object made later built `UPDATE  SET ...` with no table for `rebuildCommand` and `syncInsert`. The description of each index is now kept per index for the process, and a rebuild or sync of an index no `createIndex` described throws an error that says so.
 
 ## [0.7.4] - 2026-10-16
 

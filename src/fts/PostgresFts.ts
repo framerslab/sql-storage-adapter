@@ -1,68 +1,133 @@
 import type { IFullTextSearch } from '../core/contracts/fts.js';
 
+type Weight = 'A' | 'B' | 'C' | 'D';
+
+/** What createIndex learned about an index: where its column lives, what it covers, how it reads text. */
+interface PostgresIndex {
+  contentTable: string;
+  columns: string[];
+  lang: string;
+  weights?: Record<string, Weight>;
+}
+
+/**
+ * The indexes createIndex has described in this process, by index name. It
+ * is the module's, not an instance's, so a features object made later (or a
+ * second one) syncs, rebuilds and queries an index another one created, and
+ * each index keeps its own language.
+ */
+const INDEXES = new Map<string, PostgresIndex>();
+
+const WEIGHTS = new Set<string>(['A', 'B', 'C', 'D']);
+
 /**
  * Postgres full-text search using tsvector columns and GIN indexes.
  *
- * Unlike FTS5 (separate virtual table), Postgres stores the tsvector
- * as a column `_tsv` on the content table itself. The `createIndex()`
- * call adds the column, creates the GIN index, and backfills existing rows.
+ * Unlike FTS5 (separate virtual table), Postgres stores the tsvector as a
+ * column `_tsv` on the content table itself. The `createIndex()` call adds the
+ * column, creates the GIN index, and backfills existing rows. Queries go
+ * through `websearch_to_tsquery`, which reads raw user text without syntax
+ * errors: words are ANDed, and `or`, `-word` and quoted phrases work as in a
+ * web search box.
  */
 export class PostgresFts implements IFullTextSearch {
-  /** The content table is stored during createIndex for use by other methods. */
-  private _contentTable = '';
-  private _columns: string[] = [];
-  private _lang = 'english';
-
-  createIndex(config: { table: string; columns: string[]; contentTable?: string; tokenizer?: string }): string {
-    const ct = config.contentTable ?? config.table;
-    this._contentTable = ct;
-    this._columns = config.columns;
-    const colConcat = config.columns.map((c) => `COALESCE(${c}, '')`).join(" || ' ' || ");
-    const lang = this._tokenizerToLang(config.tokenizer);
-    this._lang = lang;
-
+  createIndex(config: {
+    table: string;
+    columns: string[];
+    contentTable?: string;
+    tokenizer?: string;
+    weights?: Record<string, Weight>;
+  }): string {
+    const index: PostgresIndex = {
+      contentTable: config.contentTable ?? config.table,
+      columns: config.columns,
+      lang: tokenizerToLang(config.tokenizer),
+      weights: checkWeights(config.columns, config.weights),
+    };
+    INDEXES.set(config.table, index);
+    const ct = index.contentTable;
     return [
       `ALTER TABLE ${ct} ADD COLUMN IF NOT EXISTS _tsv tsvector`,
       `CREATE INDEX IF NOT EXISTS idx_${config.table}_tsv ON ${ct} USING GIN(_tsv)`,
-      `UPDATE ${ct} SET _tsv = to_tsvector('${lang}', ${colConcat}) WHERE _tsv IS NULL`,
+      `UPDATE ${ct} SET _tsv = ${tsvector(index, index.columns.map((column) => `COALESCE(${column}, '')`))} WHERE _tsv IS NULL`,
     ].join(';\n');
   }
 
-  matchClause(_indexName: string, queryPlaceholder: string): string {
-    return `_tsv @@ plainto_tsquery('${this._lang}', ${queryPlaceholder})`;
+  matchClause(indexName: string, queryPlaceholder: string): string {
+    return `_tsv @@ websearch_to_tsquery('${langOf(indexName)}', ${queryPlaceholder})`;
   }
 
-  rankExpression(_indexName: string, queryPlaceholder?: string): string {
+  rankExpression(indexName: string, queryPlaceholder?: string): string {
     const qp = queryPlaceholder ?? '$1';
-    return `ts_rank(_tsv, plainto_tsquery('${this._lang}', ${qp}))`;
+    return `ts_rank(_tsv, websearch_to_tsquery('${langOf(indexName)}', ${qp}))`;
   }
 
-  rebuildCommand(_indexName: string): string {
-    const ct = this._contentTable;
-    const colConcat = this._columns.map((c) => `COALESCE(${c}, '')`).join(" || ' ' || ");
-    return `UPDATE ${ct} SET _tsv = to_tsvector('${this._lang}', ${colConcat})`;
+  relevanceOrder(indexName: string, queryPlaceholder?: string): string {
+    return `${this.rankExpression(indexName, queryPlaceholder)} DESC`;
   }
 
-  syncInsert(_indexName: string, _rowIdExpr: string, columns: string[]): string {
-    const ct = this._contentTable;
-    const colConcat = columns
-      .map((_, index) => `COALESCE($${index + 2}, '')`)
-      .join(" || ' ' || ");
-    return `UPDATE ${ct} SET _tsv = to_tsvector('${this._lang}', ${colConcat}) WHERE id = $1`;
+  rebuildCommand(indexName: string): string {
+    const index = described(indexName);
+    return `UPDATE ${index.contentTable} SET _tsv = ${tsvector(index, index.columns.map((column) => `COALESCE(${column}, '')`))}`;
+  }
+
+  syncInsert(indexName: string, _rowIdExpr: string, columns: string[]): string {
+    const index = described(indexName);
+    const values = columns.map((_, i) => `COALESCE($${i + 2}, '')`);
+    return `UPDATE ${index.contentTable} SET _tsv = ${tsvector({ ...index, columns }, values)} WHERE id = $1`;
   }
 
   sanitizeQuery(input: string): string {
-    return input;
+    return input
+      .replace(/[*()":^~{}[\]\\-]/g, ' ')
+      .split(/\s+/)
+      .filter((word) => word.length > 0 && word.toLowerCase() !== 'or')
+      .map((word) => `"${word}"`)
+      .join(' or ');
   }
 
   joinClause(contentTable: string, contentAlias: string, _ftsAlias: string, _indexName: string): string {
     return `${contentTable} ${contentAlias}`;
   }
-
-  /** Map FTS5-style tokenizer strings to Postgres text search configurations. */
-  private _tokenizerToLang(tokenizer?: string): string {
-    if (!tokenizer) return 'english';
-    if (tokenizer.includes('porter')) return 'english';
-    return 'simple';
-  }
 }
+
+/** Map FTS5-style tokenizer strings to Postgres text search configurations. */
+const tokenizerToLang = (tokenizer?: string): string => {
+  if (!tokenizer) return 'english';
+  if (tokenizer.includes('porter')) return 'english';
+  return 'simple';
+};
+
+const checkWeights = (columns: string[], weights?: Record<string, Weight>): Record<string, Weight> | undefined => {
+  if (!weights) return undefined;
+  for (const [column, weight] of Object.entries(weights)) {
+    if (!columns.includes(column)) throw new Error(`weights names ${JSON.stringify(column)}, which is not one of the indexed columns.`);
+    if (!WEIGHTS.has(weight)) throw new Error(`The weight of ${column} must be 'A', 'B', 'C' or 'D'; got ${JSON.stringify(weight)}.`);
+  }
+  return weights;
+};
+
+/** The tsvector expression over `values`, one per indexed column, weighted when the index has weights. */
+const tsvector = (index: PostgresIndex, values: string[]): string => {
+  if (!index.weights) return `to_tsvector('${index.lang}', ${values.join(" || ' ' || ")})`;
+  return values
+    .map((value, i) => {
+      const weight = index.weights![index.columns[i]];
+      const vector = `to_tsvector('${index.lang}', ${value})`;
+      return weight ? `setweight(${vector}, '${weight}')` : vector;
+    })
+    .join(' || ');
+};
+
+const described = (indexName: string): PostgresIndex => {
+  const index = INDEXES.get(indexName);
+  if (!index) {
+    throw new Error(
+      `No PostgreSQL full-text index named ${JSON.stringify(indexName)} has been described in this process: run its createIndex() first (it is idempotent).`,
+    );
+  }
+  return index;
+};
+
+/** The language of an index, or 'english' for an index this process has not described. */
+const langOf = (indexName: string): string => INDEXES.get(indexName)?.lang ?? 'english';
