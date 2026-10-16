@@ -1,4 +1,5 @@
 import type {
+  AutoIncrementOptions,
   CastType,
   ColumnKind,
   DateBucketUnit,
@@ -6,7 +7,15 @@ import type {
   JsonValueType,
   SqlDialect,
 } from '../core/contracts/dialect.js';
-import { checkChoice, checkDateBucketUnit, intervalSeconds, parseJsonPath, upsertUpdateColumns } from './shared.js';
+import {
+  checkChoice,
+  checkColumnName,
+  checkDateBucketUnit,
+  checkTableName,
+  intervalSeconds,
+  parseJsonPath,
+  upsertUpdateColumns,
+} from './shared.js';
 
 /** The time format a bound Date takes, which SQLite's date functions read and write. */
 const ISO_FORMAT = '%Y-%m-%dT%H:%M:%fZ';
@@ -88,8 +97,14 @@ export class SqliteDialect implements SqlDialect {
     return `ifnull(${expr}, ${fallback})`;
   }
 
-  autoIncrementPrimaryKey(): string {
+  autoIncrementPrimaryKey(_options: AutoIncrementOptions = {}): string {
     return 'INTEGER PRIMARY KEY AUTOINCREMENT';
+  }
+
+  syncIdentitySequence(table: string, column: string): null {
+    checkTableName(table);
+    checkColumnName(column);
+    return null;
   }
 
   columnType(kind: ColumnKind): string {

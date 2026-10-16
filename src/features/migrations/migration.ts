@@ -277,6 +277,11 @@ export function formatMigrationResult(result: MigrationResult): string {
     result.errors.forEach(err => lines.push(`  [X] ${err}`));
   }
 
+  if (result.warnings && result.warnings.length > 0) {
+    lines.push('\nWarnings:');
+    result.warnings.forEach(warning => lines.push(`  [!] ${warning}`));
+  }
+
   if (result.verification) {
     lines.push('\nVerification:');
     lines.push(`Status: ${result.verification.passed ? '[OK] PASSED' : '[X] FAILED'}`);
