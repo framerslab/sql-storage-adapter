@@ -150,10 +150,12 @@ describe('Migration Utilities', () => {
       'extra@example.com',
     ]);
 
-    // Run verification
+    // Run verification. The target keeps the source's primary key, so the
+    // rows the first run copied conflict; ignore them and count again.
     const result = await migrateAdapters(sourceAdapter, targetAdapter, {
       verify: true,
       dropExisting: false,
+      onConflict: 'ignore',
     });
 
     expect(result.verification).toBeDefined();
