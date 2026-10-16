@@ -110,6 +110,12 @@ export interface PostgresAdapterOptions {
    * when it is missing, and a `CREATE EXTENSION` that names no schema installs
    * the extension where it would without a segment, in `public`.
    *
+   * `open()` fails when the segment is not the current schema of its first
+   * connection: PostgreSQL leaves a schema the role has no USAGE privilege on
+   * out of the search_path without a word (an existing schema another role
+   * made), and a pooler that drops startup options leaves it out too. The
+   * role needs USAGE and CREATE on the segment's schema.
+   *
    * A name the segment does not hold falls through to `public`: create a
    * segment's tables before reading them (`CREATE TABLE IF NOT EXISTS` creates
    * one in the segment even when `public` has a table of that name), and name
@@ -733,6 +739,29 @@ const createSchema = async (client: PostgresPoolClientLike, segment: string): Pr
 };
 
 /**
+ * Checks that a segment is the current schema of a connection that started on
+ * it. PostgreSQL leaves out of the search_path, without a word, a schema the
+ * role has no USAGE privilege on: an existing segment another role made would
+ * then let the segment's statements read and create tables in `public`. A
+ * pooler that drops a connection's startup options leaves the segment out the
+ * same way.
+ */
+const requireSegmentSchema = async (client: PostgresPoolClientLike, segment: string): Promise<void> => {
+  const result = await client.query('SELECT current_schema() AS schema');
+  const current = (result.rows[0] as { schema?: unknown } | undefined)?.schema;
+  if (current === segment) {
+    return;
+  }
+  throw new Error(
+    `PostgresAdapter: segment "${segment}" is not the current schema of the adapter's connections ` +
+      `(${typeof current === 'string' ? `it is "${current}"` : 'there is none'}), so its statements would run outside it. ` +
+      `PostgreSQL leaves a schema out of the search_path when the role has no USAGE privilege on it: grant the role ` +
+      `USAGE and CREATE on schema "${segment}", or use another segment. A pooler that drops the startup options of a ` +
+      'connection leaves the segment out too: connect to PostgreSQL itself, or through a pooler that keeps them.',
+  );
+};
+
+/**
  * Adapter view bound to one checked-out transaction client while its
  * transaction runs. Each concurrent transaction receives its own instance, so
  * callback queries cannot leak onto another callback's client through shared
@@ -1162,8 +1191,9 @@ export class PostgresAdapter implements StorageAdapter {
   /**
    * Opens the adapter: makes its pool and checks that a connection can be
    * made (and with a segment, creates the segment's schema when it is
-   * missing), or takes up the pool it was given. A failure ends the pool it
-   * made, so a later `open()` starts again. Two calls at once open once.
+   * missing and checks that the segment is the connection's current schema),
+   * or takes up the pool it was given. A failure ends the pool it made, so a
+   * later `open()` starts again. Two calls at once open once.
    */
   public open(openOptions?: StorageOpenOptions): Promise<void> {
     if (this.pool) {
@@ -1207,6 +1237,7 @@ export class PostgresAdapter implements StorageAdapter {
       try {
         if (this.segmentStatements) {
           await createSchema(client, this.segmentStatements.segment);
+          await requireSegmentSchema(client, this.segmentStatements.segment);
         }
       } finally {
         client.release();
