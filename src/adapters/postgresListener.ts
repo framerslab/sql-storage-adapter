@@ -169,7 +169,7 @@ export class PostgresListener {
   }
 
   private schedule(wait: number): void {
-    if (this.retry) return;
+    if (this.closed || this.handlers.size === 0 || this.retry) return;
     this.retry = setTimeout(() => {
       this.retry = null;
       if (this.closed || this.handlers.size === 0) return;
