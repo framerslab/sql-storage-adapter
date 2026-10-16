@@ -78,6 +78,27 @@ npm install sql.js                    # WASM SQLite (auto-included for IndexedDB
 
 > `better-sqlite3` 13 needs Node-API 10: Node.js 22.14+ or 23.6+, or Electron 35+ (whose Node is 22.14). On an older runtime (Node.js 20, Node.js 22.13 and earlier, Electron 34 and earlier) install `better-sqlite3@12`; with 13 installed there, the adapter refuses to open, so the resolver falls back to `sql.js`, rather than letting the native binding crash the process. `better-sqlite3` 13 ships prebuilt binaries, but npm can still run `node-gyp rebuild` for it, which needs the build tools above (Python, and make and a C++ compiler, or the Visual Studio Build Tools on Windows): always when it installs from a lockfile (`npm ci`, or `npm install` with a `package-lock.json`), and on some platforms on a fresh install too ([WiseLibs/better-sqlite3#1516](https://github.com/WiseLibs/better-sqlite3/issues/1516)).
 
+### Entries
+
+The root entry exports everything and imports every adapter. A server takes its adapter from that adapter's own entry, with the rest from `./core`, so its bundle carries neither sql.js nor the S3 client:
+
+```typescript
+import { createPostgresAdapter } from '@framers/sql-storage-adapter/postgres';
+import { createStorageFeatures, runSchemaMigrations, isUniqueViolation } from '@framers/sql-storage-adapter/core';
+```
+
+| Entry | Holds |
+| --- | --- |
+| `@framers/sql-storage-adapter` | Everything, with `createDatabase` and the resolver |
+| `./core` | Contracts and errors, dialects, full-text search, codecs, exporters, `createStorageFeatures`, the schema-migration runner, `isUniqueViolation`, the logger. No adapter |
+| `./postgres`, `./better-sqlite3`, `./sqljs`, `./indexeddb`, `./capacitor` | One adapter each |
+| `./backup` | S3-compatible backups (`@aws-sdk/client-s3`) |
+| `./authjs` | The Auth.js database adapter (also in `./core`) |
+| `./electron`, `./electron/renderer`, `./electron/preload` | The Electron adapters. `./electron/renderer` holds only what a window uses; `require('./electron/preload')` gives one bundled CommonJS file for a sandboxed preload |
+| `./sync`, `./kv`, `./types` | Cross-platform sync, the key-value store, the types |
+
+Every entry has an `import` and a `require` condition. The CommonJS build under `dist/cjs` is made from the ES module build file by file, so a class has one identity whichever entry a caller takes it from. It carries its own declarations, so a CommonJS TypeScript consumer under `node16` resolution type-checks against them. CI packs the package, installs it in a new project and checks each of these: `require()` of every entry, what each server entry bundles, and the preload.
+
 ## Quick Start
 
 ```typescript
@@ -360,6 +381,26 @@ const status = await schemaMigrationStatus(db, migrations);            // { appl
 - **Locking.** On PostgreSQL each file's transaction takes `pg_advisory_xact_lock(lockKey)` and checks the ledger again, so two runners at once apply each file once. `lockKey` is an integer, or text hashed with `hashtext()`. On SQLite the file's write transaction is the lock.
 - **Outside a transaction.** A file whose first line is `-- outside transaction` (`outsideTransactionMarker`) runs outside a transaction, for `CREATE INDEX CONCURRENTLY` or `VACUUM`. On PostgreSQL it runs under the session lock on one held connection (`withConnection`).
 - **Unknown rows.** `unknown: 'ignore'` lets a run go on past ledger rows the list lacks.
+
+### Auth.js
+
+`createAuthJsAdapter(db)` is an Auth.js database adapter. It keeps users, accounts, sessions and verification tokens in the product's own database through this library, on PostgreSQL or SQLite. Pass it to NextAuth v5 or `@auth/core`; it has the shape of `Adapter` from `@auth/core/adapters`, which CI checks, and needs no dependency on it.
+
+```typescript
+import NextAuth from 'next-auth';
+import { createDatabase } from '@framers/sql-storage-adapter';
+import { createAuthJsAdapter, ensureAuthJsTables } from '@framers/sql-storage-adapter/authjs';
+
+const db = await createDatabase({ url: process.env.DATABASE_URL, strict: true });
+await ensureAuthJsTables(db); // or put authJsTablesSql(db) in a migration
+export const { handlers, auth, signIn, signOut } = NextAuth({ adapter: createAuthJsAdapter(db), providers: [/* ... */] });
+```
+
+- **Tables.** They are `auth_users`, `auth_accounts`, `auth_sessions` and `auth_verification_tokens`; `tablePrefix` changes the `auth_`. Ids are text, from `crypto.randomUUID()` unless Auth.js passes one or `generateId` is given. Times are `timestamptz` on PostgreSQL and ISO 8601 text on SQLite, and Dates either way in JavaScript.
+- **Deletes.** `deleteUser` deletes the user's sessions and accounts first, in one transaction, so it holds on engines that leave foreign keys off.
+- **Verification tokens.** `useVerificationToken` deletes and returns the token in one statement (`DELETE ... RETURNING`), so a token works once.
+- **Passkeys.** WebAuthn authenticators are not stored.
+- **Tests.** Auth.js's own adapter test suite runs against it on PostgreSQL, better-sqlite3 and sql.js.
 
 ### Values
 

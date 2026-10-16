@@ -1,3 +1,24 @@
+## [0.7.4] - 2026-10-16
+
+### Added
+- An Auth.js database adapter: `createAuthJsAdapter(db, { tablePrefix?, generateId? })`, with `ensureAuthJsTables()` and `authJsTablesSql()`, from `./authjs`, `./core` and the root.
+  - It keeps users, accounts, sessions and verification tokens in text-keyed tables (`auth_` by default) on PostgreSQL or SQLite.
+  - It has the shape of `@auth/core`'s `Adapter` (CI type-checks it against `@auth/core`), with no dependency on it.
+  - `deleteUser` removes the user's sessions and accounts in one transaction, and `useVerificationToken` deletes and returns a token in one statement.
+  - Auth.js's own adapter test suite, vendored with its ISC notice, runs against it on PostgreSQL, better-sqlite3 and sql.js.
+  - WebAuthn authenticators are not stored.
+
+## [0.7.3] - 2026-10-15
+
+### Added
+- Per-adapter entries (`./postgres`, `./better-sqlite3`, `./sqljs`, `./indexeddb`, `./capacitor`), `./backup`, and an adapter-free `./core`. A server that takes its adapter from its own entry, with the rest from `./core`, bundles neither sql.js nor `@aws-sdk/client-s3`. The root entry imports every adapter, as before.
+- `./electron/renderer`: the renderer adapter alone, with nothing from the main process.
+- A CommonJS build. Every entry has a `require` condition to `dist/cjs`, transformed from the ES module build file by file and carrying its own declarations, and `main` points at it. `require('@framers/sql-storage-adapter/electron/preload')` gives one bundled CommonJS file that requires only `electron`, as a sandboxed preload must.
+
+### Changed
+- `@capacitor-community/sqlite` is accepted as a peer at `^6.0.0 || ^7.0.0 || ^8.0.0`. The connection calls the adapter makes are the same in 7 and 8.
+- `sideEffects` names the preload files, which expose their API on import. With `sideEffects: false` a bundler could drop `import '@framers/sql-storage-adapter/electron/preload'`.
+
 ## [0.7.2] - 2026-10-15
 
 ### Added
