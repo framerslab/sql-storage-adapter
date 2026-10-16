@@ -92,6 +92,7 @@ import { createStorageFeatures, runSchemaMigrations, isUniqueViolation } from '@
 | `@framers/sql-storage-adapter` | Everything, with `createDatabase` and the resolver |
 | `./core` | Contracts and errors, dialects, full-text search, codecs, exporters, `createStorageFeatures`, the schema-migration runner, `isUniqueViolation`, the logger. No adapter |
 | `./postgres`, `./better-sqlite3`, `./sqljs`, `./indexeddb`, `./capacitor` | One adapter each |
+| `SupabaseAdapter` (root) | Deprecated: use `./postgres` with the Supabase connection string |
 | `./backup` | S3-compatible backups (`@aws-sdk/client-s3`) |
 | `./authjs` | The Auth.js database adapter (also in `./core`) |
 | `./electron`, `./electron/renderer`, `./electron/preload` | The Electron adapters. `./electron/renderer` holds only what a window uses; `require('./electron/preload')` gives one bundled CommonJS file for a sandboxed preload |
@@ -738,7 +739,7 @@ const ddl = `CREATE TABLE notes (id ${d.columnType('uuid')} PRIMARY KEY DEFAULT 
 `createStorageFeatures` gives each engine the full-text search it has:
 - FTS5 on better-sqlite3;
 - FTS4 on sql.js and IndexedDB, whose stock sql.js build compiles FTS3 and FTS4 and no FTS5;
-- a tsvector column with a GIN index on PostgreSQL, the Supabase adapter included.
+- a tsvector column with a GIN index on PostgreSQL, the Supabase adapter included. (`SupabaseAdapter` is deprecated: reach Supabase with `createPostgresAdapter({ connectionString })`, which gives it the same features.)
 
 The same calls return the same rows on all three, and `tests/fts.parity.spec.ts` runs them on each.
 

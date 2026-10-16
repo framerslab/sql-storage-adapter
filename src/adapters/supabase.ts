@@ -1,9 +1,16 @@
 /**
  * Supabase Postgres Storage Adapter
  * Provides full Postgres capabilities with Supabase's managed infrastructure
+ *
+ * @deprecated Use the PostgreSQL adapter with the Supabase connection string:
+ * `createPostgresAdapter({ connectionString, ssl: { rejectUnauthorized: true, ca } })`
+ * from `@framers/sql-storage-adapter/postgres`. It reaches Supabase the same
+ * way, with pool control, transaction error handling and `strict` resolution.
  */
 
 import type { Pool } from 'pg';
+import { toPostgresStatement } from '../shared/sqlPlaceholders';
+import { getStorageLogger } from '../shared/logger';
 import type {
   StorageAdapter,
   StorageCapability,
@@ -28,9 +35,28 @@ export interface SupabaseAdapterOptions extends StorageOpenOptions {
     idleTimeoutMillis?: number;
     connectionTimeoutMillis?: number;
   };
-  ssl?: boolean | { rejectUnauthorized: boolean };
+  /** TLS: false turns it off; an object (with `ca` to verify Supabase's certificate) is passed to pg; otherwise TLS without verification. */
+  ssl?: boolean | { rejectUnauthorized: boolean; ca?: string };
 }
 
+/** Whether this process has been told the adapter is deprecated. */
+let deprecationLogged = false;
+
+/** A statement and its parameters for pg: `?` and `@name` rewritten to `$n`, as the PostgreSQL adapter does. */
+const prepare = (statement: string, parameters?: StorageParameters): [string, unknown[]] => {
+  const { text, values } = toPostgresStatement(statement, parameters);
+  return [text, values];
+};
+
+/** An error with `message`, keeping the database error as `cause` and its PostgreSQL error `code`. */
+const failure = (message: string, error: unknown): Error => {
+  const wrapped = new Error(message) as Error & { cause?: unknown; code?: unknown };
+  wrapped.cause = error;
+  if (error && typeof error === 'object' && 'code' in error) wrapped.code = (error as { code?: unknown }).code;
+  return wrapped;
+};
+
+/** @deprecated Use `createPostgresAdapter` from `@framers/sql-storage-adapter/postgres` with the Supabase connection string. */
 export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions {
   readonly kind = 'supabase-postgres';
   readonly capabilities: ReadonlySet<StorageCapability> = new Set<StorageCapability>([
@@ -58,6 +84,13 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
 
   async open(options?: SupabaseAdapterOptions): Promise<void> {
     this.options = options;
+    if (!deprecationLogged) {
+      deprecationLogged = true;
+      getStorageLogger().warn(
+        { adapter: 'supabase-postgres' },
+        'SupabaseAdapter is deprecated: use createPostgresAdapter({ connectionString }) from @framers/sql-storage-adapter/postgres, which reaches Supabase the same way. SupabaseAdapter does not verify the server certificate unless ssl is { rejectUnauthorized: true, ca }.',
+      );
+    }
 
     // Dynamic import to avoid bundling pg when not needed
     const pg = await import('pg');
@@ -82,7 +115,7 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       min: options?.poolConfig?.min || 2,
       idleTimeoutMillis: options?.poolConfig?.idleTimeoutMillis || 30000,
       connectionTimeoutMillis: options?.poolConfig?.connectionTimeoutMillis || 5000,
-      ssl: options?.ssl !== false ? { rejectUnauthorized: false } : undefined
+      ssl: options?.ssl === false ? undefined : typeof options?.ssl === 'object' ? options.ssl : { rejectUnauthorized: false }
     });
 
     // Test connection
@@ -135,7 +168,7 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
 
     const startTime = Date.now();
     try {
-      const result = await this.pool.query(statement, Array.isArray(parameters) ? parameters : undefined);
+      const result = await this.pool.query(...prepare(statement, parameters));
       this.trackQuery(statement, startTime);
 
       return {
@@ -143,7 +176,7 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
         lastInsertRowid: result.rows[0]?.id || 0
       };
     } catch (error) {
-      throw new Error(`Query failed: ${error}`);
+      throw failure(`Query failed: ${error}`, error);
     }
   }
 
@@ -167,7 +200,7 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
 
     const startTime = Date.now();
     try {
-      const result = await this.pool.query(statement, Array.isArray(parameters) ? parameters : undefined);
+      const result = await this.pool.query(...prepare(statement, parameters));
       this.trackQuery(statement, startTime);
 
       const value = result.rows[0] || null;
@@ -188,7 +221,7 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
 
       return value as T;
     } catch (error) {
-      throw new Error(`Query failed: ${error}`);
+      throw failure(`Query failed: ${error}`, error);
     }
   }
 
@@ -214,7 +247,7 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
 
     const startTime = Date.now();
     try {
-      const result = await this.pool.query(statement, Array.isArray(parameters) ? parameters : undefined);
+      const result = await this.pool.query(...prepare(statement, parameters));
       this.trackQuery(statement, startTime);
 
       const rows = result.rows;
@@ -235,7 +268,7 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
 
       return rows as T[];
     } catch (error) {
-      throw new Error(`Query failed: ${error}`);
+      throw failure(`Query failed: ${error}`, error);
     }
   }
 
@@ -247,7 +280,7 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       await this.pool.query(script);
       this.trackQuery(script, startTime);
     } catch (error) {
-      throw new Error(`Script execution failed: ${error}`);
+      throw failure(`Script execution failed: ${error}`, error);
     }
   }
 
@@ -265,15 +298,15 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
         open: async () => {},
         close: async () => {},
         run: async (stmt, params) => {
-          const result = await client.query(stmt, Array.isArray(params) ? params : undefined);
+          const result = await client.query(...prepare(stmt, params));
           return { changes: result.rowCount || 0, lastInsertRowid: 0 };
         },
         get: async (stmt, params) => {
-          const result = await client.query(stmt, Array.isArray(params) ? params : undefined);
+          const result = await client.query(...prepare(stmt, params));
           return result.rows[0] || null;
         },
         all: async (stmt, params) => {
-          const result = await client.query(stmt, Array.isArray(params) ? params : undefined);
+          const result = await client.query(...prepare(stmt, params));
           return result.rows;
         },
         exec: async (script) => {

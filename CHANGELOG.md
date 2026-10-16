@@ -1,4 +1,4 @@
-## [0.7.6] - 2026-10-16
+## [0.7.7] - 2026-10-16
 
 ### Added
 - `PostgresExporterOptions`, the second argument of `new PostgresExporter(connectionString, { schema })`: `schema` exports one schema alone, by its exact name (`pg_dump --schema`). It is exported from the root and `./core`.
@@ -16,6 +16,16 @@
 - `resolveStorageAdapter()` and `createDatabase()` refuse a segment name in `postgres`, `indexedDb` or `capacitor` that cannot be a segment before any adapter is tried, as they refuse their own. A candidate whose options name no segment, tried after a candidate whose options named one, opens in that segment: without `strict`, an unreachable PostgreSQL with `postgres.segment` fell through to better-sqlite3 on the shared file, outside the segment.
 - IndexedDB adapter: a PRAGMA through `all()` or `get()` that sets `user_version`, `application_id`, `schema_version`, `page_size`, `auto_vacuum` or `encoding`, or runs `incremental_vacuum` or `optimize`, is saved. SQLite's `total_changes()` counts no PRAGMA, so `get('PRAGMA user_version = 3')` was stored neither with `durability: 'commit'` nor by `flush()` or `close()`. PRAGMA reads and connection settings still write nothing.
 - `createSqlKeyValueStore()` refuses a `Proxy` with a `DataCloneError`, as the structured clone and IndexedDB's put do. A proxy reads as the object it wraps to every check but the runtime's own `structuredClone`, which now runs first, so `set()` stored `new Proxy({ x: 1 }, {})` as `{ x: 1 }`.
+
+## [0.7.6] - 2026-10-16
+
+### Deprecated
+- `SupabaseAdapter`. The PostgreSQL adapter reaches Supabase with its connection string (`createPostgresAdapter({ connectionString, ssl: { rejectUnauthorized: true, ca } })`), with pool control, transaction error handling and `strict` resolution. `open()` says so once per process through the host logger, and adds that `SupabaseAdapter` does not verify the server certificate unless `ssl` is `{ rejectUnauthorized: true, ca }`.
+
+### Fixed
+- `SupabaseAdapter` reads `?` and `@name` placeholders as the PostgreSQL adapter does, in and out of a transaction. It passed the statement to pg as written, so a `?` failed with a syntax error and named parameters were dropped.
+- `SupabaseAdapter` keeps PostgreSQL's error code (`code`) and the database error (`cause`) on the errors it throws, so `isUniqueViolation` reads a duplicate. It threw a new Error carrying only the message.
+- `SupabaseAdapter` passes an `ssl` object it is given to pg. It replaced any `ssl` option other than `false` with `{ rejectUnauthorized: false }`, so certificate verification could not be turned on.
 
 ## [0.7.5] - 2026-10-16
 
