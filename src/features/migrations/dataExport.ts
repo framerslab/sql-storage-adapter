@@ -3,6 +3,7 @@
  * Supports exporting data to portable formats (JSON, SQL, CSV).
  */
 
+import { syncPostgresSequence } from '../../shared/identitySequence';
 import type { StorageAdapter } from '../../core/contracts';
 import { createStorageFeatures } from '../../core/contracts/features';
 import { createTableStatement, quoteIdentifier, type Engine } from './tableDefinition';
@@ -50,6 +51,10 @@ export interface TableSchema {
   /** The primary key's columns, in key order. */
   primaryKeys?: string[];
   indexes?: IndexInfo[];
+  /** A selected view is exported as a row snapshot, not recreated as a view. */
+  view?: boolean;
+  /** SQLite AUTOINCREMENT high-water mark, including ids whose rows were deleted. */
+  sequence?: string;
   /** SQLite: the CREATE TABLE statement SQLite keeps for the table, which a SQLite import runs. */
   sql?: string;
 }
@@ -71,6 +76,8 @@ export interface ColumnInfo {
   generated?: boolean;
   /** PostgreSQL: the generated column's expression. */
   generationExpression?: string;
+  /** PostgreSQL: how the generated column is evaluated. */
+  generationKind?: 'stored' | 'virtual';
 }
 
 /**
@@ -118,17 +125,38 @@ export async function exportData(
     // Pages in one order, so none repeats or skips a row: the primary key's,
     // else the row's place in the table (its rowid on SQLite, its ctid on PostgreSQL).
     const keys = schemas[index].primaryKeys ?? [];
-    const order =
+    const view = schemas[index].view === true;
+    const order = view ? '' :
       keys.length > 0 ? ` ORDER BY ${keys.map(escapeIdentifier).join(', ')}` : engine === 'postgres' ? ' ORDER BY ctid' : ' ORDER BY rowid';
+
+    // FTS uses its rowid to look up external content; SELECT * omits it.
+    const selection = engine === 'sqlite' && /^\s*CREATE\s+VIRTUAL\s+TABLE\b/i.test(schemas[index].sql ?? '') &&
+      /\bUSING\s+fts[345]\s*\(/i.test(schemas[index].sql ?? '') ? 'rowid, *' : '*';
 
     // Fetch data in batches
     do {
       batch = await adapter.all(
-        `SELECT * FROM ${escapeIdentifier(table)}${order} LIMIT ${batchSize} OFFSET ${offset}`
+        `SELECT ${selection} FROM ${escapeIdentifier(table)}${order}${view ? '' : ` LIMIT ${batchSize} OFFSET ${offset}`}`
       );
-      rows.push(...batch);
+      rows.push(...batch.map(row => {
+        const record = { ...(row as Record<string, unknown>) };
+        if (engine === 'postgres') {
+          for (const column of schemas[index].columns) {
+            const value = record[column.name];
+            if (!(value instanceof Date)) continue;
+            if (column.type === 'date' || /^timestamp(\(\d+\))? without time zone$/.test(column.type)) {
+              // pg reads zone-less fields in the process's local time.
+              const pad = (n: number, width = 2) => String(n).padStart(width, '0');
+              const day = `${pad(value.getFullYear(), 4)}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
+              record[column.name] = column.type === 'date' ? day :
+                `${day} ${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}.${pad(value.getMilliseconds(), 3)}`;
+            }
+          }
+        }
+        return record;
+      }));
       offset += batchSize;
-    } while (batch.length === batchSize);
+    } while (!view && batch.length === batchSize);
 
     exportedData.data[table] = rows;
   }
@@ -154,7 +182,7 @@ export async function exportAsSQL(
   adapter: StorageAdapter,
   options: DataExportOptions = {}
 ): Promise<string> {
-  const data = await exportData(adapter, options);
+  const data = await exportData(adapter, { ...options, includeSchema: true });
   const lines: string[] = [];
 
   lines.push('-- SQL Export from sql-storage-adapter');
@@ -165,7 +193,7 @@ export async function exportAsSQL(
   const schemas = new Map((data.schema ?? []).map((table) => [table.name, table]));
 
   // Export schema
-  for (const table of schemas.values()) {
+  for (const table of options.includeSchema === false ? [] : schemas.values()) {
     lines.push(`-- Table: ${table.name}`);
     // The export inserts the ids it holds, so identity columns take them.
     const { sql, warnings } = createTableStatement(table, engine, engine, {
@@ -179,7 +207,6 @@ export async function exportAsSQL(
 
   // Export data
   for (const [tableName, rows] of Object.entries(data.data)) {
-    if (rows.length === 0) continue;
     const columns = schemas.get(tableName)?.columns ?? [];
     const generated = new Set(columns.filter((column) => column.generated).map((column) => column.name));
 
@@ -190,15 +217,24 @@ export async function exportAsSQL(
       const values = Object.fromEntries(Object.entries(row as Record<string, unknown>).filter(([column]) => !generated.has(column)));
       lines.push(generateInsertSQL(tableName, values, engine, types));
     }
-    if (engine === 'postgres') {
+    if (engine === 'postgres' && rows.length > 0) {
       // Move each identity's sequence past the ids the inserts gave.
       for (const column of columns.filter((candidate) => candidate.autoIncrement)) {
         const table = quoteIdentifier(tableName);
         const literal = table.replace(/'/g, "''");
         lines.push(
-          `SELECT setval(pg_get_serial_sequence('${literal}', '${column.name.replace(/'/g, "''")}'), GREATEST(COALESCE(MAX(${quoteIdentifier(column.name)}), 0), 0) + 1, false) FROM ${table};`,
+          `${syncPostgresSequence(
+            `pg_get_serial_sequence('${literal}', '${column.name.replace(/'/g, "''")}')`,
+            `SELECT MAX(${quoteIdentifier(column.name)}) FROM ${table}`,
+          )};`,
         );
       }
+    }
+    const sequence = schemas.get(tableName)?.sequence;
+    if (engine === 'sqlite' && sequence !== undefined && /^\d+$/.test(sequence)) {
+      const name = quoteText(tableName);
+      lines.push(`UPDATE sqlite_sequence SET seq = MAX(seq, ${sequence}) WHERE name = ${name};`);
+      lines.push(`INSERT INTO sqlite_sequence (name, seq) SELECT ${name}, ${sequence} WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = ${name});`);
     }
     lines.push('');
   }
@@ -305,11 +341,11 @@ async function getSqliteTableSchema(adapter: StorageAdapter, table: string): Pro
       [table]
     );
   }
-  const created = await adapter.get<{ sql: string | null }>(
-    `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`,
+  const created = await adapter.get<{ sql: string | null; type: string }>(
+    `SELECT sql, type FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?`,
     [table]
   );
-  const sql = created?.sql ?? undefined;
+  const sql = created?.type === 'view' ? undefined : created?.sql ?? undefined;
   // The table's options follow its closing parenthesis: `) WITHOUT ROWID`.
   const withoutRowid = sql ? /\bWITHOUT\s+ROWID\b/i.test(sql.slice(sql.lastIndexOf(')') + 1)) : false;
   // A virtual table's hidden columns (hidden = 1) are not part of its rows.
@@ -318,6 +354,13 @@ async function getSqliteTableSchema(adapter: StorageAdapter, table: string): Pro
     .filter(column => Number(column.pk) > 0)
     .sort((a, b) => Number(a.pk) - Number(b.pk))
     .map(column => column.name);
+
+  const sequenceTable = sql && /\bAUTOINCREMENT\b/i.test(sql)
+    ? await adapter.get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'")
+    : undefined;
+  const sequence = sequenceTable
+    ? await adapter.get<{ seq: string }>('SELECT CAST(seq AS TEXT) AS seq FROM sqlite_sequence WHERE name = ?', [table])
+    : undefined;
 
   return {
     name: table,
@@ -337,6 +380,8 @@ async function getSqliteTableSchema(adapter: StorageAdapter, table: string): Pro
     }),
     ...(primaryKeys.length > 0 ? { primaryKeys } : {}),
     ...(sql ? { sql } : {}),
+    ...(created?.type === 'view' ? { view: true } : {}),
+    ...(sequence ? { sequence: sequence.seq } : {}),
   };
 }
 
@@ -349,10 +394,12 @@ async function getPostgresTableSchema(adapter: StorageAdapter, table: string): P
     default_value: string | null;
     identity: string;
     generated: string;
+    relation_kind: string;
   }>(
     `SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS not_null,
-            pg_get_expr(d.adbin, d.adrelid) AS default_value, a.attidentity AS identity, a.attgenerated AS generated
+            pg_get_expr(d.adbin, d.adrelid) AS default_value, a.attidentity AS identity, a.attgenerated AS generated, c.relkind AS relation_kind
      FROM pg_attribute a
+     JOIN pg_class c ON c.oid = a.attrelid
      LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
      WHERE a.attrelid = to_regclass(quote_ident(current_schema()) || '.' || quote_ident(?))
        AND a.attnum > 0 AND NOT a.attisdropped
@@ -361,20 +408,23 @@ async function getPostgresTableSchema(adapter: StorageAdapter, table: string): P
   );
   const primaryKeys = (
     await adapter.all<{ name: string }>(
-      `SELECT kcu.column_name AS name
-       FROM information_schema.table_constraints tc
-       JOIN information_schema.key_column_usage kcu
-         ON kcu.constraint_schema = tc.constraint_schema AND kcu.constraint_name = tc.constraint_name
-       WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = current_schema() AND tc.table_name = ?
-       ORDER BY kcu.ordinal_position`,
+      `SELECT a.attname AS name
+       FROM pg_index i
+       CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, position)
+       JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+       WHERE i.indisprimary
+         AND i.indrelid = to_regclass(quote_ident(current_schema()) || '.' || quote_ident(?))
+         AND k.position <= i.indnkeyatts
+       ORDER BY k.position`,
       [table]
     )
   ).map(row => row.name);
 
   return {
     name: table,
+    ...(columns[0]?.relation_kind === 'v' ? { view: true } : {}),
     columns: columns.map((column): ColumnInfo => {
-      const generated = column.generated === 's';
+      const generated = column.generated === 's' || column.generated === 'v';
       const identity = column.identity === 'a' ? 'always' : column.identity === 'd' ? 'by default' : undefined;
       const fromSequence = column.default_value !== null && /^\s*nextval\s*\(/i.test(column.default_value);
       return {
@@ -384,7 +434,7 @@ async function getPostgresTableSchema(adapter: StorageAdapter, table: string): P
         defaultValue: generated ? undefined : column.default_value ?? undefined,
         ...(identity || fromSequence ? { autoIncrement: true } : {}),
         ...(identity ? { identity } : {}),
-        ...(generated ? { generated: true, generationExpression: column.default_value ?? undefined } : {}),
+        ...(generated ? { generated: true, generationKind: column.generated === 'v' ? 'virtual' : 'stored', generationExpression: column.default_value ?? undefined } : {}),
       };
     }),
     ...(primaryKeys.length > 0 ? { primaryKeys } : {}),
@@ -398,7 +448,7 @@ function generateInsertSQL(table: string, row: Record<string, unknown>, engine: 
   const columns = Object.keys(row);
   const values = columns.map(col => escapeSQLValue(row[col], engine, types.get(col)));
 
-  return `INSERT INTO ${escapeIdentifier(table)} (${columns.map(escapeIdentifier).join(', ')}) VALUES (${values.join(', ')});`;
+  return `INSERT INTO ${escapeIdentifier(table)} (${columns.map(escapeIdentifier).join(', ')})${engine === 'postgres' ? ' OVERRIDING SYSTEM VALUE' : ''} VALUES (${values.join(', ')});`;
 }
 
 /**
@@ -428,6 +478,7 @@ const postgresArrayText = (items: unknown[]): string =>
  */
 function escapeSQLValue(value: unknown, engine: Engine, columnType?: string): string {
   if (value === null || value === undefined) return 'NULL';
+  if (engine === 'postgres' && (columnType === 'json' || columnType === 'jsonb')) return quoteText(JSON.stringify(value));
   if (typeof value === 'number') return Number.isFinite(value) ? String(value) : quoteText(String(value));
   if (typeof value === 'bigint') return String(value);
   if (typeof value === 'boolean') return engine === 'postgres' ? (value ? 'TRUE' : 'FALSE') : value ? '1' : '0';

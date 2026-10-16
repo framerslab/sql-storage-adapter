@@ -65,6 +65,21 @@ describe('Data Export', () => {
     ]);
   });
 
+  it('exports an explicitly selected SQLite view without rowid pagination', async () => {
+    await adapter.exec('CREATE VIEW user_names AS SELECT name FROM users UNION ALL SELECT name FROM users');
+    const data = await exportData(adapter, { tables: ['user_names'], batchSize: 1 });
+    expect(data.data.user_names).toEqual([{ name: 'Alice' }, { name: 'Bob' }, { name: 'Alice' }, { name: 'Bob' }]);
+    expect(data.schema?.[0].sql).toBeUndefined();
+  });
+
+  it('does not mistake AUTOINCREMENT in a text default for sequence metadata', async () => {
+    await adapter.exec("CREATE TABLE labels (id INTEGER PRIMARY KEY, label TEXT DEFAULT 'AUTOINCREMENT')");
+    const data = await exportData(adapter, { tables: ['labels'] });
+    expect(data.schema?.[0].primaryKeys).toEqual(['id']);
+    expect(data.schema?.[0].columns).toHaveLength(2);
+    expect(data.schema?.[0].sequence).toBeUndefined();
+  });
+
   it('should export all data with schema', async () => {
     const exported = await exportData(adapter, { includeSchema: true });
 

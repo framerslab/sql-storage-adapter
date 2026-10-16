@@ -275,11 +275,13 @@ describe('Migration Utilities', () => {
 
   it('should handle onConflict strategies', async () => {
     // Pre-populate target
-    await targetAdapter.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
-    await targetAdapter.run('INSERT INTO users (id, name, email) VALUES (?, ?, ?)', [
+    // The target's table has the source's columns, so the only failure an insert can meet is the conflict on id 1.
+    await targetAdapter.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT, created_at INTEGER)');
+    await targetAdapter.run('INSERT INTO users (id, name, email, created_at) VALUES (?, ?, ?, ?)', [
       1,
       'Existing Alice',
       'existing@example.com',
+      0,
     ]);
 
     // Migrate with replace strategy
@@ -293,8 +295,8 @@ describe('Migration Utilities', () => {
       'SELECT name FROM users WHERE id = ?',
       [1]
     );
-    // Depending on the adapter's support for ON CONFLICT, this might still be 'Existing Alice'
-    expect(alice).toBeDefined();
+    // 'replace' writes the source's row over the conflicting one
+    expect(alice?.name).toBe('Alice');
   });
 
   it('should create partial backups', async () => {

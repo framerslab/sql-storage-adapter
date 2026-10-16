@@ -1,8 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { StorageResolutionError } from '../src/core/contracts/index.ts';
+import { SqliteDialect } from '../src/dialects/SqliteDialect.js';
 import * as Types from '../src/types/index.ts';
 
 describe('Types and Exports', () => {
+  it('accepts a dialect implementation without syncIdentitySequence', () => {
+    const legacy: Omit<Types.SqlDialect, 'syncIdentitySequence'> = Object.assign(new SqliteDialect(), {
+      syncIdentitySequence: undefined,
+    });
+    const dialect: Types.SqlDialect = legacy;
+    expect(dialect.syncIdentitySequence?.('items', 'id') ?? null).toBeNull();
+    expect(dialect.autoIncrementPrimaryKey()).toBe('INTEGER PRIMARY KEY AUTOINCREMENT');
+  });
+
   describe('StorageResolutionError', () => {
     it('should create error with message', () => {
       const error = new StorageResolutionError('Test error');

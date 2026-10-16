@@ -31,6 +31,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
+      TZ: Europe/Berlin
       POSTGRES_TEST_URL: postgresql://adapter:adapter@localhost:5432/adapter_test
     steps:
       - uses: actions/checkout@v5
@@ -86,6 +87,7 @@ jobs:
             resolveStorageAdapter,
             type PostgresAdapter,
             type StorageAdapter,
+            type SqlDialect,
           } from '@framers/sql-storage-adapter';
           import {
             createSqlKeyValueStore,
@@ -93,6 +95,11 @@ jobs:
             openIndexedDbStore,
             type KeyValueStore,
           } from '@framers/sql-storage-adapter/kv';
+
+          declare const legacyDialect: Omit<SqlDialect, 'syncIdentitySequence'>;
+          export const compatibleDialect: SqlDialect = legacyDialect;
+          export const syncIfAvailable = (dialect: SqlDialect) =>
+            dialect.syncIdentitySequence?.('items', 'id') ?? null;
 
           export const openDefault = (): Promise<StorageAdapter> => createDatabase({ segment: 'agentos' });
           export const openResolved = (): Promise<StorageAdapter> => resolveStorageAdapter();
@@ -133,6 +140,35 @@ jobs:
           "$tsc" --module node16 --moduleResolution node16 --strict --skipLibCheck --noEmit cjs-consumer.cts
           node "$GITHUB_WORKSPACE/scripts/verify-package.mjs" "$consumer_dir"
 
+
+  postgres18:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: adapter
+          POSTGRES_PASSWORD: adapter
+          POSTGRES_DB: adapter_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U adapter -d adapter_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TZ: Europe/Berlin
+      POSTGRES_TEST_URL: postgresql://adapter:adapter@localhost:5432/adapter_test
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: npm install
+      - name: Run migration specs on PostgreSQL 18
+        run: npx vitest run tests/migrateAdapter.engines.spec.ts
 
   # The IndexedDB adapter's cross-tab coordination and durability, and the
   # key-value module, on the browsers' own IndexedDB, Web Locks and structured

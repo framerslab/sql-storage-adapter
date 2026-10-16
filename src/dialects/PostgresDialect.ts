@@ -1,3 +1,4 @@
+import { syncPostgresSequence } from '../shared/identitySequence.js';
 import type {
   AutoIncrementOptions,
   CastType,
@@ -125,9 +126,9 @@ export class PostgresDialect implements SqlDialect {
     const col = checkColumnName(column);
     // pg_get_serial_sequence parses its first argument as SQL does (unquoted
     // names fold to lower case) and takes the column name literally.
-    return (
-      `SELECT setval(pg_get_serial_sequence('${name}', '${col.toLowerCase()}'), ` +
-      `GREATEST(COALESCE(MAX(${col}), 0), 0) + 1, false) FROM ${name}`
+    return syncPostgresSequence(
+      `pg_get_serial_sequence('${name}', '${col.toLowerCase()}')`,
+      `SELECT MAX(${col}) FROM ${name}`,
     );
   }
 

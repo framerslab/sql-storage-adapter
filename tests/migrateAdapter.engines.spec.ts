@@ -1,3 +1,4 @@
+import { SqliteFts5 } from '../src/fts/SqliteFts5.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   createDatabase,
@@ -5,6 +6,8 @@ import {
   createSqlJsAdapter,
   createStorageFeatures,
   exportAsSQL,
+  exportData,
+  importData,
   importFromSQL,
   migrateAdapter,
   type StorageAdapter,
@@ -21,6 +24,48 @@ const POSTGRES_TEST_URL = process.env.POSTGRES_TEST_URL;
 const unique = (prefix: string): string => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
 
 describe('migrateAdapter from SQLite to SQLite', () => {
+  it.each(['copy', 'dump'])('keeps sparse FTS rowids in an external-content index through %s', async mode => {
+    const source = await createDatabase({ type: 'memory' });
+    const target = await createDatabase({ type: 'memory' });
+    const fts = new SqliteFts5();
+    try {
+      await source.exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)');
+      await source.exec("INSERT INTO notes VALUES (3, 'alpha'), (7, 'bravo')");
+      await source.exec(fts.createIndex({ table: 'notes_fts', columns: ['body'], contentTable: 'notes' }));
+      await source.exec(fts.rebuildCommand('notes_fts'));
+      const result = mode === 'copy' ? await migrateAdapter(source, target) :
+        await importFromSQL(target, await exportAsSQL(source));
+      expect(result.errors).toBeUndefined();
+      expect(await target.all("SELECT rowid, body FROM notes_fts WHERE notes_fts MATCH 'bravo'")).toEqual([{ rowid: 7, body: 'bravo' }]);
+      expect(await target.all("SELECT notes.id FROM notes JOIN notes_fts ON notes.id = notes_fts.rowid WHERE notes_fts MATCH 'alpha'")).toEqual([{ id: 3 }]);
+    } finally {
+      await source.close();
+      await target.close();
+    }
+  });
+
+  it.each(['copy', 'dump'])('keeps deleted AUTOINCREMENT high-water marks through %s', async mode => {
+    const source = await createDatabase({ type: 'memory' });
+    const target = await createDatabase({ type: 'memory' });
+    try {
+      await source.exec('CREATE TABLE ids (id INTEGER PRIMARY KEY AUTOINCREMENT); CREATE TABLE empty_ids (id INTEGER PRIMARY KEY AUTOINCREMENT)');
+      await source.exec('INSERT INTO ids VALUES (1), (99); DELETE FROM ids WHERE id = 99; INSERT INTO empty_ids VALUES (50); DELETE FROM empty_ids');
+      const result = mode === 'copy' ? await migrateAdapter(source, target) :
+        await importFromSQL(target, await exportAsSQL(source));
+      expect(result.errors).toBeUndefined();
+      await target.exec('INSERT INTO ids DEFAULT VALUES; INSERT INTO empty_ids DEFAULT VALUES');
+      expect(await target.all('SELECT id FROM ids ORDER BY id')).toEqual([{ id: 1 }, { id: 100 }]);
+      expect(await target.get('SELECT id FROM empty_ids')).toEqual({ id: 51 });
+      await target.exec('INSERT INTO ids VALUES (200); DELETE FROM ids WHERE id = 200');
+      expect((await migrateAdapter(source, target, { onConflict: 'ignore' })).errors).toBeUndefined();
+      await target.exec('INSERT INTO ids DEFAULT VALUES');
+      expect(await target.get('SELECT MAX(id) AS id FROM ids')).toEqual({ id: 201 });
+    } finally {
+      await source.close();
+      await target.close();
+    }
+  });
+
   it('keeps the table as SQLite created it: its primary key, AUTOINCREMENT, UNIQUE and CHECK', async () => {
     const source = await createDatabase({ type: 'memory' });
     const target = createSqlJsAdapter();
@@ -94,7 +139,7 @@ describe('an identity column that takes explicit ids', () => {
       await db.exec(`CREATE TABLE ${table} (id ${dialect.autoIncrementPrimaryKey({ acceptExplicitIds: true })}, label TEXT)`);
       await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [41, 'explicit']);
 
-      const sync = dialect.syncIdentitySequence(table, 'id');
+      const sync = dialect.syncIdentitySequence?.(table, 'id') ?? null;
       if (sync) await db.get(sync);
       await db.run(`INSERT INTO ${table} (label) VALUES (?)`, ['generated']);
 
@@ -147,6 +192,273 @@ describe.skipIf(!POSTGRES_TEST_URL)('migrateAdapter to and from PostgreSQL', () 
         [table],
       )
     ).map((row) => row.name);
+
+  it('keeps zone-less dates and timestamps in a non-UTC process', async () => {
+    const previous = process.env.TZ;
+    process.env.TZ = 'Europe/Berlin';
+    const table = unique('local_dates');
+    const schema = unique('local_dates_dump');
+    tables.push(table);
+    schemas.push(schema);
+    const sqlite = await createDatabase({ type: 'memory' });
+    const target = createPostgresAdapter({ connectionString: url, segment: schema });
+    await target.open();
+    try {
+      expect(new Date(2026, 9, 16).getTimezoneOffset()).not.toBe(0);
+      await pg.exec(`CREATE TABLE ${table} (day DATE, stamp TIMESTAMP, instant TIMESTAMPTZ)`);
+      await pg.exec(`INSERT INTO ${table} VALUES ('2026-10-16', '2026-10-16 12:00:00', '2026-10-16 12:00:00Z')`);
+      expect((await migrateAdapter(pg, sqlite, { tables: [table] })).errors).toBeUndefined();
+      expect(await sqlite.get(`SELECT * FROM ${table}`)).toEqual({
+        day: '2026-10-16', stamp: '2026-10-16 12:00:00.000', instant: '2026-10-16T12:00:00.000Z',
+      });
+      expect((await importFromSQL(target, await exportAsSQL(pg, { tables: [table] }))).errors).toBeUndefined();
+      expect(await target.get(`SELECT day::text, stamp::text FROM ${table}`)).toEqual({
+        day: '2026-10-16', stamp: '2026-10-16 12:00:00',
+      });
+    } finally {
+      if (previous === undefined) delete process.env.TZ;
+      else process.env.TZ = previous;
+      await sqlite.close();
+      await target.close();
+    }
+  });
+
+  it.each(['ignore', 'replace'] as const)('reports non-conflict insert errors with %s', async onConflict => {
+    const sqlite = await createDatabase({ type: 'memory' });
+    const table = unique('bad_numeric');
+    tables.push(table);
+    try {
+      await sqlite.exec(`CREATE TABLE ${table} (id INTEGER PRIMARY KEY, status STRING)`);
+      await sqlite.exec(`INSERT INTO ${table} VALUES (1, 'active')`);
+      const result = await migrateAdapter(sqlite, pg, { onConflict });
+      expect(result.success).toBe(false);
+      expect(result.errors).toEqual([expect.stringContaining('invalid input syntax for type numeric')]);
+      expect(await pg.get(`SELECT COUNT(*)::int AS count FROM ${table}`)).toEqual({ count: 0 });
+    } finally {
+      await sqlite.close();
+    }
+  });
+
+  it('copies PostgreSQL 18 virtual generated columns and leaves them out of inserts', async context => {
+    const version = await pg.get<{ version: string }>("SELECT current_setting('server_version_num') AS version");
+    if (Number(version?.version) < 180000) context.skip();
+    const schema = unique('virtual_dst');
+    schemas.push(schema);
+    const table = unique('virtual_src');
+    tables.push(table);
+    const target = createPostgresAdapter({ connectionString: url, segment: schema });
+    await target.open();
+    try {
+      await pg.exec(`CREATE TABLE ${table} (n INTEGER, doubled INTEGER GENERATED ALWAYS AS (n * 2))`);
+      await pg.exec(`INSERT INTO ${table} (n) VALUES (3)`);
+      expect((await migrateAdapter(pg, target, { tables: [table] })).errors).toBeUndefined();
+      expect(await target.get(`UPDATE ${table} SET n = 5 RETURNING doubled`)).toEqual({ doubled: 10 });
+      expect(await target.get("SELECT attgenerated FROM pg_attribute WHERE attrelid = ?::regclass AND attname = 'doubled'", [table])).toEqual({ attgenerated: 'v' });
+      await target.exec(`DROP TABLE ${table}`);
+      expect((await importFromSQL(target, await exportAsSQL(pg, { tables: [table] }))).errors).toBeUndefined();
+      expect(await target.get(`SELECT doubled FROM ${table}`)).toEqual({ doubled: 6 });
+    } finally {
+      await target.close();
+    }
+  });
+
+  it('copies and dumps JSON arrays and scalar values as JSON', async () => {
+    const schema = unique('json_dst');
+    schemas.push(schema);
+    const table = unique('json_src');
+    tables.push(table);
+    const target = createPostgresAdapter({ connectionString: url, segment: schema });
+    await target.open();
+    try {
+      await pg.exec(`CREATE TABLE ${table} (id INTEGER PRIMARY KEY, doc JSONB, plain JSON)`);
+      const values = [['a'], 'dark', 3, true, { nested: ['x'] }];
+      for (const [id, value] of values.entries()) {
+        await pg.run(`INSERT INTO ${table} VALUES (?, ?::jsonb, ?::json)`, [id, JSON.stringify(value), JSON.stringify(value)]);
+      }
+      expect((await migrateAdapter(pg, target, { tables: [table] })).errors).toBeUndefined();
+      expect(await target.all(`SELECT doc, plain FROM ${table} ORDER BY id`)).toEqual(values.map(value => ({ doc: value, plain: value })));
+      await target.exec(`DROP TABLE ${table}`);
+      expect((await importFromSQL(target, await exportAsSQL(pg, { tables: [table] }))).errors).toBeUndefined();
+      expect(await target.all(`SELECT doc, plain FROM ${table} ORDER BY id`)).toEqual(values.map(value => ({ doc: value, plain: value })));
+    } finally {
+      await target.close();
+    }
+  });
+
+  it('keeps primary keys when the source role has only SELECT', async () => {
+    const role = unique('reader');
+    const table = unique('readonly_ids');
+    const composite = unique('readonly_key');
+    tables.push(table, composite);
+    const sqlite = await createDatabase({ type: 'memory' });
+    await pg.exec(`CREATE ROLE ${role}`);
+    try {
+      await pg.exec(`CREATE TABLE ${table} (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, label TEXT)`);
+      await pg.exec(`CREATE TABLE ${composite} (a INTEGER, b INTEGER, PRIMARY KEY (b, a))`);
+      await pg.exec(`INSERT INTO ${table} (label) VALUES ('one')`);
+      await pg.exec(`GRANT USAGE ON SCHEMA public TO ${role}`);
+      await pg.exec(`GRANT SELECT ON ${table}, ${composite} TO ${role}`);
+      const data = await pg.transaction(async trx => {
+        await trx.exec(`SET LOCAL ROLE ${role}`);
+        return exportData(trx, { tables: [table, composite] });
+      });
+      expect(data.schema?.find(item => item.name === table)?.primaryKeys).toEqual(['id']);
+      expect(data.schema?.find(item => item.name === composite)?.primaryKeys).toEqual(['b', 'a']);
+      expect((await importData(sqlite, data)).errors).toBeUndefined();
+      expect((await importData(sqlite, data, { onConflict: 'ignore' })).rowsImported).toBe(0);
+      expect(await sqlite.get(`SELECT COUNT(*) AS count FROM ${table}`)).toEqual({ count: 1 });
+      await sqlite.exec(`INSERT INTO ${table} (label) VALUES ('two')`);
+      expect(await sqlite.get(`SELECT id FROM ${table} WHERE label = 'two'`)).toEqual({ id: 2 });
+    } finally {
+      await sqlite.close();
+      await pg.exec(`DROP OWNED BY ${role}`);
+      await pg.exec(`DROP ROLE ${role}`);
+    }
+  });
+
+  it.each([true, false])('loads SQL into existing ALWAYS identities with includeSchema %s', async includeSchema => {
+    const table = unique('existing_identity');
+    const schema = unique('existing_dump');
+    tables.push(table);
+    schemas.push(schema);
+    const target = createPostgresAdapter({ connectionString: url, segment: schema });
+    await target.open();
+    try {
+      const ddl = `CREATE TABLE ${table} (
+        id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        tags TEXT[], n INTEGER, doubled INTEGER GENERATED ALWAYS AS (n * 2) STORED
+      )`;
+      await pg.exec(ddl);
+      await target.exec(ddl);
+      await pg.exec(`INSERT INTO ${table} (id, tags, n) OVERRIDING SYSTEM VALUE VALUES (41, ARRAY['a', 'b'], 3)`);
+      const dump = await exportAsSQL(pg, { tables: [table], includeSchema });
+      if (!includeSchema) expect(dump).not.toContain('CREATE TABLE');
+      expect((await importFromSQL(target, dump)).errors).toBeUndefined();
+      expect(await target.get(`SELECT * FROM ${table}`)).toEqual({ id: 41, tags: ['a', 'b'], n: 3, doubled: 6 });
+      expect(await target.get(`INSERT INTO ${table} (n) VALUES (4) RETURNING id, doubled`)).toEqual({ id: 42, doubled: 8 });
+    } finally {
+      await target.close();
+    }
+  });
+
+  it('maps integer boolean defaults and warns about invalid calendar defaults', async () => {
+    const sqlite = await createDatabase({ type: 'memory' });
+    const table = unique('literal_defaults');
+    tables.push(table);
+    try {
+      await sqlite.exec(`CREATE TABLE ${table} (
+        id INTEGER PRIMARY KEY, yes INTEGER DEFAULT TRUE, no INTEGER DEFAULT FALSE,
+        stamp DATETIME DEFAULT '0000-00-00 00:00:00', day DATE DEFAULT '2026-02-30',
+        valid DATETIME DEFAULT '2026-10-16 12:00:00'
+      )`);
+      const result = await migrateAdapter(sqlite, pg, { onConflict: 'error' });
+      expect(result.errors).toBeUndefined();
+      expect(result.warnings).toEqual([expect.stringContaining(`${table}.stamp`), expect.stringContaining(`${table}.day`)]);
+      expect(await pg.get(`INSERT INTO ${table} DEFAULT VALUES RETURNING yes, no, stamp, day`)).toEqual({
+        yes: 1, no: 0, stamp: null, day: null,
+      });
+    } finally {
+      await sqlite.close();
+    }
+  });
+
+  it('exports a PostgreSQL view as rows without ctid pagination', async () => {
+    const view = unique('view_rows');
+    const sqlite = await createDatabase({ type: 'memory' });
+    await pg.exec(`CREATE VIEW ${view} AS SELECT n, json_build_object('n', n) AS doc FROM generate_series(1, 3) AS n`);
+    try {
+      const data = await exportData(pg, { tables: [view], batchSize: 1 });
+      expect(data.data[view]).toHaveLength(3);
+      expect((await importData(sqlite, data)).errors).toBeUndefined();
+      expect(await sqlite.all(`SELECT n FROM ${view} ORDER BY n`)).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }]);
+    } finally {
+      await sqlite.close();
+      await pg.exec(`DROP VIEW ${view}`);
+    }
+  });
+
+  it('replaces ordinary values without updating an ALWAYS identity outside the key', async () => {
+    const table = unique('nonkey_identity');
+    tables.push(table);
+    const sqlite = await createDatabase({ type: 'memory' });
+    try {
+      await sqlite.exec(`CREATE TABLE ${table} (id TEXT PRIMARY KEY, seq INTEGER, label TEXT)`);
+      await sqlite.exec(`INSERT INTO ${table} VALUES ('old', 99, 'updated'), ('new', 100, 'inserted')`);
+      await pg.exec(`CREATE TABLE ${table} (id TEXT PRIMARY KEY, seq INTEGER GENERATED ALWAYS AS IDENTITY, label TEXT)`);
+      await pg.exec(`INSERT INTO ${table} (id, label) VALUES ('old', 'original')`);
+      const result = await migrateAdapter(sqlite, pg, { skipSchema: true, onConflict: 'replace' });
+      expect(result.errors).toBeUndefined();
+      expect(result.rowsImported).toBe(2);
+      expect(await pg.all(`SELECT * FROM ${table} ORDER BY id`)).toEqual([
+        { id: 'new', seq: 100, label: 'inserted' }, { id: 'old', seq: 1, label: 'updated' },
+      ]);
+    } finally {
+      await sqlite.close();
+    }
+  });
+
+  it.each(['copy', 'dump', 'dialect'])('does not rewind an existing PostgreSQL sequence through %s', async mode => {
+    const table = unique('sequence_highwater');
+    tables.push(table);
+    await pg.exec(`CREATE TABLE ${table} (id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY)`);
+    await pg.exec(`INSERT INTO ${table} VALUES (1)`);
+    await pg.get("SELECT setval(pg_get_serial_sequence(?, 'id'), 100, true)", [table]);
+    if (mode === 'copy') {
+      const data = await exportData(pg, { tables: [table] });
+      expect((await importData(pg, data, { skipSchema: true, onConflict: 'ignore' })).errors).toBeUndefined();
+      data.data[table] = [{ id: 2 }];
+      expect((await importData(pg, data, { skipSchema: true })).errors).toBeUndefined();
+    } else if (mode === 'dump') {
+      const dump = await exportAsSQL(pg, { tables: [table], includeSchema: false });
+      await pg.exec(`DELETE FROM ${table}`);
+      expect((await importFromSQL(pg, dump)).errors).toBeUndefined();
+    } else {
+      const sql = createStorageFeatures(pg).dialect.syncIdentitySequence?.(table, 'id') ?? null;
+      if (sql) await pg.get(sql);
+    }
+    const row = await pg.get<{ id: number }>(`INSERT INTO ${table} DEFAULT VALUES RETURNING id`);
+    expect(row?.id).toBeGreaterThan(100);
+  });
+
+  it('maps empty array defaults to JSON and keeps NUMERIC precision in SQLite text', async () => {
+    const table = unique('precise_values');
+    tables.push(table);
+    await pg.exec(`CREATE TABLE ${table} (
+      id INTEGER PRIMARY KEY, tags TEXT[] DEFAULT '{}',
+      amount NUMERIC DEFAULT 1234567890123456789.123456789
+    )`);
+    await pg.exec(`INSERT INTO ${table} (id, tags) VALUES (1, ARRAY['a'])`);
+    const sqlite = await createDatabase({ type: 'memory' });
+    try {
+      expect((await migrateAdapter(pg, sqlite, { tables: [table] })).errors).toBeUndefined();
+      await sqlite.exec(`INSERT INTO ${table} (id) VALUES (2)`);
+      expect(await sqlite.all(`SELECT id, tags, amount, typeof(amount) AS kind FROM ${table} ORDER BY id`)).toEqual([
+        { id: 1, tags: '["a"]', amount: '1234567890123456789.123456789', kind: 'text' },
+        { id: 2, tags: '[]', amount: '1234567890123456789.123456789', kind: 'text' },
+      ]);
+    } finally {
+      await sqlite.close();
+    }
+  });
+
+  it('distinguishes strftime seconds from epoch seconds in defaults', async () => {
+    const sqlite = await createDatabase({ type: 'memory' });
+    const table = unique('seconds_defaults');
+    tables.push(table);
+    try {
+      await sqlite.exec(`CREATE TABLE ${table} (
+        seconds INTEGER DEFAULT (strftime('%S','now')),
+        epoch INTEGER DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+      )`);
+      expect((await migrateAdapter(sqlite, pg)).errors).toBeUndefined();
+      const row = await pg.get<{ seconds: number; epoch: number }>(`INSERT INTO ${table} DEFAULT VALUES RETURNING *`);
+      expect(Number(row?.seconds)).toBeGreaterThanOrEqual(0);
+      expect(Number(row?.seconds)).toBeLessThan(60);
+      expect(Math.abs(Number(row?.epoch) - Date.now() / 1000)).toBeLessThan(300);
+    } finally {
+      await sqlite.close();
+    }
+  });
 
   it('creates PostgreSQL types, defaults, the primary key and an identity that took the SQLite ids', async () => {
     const sqlite = await createDatabase({ type: 'memory' });

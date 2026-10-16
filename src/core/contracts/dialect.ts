@@ -89,8 +89,9 @@ export interface SqlDialect {
    * with ids inserted explicitly. Postgres: `SELECT setval(...)`. SQLite:
    * null, since a rowid and AUTOINCREMENT follow the largest id by themselves.
    * The table may be schema-qualified; names are SQL identifiers.
+   * Optional for existing custom dialects; callers may fall back to no statement.
    */
-  syncIdentitySequence(table: string, column: string): string | null;
+  syncIdentitySequence?(table: string, column: string): string | null;
 
   /**
    * Statements that make every write to `table`, from any session, send a
