@@ -117,8 +117,8 @@ export interface DatabaseOptions {
   /**
    * SQLite: `true` turns foreign-key enforcement on and `false` turns it off
    * when the adapter opens, and the setting holds when sql.js reopens its
-   * connection. Left out, each engine keeps its default: better-sqlite3
-   * enforces foreign keys, sql.js, IndexedDB and Capacitor do not.
+   * connection. Left out, each engine keeps its default: better-sqlite3 and
+   * the Capacitor plugin enforce foreign keys, sql.js and IndexedDB do not.
    * PostgreSQL always enforces them and ignores this. On the resolver, pass
    * `openOptions: { foreignKeys: true }`.
    */

@@ -185,6 +185,9 @@ const toRunResult = (answer: unknown): StorageRunResult => {
  * with `transaction` false. A PRAGMA statement goes through the plugin's
  * query(), outside that transaction of the plugin's own: in a run() call, or
  * at the start or the end of an exec() script.
+ *
+ * The plugin turns foreign keys on when it opens a database, on Android, iOS
+ * and Electron. `foreignKeys: false` in the open options turns them off.
  */
 export class CapacitorSqliteAdapter implements StorageAdapter {
   public readonly kind = 'capacitor-sqlite';
@@ -253,7 +256,15 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
       connection = await createConnection(sqlite, name);
       try {
         await connection.open();
+        if (options?.foreignKeys !== undefined) {
+          // The plugin turns foreign keys on when it opens a database. The
+          // PRAGMA goes through query(), outside a transaction of the plugin's
+          // own, where SQLite ignores it. A failure here closes the connection
+          // and leaves the adapter closed, like a failed open().
+          await connection.query(`PRAGMA foreign_keys = ${options.foreignKeys ? 'ON' : 'OFF'};`);
+        }
       } catch (error) {
+        // closeConnection closes the database too, when open() opened it.
         await sqlite.closeConnection(name, false).catch(() => undefined);
         throw error;
       }
@@ -268,11 +279,6 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
 
     if (this.options.enableWal ?? true) {
       await this.enableWal(connection);
-    }
-
-    if (options?.foreignKeys !== undefined) {
-      // Outside the plugin's own transaction: SQLite ignores this PRAGMA inside one.
-      await this.connection.execute(`PRAGMA foreign_keys = ${options.foreignKeys ? 'ON' : 'OFF'};`, false);
     }
   }
 
