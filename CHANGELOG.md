@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.7.8] - 2026-10-16
 
 ### Added
 - `batch()` on the PostgreSQL adapter, with `batch` in its capabilities: the operations run in one transaction, each under a savepoint, and the batch goes on past one that fails, as the better-sqlite3 adapter's does. The result has the same shape, a failure of the transaction itself included (index -1). A transaction handle's `batch()` runs in that transaction; a held connection's runs in a transaction of its own.
