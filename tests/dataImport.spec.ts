@@ -50,6 +50,40 @@ describe('Data Import', () => {
     ]);
   });
 
+  it('imports foreign keys in any row order on better-sqlite3 and restores enforcement', async () => {
+    const source = createBetterSqliteAdapter(':memory:');
+    const target = createBetterSqliteAdapter(':memory:');
+    await source.open();
+    await target.open();
+    try {
+      await source.exec('CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent_id REFERENCES nodes(id))');
+      await source.exec('INSERT INTO nodes VALUES (2, NULL), (1, 2)');
+      expect(await target.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
+      const data = await exportData(source);
+      const result = await importData(target, data, { onConflict: 'ignore' });
+      expect(result.errors).toBeUndefined();
+      expect(result.rowsImported).toBe(2);
+      expect(await target.all('SELECT * FROM nodes ORDER BY id')).toEqual([
+        { id: 1, parent_id: 2 }, { id: 2, parent_id: null },
+      ]);
+      expect(await target.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
+      await expect(target.run('INSERT INTO nodes VALUES (3, 99)')).rejects.toThrow(/FOREIGN KEY/);
+
+      data.data.nodes = [{ id: 3, parent_id: 99 }];
+      const invalid = await importData(target, data, { skipSchema: true });
+      expect(invalid.success).toBe(false);
+      expect(invalid.errors).toEqual([expect.stringContaining('Foreign key violation')]);
+      expect(await target.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
+
+      const failed = await importData(target, { ...data, schema: [{ name: 'bad', columns: [] }] });
+      expect(failed.success).toBe(false);
+      expect(await target.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
+    } finally {
+      await source.close();
+      await target.close();
+    }
+  });
+
   it('should import data from exported format', async () => {
     const exported = await exportData(sourceAdapter);
     const result = await importData(targetAdapter, exported);
