@@ -1,3 +1,13 @@
+## [Unreleased]
+
+### Added
+- Lifecycle hooks around an adapter's calls: `withHooks(adapter, hooks)` on any adapter, and `createDatabase({ hooks })`.
+  - The `StorageHooks` the package exported now run: `onBeforeQuery`, `onAfterQuery`, `onBeforeWrite`, `onAfterWrite`, `onBeforeTransaction`, `onAfterTransaction` and `onError`.
+  - A `before` hook returning undefined stops the call, as `combineHooks` already read it.
+  - The statements inside a transaction pass through the hooks too.
+  - The adapter keeps its kind, its own methods and its class.
+  - The performance tiers stay types for a host to apply.
+
 ## [0.7.6] - 2026-10-16
 
 ### Deprecated
