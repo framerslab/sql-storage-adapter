@@ -54,6 +54,7 @@ import type {
 } from '../core/contracts';
 import { expandNamedParameters, normaliseParameters } from '../shared/parameterUtils';
 import { toSqliteStatement } from '../shared/sqlPlaceholders';
+import { checkFunctionName, type SqlFunction, type SqlFunctionOptions } from '../shared/sqlFunctions';
 import {
   createSerializedTransactionRunner,
   createSharedConnectionTransactionAdapter,
@@ -286,6 +287,8 @@ export class IndexedDbAdapter implements StorageAdapter {
   private db: SqlJsDatabase | null = null;
   /** Foreign-key enforcement as open() was asked for it (undefined: the engine default); sql.js forgets the PRAGMA when export() reopens the connection. */
   private foreignKeys: boolean | undefined;
+  /** The functions registerFunction made callable from SQL, registered again after each reopening. */
+  private readonly sqlFunctions = new Map<string, SqlFunction>();
   private idb: IDBDatabase | null = null;
   private saveTimer: ReturnType<typeof setInterval> | null = null;
   /** Bumped by every statement that can change the database. */
@@ -812,6 +815,24 @@ export class IndexedDbAdapter implements StorageAdapter {
     if (this.foreignKeys !== undefined) {
       this.db!.run(`PRAGMA foreign_keys = ${this.foreignKeys ? 'ON' : 'OFF'};`);
     }
+    this.applyFunctions();
+  }
+
+  /** Registers the functions registerFunction keeps: sql.js drops them when export() reopens the connection. */
+  private applyFunctions(): void {
+    for (const [name, fn] of this.sqlFunctions) {
+      this.db!.create_function(name, fn);
+    }
+  }
+
+  /**
+   * Makes a JavaScript function callable from SQL under `name`. It is
+   * registered again after each save, export, import and reload, which
+   * reopen the sql.js connection and drop the functions it had.
+   */
+  public registerFunction(name: string, fn: SqlFunction, _options: SqlFunctionOptions = {}): void {
+    this.sqlFunctions.set(checkFunctionName(name), fn);
+    if (this.db) this.db.create_function(name, fn);
   }
 
   /**
@@ -866,6 +887,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     this.db!.close();
     this.db = next;
     this.applyPragmas(settings);
+    this.applyFunctions();
   }
 
   // ==========================================================================
@@ -1040,6 +1062,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     const settings = this.changedPragmas();
     const image = this.db!.export();
     this.applyPragmas(settings);
+    this.applyFunctions();
     return image;
   }
 

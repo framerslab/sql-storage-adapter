@@ -1,3 +1,13 @@
+## [Unreleased]
+
+### Added
+- `batch()` on the PostgreSQL adapter, with `batch` in its capabilities: the operations run in one transaction, each under a savepoint, and the batch goes on past one that fails, as the better-sqlite3 adapter's does. The result has the same shape, a failure of the transaction itself included (index -1). A transaction handle's `batch()` runs in that transaction; a held connection's runs in a transaction of its own.
+- `registerFunction(name, fn, { deterministic })` on the better-sqlite3, sql.js and IndexedDB adapters: a JavaScript function callable from SQL. The sql.js and IndexedDB adapters register it again each time sql.js reopens the connection (a save, an export, an import), which drops it.
+- `ensureColumnExists(db, table, column, definition)`, named under 0.5.2 below and missing from the package since: it adds a column when the table lacks it, on PostgreSQL and SQLite, and says whether it did.
+
+### Changed
+- `pg` is listed once, as a dependency. It was also an optional peer dependency.
+
 ## [0.7.7] - 2026-10-16
 
 ### Added

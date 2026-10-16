@@ -7,7 +7,7 @@ const __isBrowser = typeof window !== 'undefined' && typeof window.document !== 
 type PgModule = typeof import('pg');
 type PoolConfig = import('pg').PoolConfig;
 
-import type { StorageAdapter, StorageCapability, StorageOpenOptions, StorageParameters, StorageRunResult } from '../core/contracts';
+import type { BatchOperation, BatchResult, StorageAdapter, StorageCapability, StorageOpenOptions, StorageParameters, StorageRunResult } from '../core/contracts';
 import { toPostgresStatement } from '../shared/sqlPlaceholders';
 import { splitSqlStatements } from '../shared/splitSqlStatements';
 import { validateSegment } from '../shared/segment';
@@ -438,6 +438,56 @@ const unqualifiedCreateExtension = (statement: string): string | null => {
 /** An unknown thrown value as an Error. */
 const asError = (value: unknown): Error => (value instanceof Error ? value : new Error(String(value)));
 
+/** The savepoint each operation of a batch runs under. */
+const BATCH_SAVEPOINT = 'storage_adapter_batch';
+
+/**
+ * Runs a batch's operations on `trx`, a handle inside an open transaction,
+ * each under a savepoint. A failed statement aborts a PostgreSQL transaction,
+ * so a failure rolls back to its savepoint and the batch goes on, as the
+ * better-sqlite3 adapter's batch does.
+ */
+const runBatchSteps = async (trx: StorageAdapter, operations: BatchOperation[]): Promise<BatchResult> => {
+  const results: StorageRunResult[] = [];
+  const errors: Array<{ index: number; error: Error }> = [];
+  for (const [index, operation] of operations.entries()) {
+    await trx.exec(`SAVEPOINT ${BATCH_SAVEPOINT}`);
+    let result: StorageRunResult;
+    try {
+      result = await trx.run(operation.statement, operation.parameters);
+    } catch (error) {
+      await trx.exec(`ROLLBACK TO SAVEPOINT ${BATCH_SAVEPOINT}`);
+      await trx.exec(`RELEASE SAVEPOINT ${BATCH_SAVEPOINT}`);
+      errors.push({ index, error: asError(error) });
+      continue;
+    }
+    await trx.exec(`RELEASE SAVEPOINT ${BATCH_SAVEPOINT}`);
+    results.push(result);
+  }
+  return { successful: results.length, failed: errors.length, results, errors };
+};
+
+/**
+ * Runs a batch in a transaction of its own, begun by `transaction`. When the
+ * transaction itself fails (its BEGIN, a savepoint statement or its COMMIT),
+ * nothing commits, and the result says so as the better-sqlite3 adapter's
+ * does: every operation failed, with the error at index -1.
+ */
+const batchInOwnTransaction = async (
+  transaction: (fn: (trx: StorageAdapter) => Promise<BatchResult>) => Promise<BatchResult>,
+  operations: BatchOperation[],
+): Promise<BatchResult> => {
+  try {
+    return await transaction((trx) => runBatchSteps(trx, operations));
+  } catch (error) {
+    return { successful: 0, failed: operations.length, errors: [{ index: -1, error: asError(error) }] };
+  }
+};
+
+/** The error a second transaction on one held connection throws. */
+const TRANSACTION_ALREADY_OPEN =
+  'A transaction is already open on this connection. Run its statements through the handle its callback receives.';
+
 /**
  * Puts a failed ROLLBACK's error on the transaction's error, as a
  * non-enumerable `rollbackError` property, when that error can take one.
@@ -791,6 +841,17 @@ class PostgresTransactionAdapter implements StorageAdapter {
     return fn(this);
   }
 
+  /**
+   * Runs the operations inside this transaction, each under a savepoint, going
+   * on past one that fails; the ones that succeed commit or roll back with the
+   * transaction. After the transaction has ended, the batch runs in a
+   * transaction of its own where afterEnd runs it.
+   */
+  public async batch(operations: BatchOperation[]): Promise<BatchResult> {
+    if (this.ended) return batchInOwnTransaction((fn) => this.afterEnd.transaction(fn), operations);
+    return runBatchSteps(this, operations);
+  }
+
   public async close(): Promise<void> {
     // The owning transaction releases the checked-out client after completion.
   }
@@ -906,17 +967,23 @@ class PostgresConnectionAdapter implements PostgresConnection {
   ): Promise<T> {
     const begin = beginStatement(options);
     const client = this.live();
-    if (this.transactionOpen) {
-      throw new Error(
-        'A transaction is already open on this connection. Run its statements through the handle its callback receives.'
-      );
-    }
+    if (this.transactionOpen) throw new Error(TRANSACTION_ALREADY_OPEN);
     this.transactionOpen = true;
     try {
       return await runTransaction(client, begin, fn, this.capabilities, this.segment, this, this.onBroken);
     } finally {
       this.transactionOpen = false;
     }
+  }
+
+  /**
+   * Runs the operations in one transaction on this connection, as the
+   * adapter's batch() does on the pool.
+   */
+  public async batch(operations: BatchOperation[]): Promise<BatchResult> {
+    this.live();
+    if (this.transactionOpen) throw new Error(TRANSACTION_ALREADY_OPEN);
+    return batchInOwnTransaction((fn) => this.transaction(fn), operations);
   }
 
   public async close(): Promise<void> {
@@ -1072,7 +1139,8 @@ export class PostgresAdapter implements StorageAdapter {
     'concurrent',    // Excellent concurrent access
     'json',          // Native JSON/JSONB support
     'arrays',        // Native array data types
-    'prepared'       // Prepared statements for security/performance
+    'prepared',      // Prepared statements for security/performance
+    'batch'          // batch(): one transaction, a savepoint per operation
   ]);
 
   private options: PostgresAdapterOptions;
@@ -1391,6 +1459,19 @@ export class PostgresAdapter implements StorageAdapter {
       watch.stop();
       client.release(releaseError ?? connection.brokenBy ?? watch.failure());
     }
+  }
+
+  /**
+   * Runs the operations in one transaction, going on past one that fails, as
+   * the better-sqlite3 adapter's batch does. Each operation runs under a
+   * savepoint, since a failed statement aborts a PostgreSQL transaction; a
+   * failure rolls back to it and is reported with its index in `errors`. The
+   * operations that succeed commit together. When the transaction itself
+   * fails, nothing commits and the error is reported at index -1.
+   */
+  public async batch(operations: BatchOperation[]): Promise<BatchResult> {
+    this.requirePool();
+    return batchInOwnTransaction((fn) => this.transaction(fn), operations);
   }
 
   /**

@@ -5,6 +5,7 @@ import path from 'path';
 import type { StorageAdapter, StorageCapability, StorageOpenOptions, StorageParameters, StorageRunResult } from '../core/contracts';
 import { expandNamedParameters, normaliseParameters } from '../shared/parameterUtils';
 import { toSqliteStatement } from '../shared/sqlPlaceholders';
+import { checkFunctionName, type SqlFunction, type SqlFunctionOptions } from '../shared/sqlFunctions';
 import {
   createSerializedTransactionRunner,
   createSharedConnectionTransactionAdapter,
@@ -51,6 +52,8 @@ export class SqlJsAdapter implements StorageAdapter {
   private filePath?: string;
   /** Foreign-key enforcement as open() was asked for it (undefined: the engine default); sql.js forgets the PRAGMA when export() reopens the connection. */
   private foreignKeys: boolean | undefined;
+  /** The functions registerFunction made callable from SQL, registered again after each reopening. */
+  private readonly sqlFunctions = new Map<string, SqlFunction>();
   private readonly runSerializedTransaction = createSerializedTransactionRunner();
   /**
    * Open transaction depth. > 0 means a SQLite-level transaction is in
@@ -286,6 +289,19 @@ export class SqlJsAdapter implements StorageAdapter {
     if (this.foreignKeys !== undefined) {
       this.db!.run(`PRAGMA foreign_keys = ${this.foreignKeys ? 'ON' : 'OFF'};`);
     }
+    for (const [name, fn] of this.sqlFunctions) {
+      this.db!.create_function(name, fn);
+    }
+  }
+
+  /**
+   * Makes a JavaScript function callable from SQL under `name`. It is
+   * registered again whenever sql.js reopens the connection (each save to a
+   * file), which drops the functions it had.
+   */
+  public registerFunction(name: string, fn: SqlFunction, _options: SqlFunctionOptions = {}): void {
+    this.sqlFunctions.set(checkFunctionName(name), fn);
+    if (this.db) this.db.create_function(name, fn);
   }
 
   private async persistIfNeeded(): Promise<void> {

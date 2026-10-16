@@ -61,16 +61,15 @@ The SQL Storage Adapter provides a single, ergonomic interface over SQLite (nati
 ## Installation
 
 ```bash
-# Core package
+# Core package: brings pg (PostgreSQL) and sql.js (WASM SQLite, and IndexedDB)
 npm install @framers/sql-storage-adapter
 
-# Install only the adapters you plan to use
+# Install only the other engines you plan to use
 npm install better-sqlite3            # Native SQLite for Node/Electron
-npm install pg                        # PostgreSQL
 npm install @capacitor-community/sqlite  # Capacitor / mobile
-npm install sql.js                    # WASM SQLite (auto-included for IndexedDB)
-# IndexedDB uses sql.js (no extra install needed)
 ```
+
+`pg` and `sql.js` are dependencies of the package, listed once each, so they install with it. `better-sqlite3`, `@capacitor-community/sqlite`, `electron` and `@aws-sdk/client-s3` are optional peers: install the ones you use.
 
 > Windows users: ensure the Visual Studio Build Tools (C++ workload) are installed before adding `better-sqlite3`. On Linux, install `python3`, `build-essential`, and `libssl-dev` prior to `npm install`.
 
@@ -293,6 +292,39 @@ The IndexedDB, Capacitor and better-sqlite3 adapters run every transaction on on
 
 The PostgreSQL adapter runs each transaction on its own pooled connection, so transactions run side by side. When the connection breaks during a transaction and its ROLLBACK fails too, `transaction()` still throws the transaction's own error (the callback's, or COMMIT's), with the ROLLBACK error on it as a non-enumerable `rollbackError` property. The broken connection is closed, not returned to the pool. A connection the server closes while a callback holds it, between statements, does not end the process. Once a transaction has ended, its handle runs on the pool, as the adapter's own statements do, and its `transaction()` begins a new transaction.
 
+### Batches
+
+`batch(operations)` runs its operations in one transaction and goes on past one that fails, on better-sqlite3 and PostgreSQL (`capabilities.has('batch')`):
+
+```typescript
+const result = await db.batch([
+  { statement: 'INSERT INTO tags (id, name) VALUES (?, ?)', parameters: [1, 'red'] },
+  { statement: 'INSERT INTO tags (id, name) VALUES (?, ?)', parameters: [1, 'red again'] }, // the id is taken
+  { statement: 'INSERT INTO tags (id, name) VALUES (?, ?)', parameters: [2, 'blue'] },
+]);
+// { successful: 2, failed: 1, results: [...], errors: [{ index: 1, error }] }
+```
+
+- The operations that succeed commit together.
+- An error aborts a PostgreSQL transaction until it rolls back to a savepoint ([Transactions](https://www.postgresql.org/docs/current/tutorial-transactions.html)), so the PostgreSQL adapter runs each operation under a savepoint and rolls back to it when the operation fails ([ROLLBACK TO SAVEPOINT](https://www.postgresql.org/docs/current/sql-rollback-to.html)).
+- When the transaction itself fails (its BEGIN or COMMIT), nothing commits, and the result reports every operation failed, with the error at index -1.
+- A transaction handle's `batch()` runs in that transaction, and its operations commit or roll back with it. On a held PostgreSQL connection (`withConnection`), `batch()` runs in a transaction of its own.
+
+### SQL functions
+
+`registerFunction(name, fn, { deterministic })` on the better-sqlite3, sql.js and IndexedDB adapters makes a JavaScript function callable from SQL:
+
+```typescript
+db.registerFunction('slugify', (title) => String(title).toLowerCase().replace(/[^a-z0-9]+/g, '-'), { deterministic: true });
+const rows = await db.all('SELECT slugify(title) AS slug FROM posts');
+```
+
+- The name must be an identifier: letters, digits and underscores.
+- The function takes as many arguments as it declares (`fn.length`), on both engines, so a rest parameter declares none ([better-sqlite3](https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#functionname-options-function---this), [sql.js](https://github.com/sql-js/sql.js/blob/v1.15.0/src/api.js#L1282)).
+- sql.js drops its functions when `export()` closes and reopens the connection ([source](https://github.com/sql-js/sql.js/blob/v1.15.0/src/api.js#L1115)): a save to a file, an IndexedDB save, `exportDatabase()` and `importDatabase()`. The sql.js and IndexedDB adapters register them again after each reopening.
+- `deterministic: true` tells better-sqlite3 that the function returns the same result for the same arguments, which SQLite requires of a function in an expression index, a partial index's WHERE clause or a generated column ([SQLite](https://www.sqlite.org/deterministic.html)). sql.js registers every function as non-deterministic.
+- The better-sqlite3 adapter must be open; the sql.js and IndexedDB adapters keep a function registered before `open()` and register it when they open.
+
 ### Segments
 
 A segment keeps one user's tables apart from another's in a database they share: AgentOS's tables beside an app's, in one PostgreSQL database or one browser.
@@ -382,6 +414,17 @@ const status = await schemaMigrationStatus(db, migrations);            // { appl
 - **Locking.** On PostgreSQL each file's transaction takes `pg_advisory_xact_lock(lockKey)` and checks the ledger again, so two runners at once apply each file once. `lockKey` is an integer, or text hashed with `hashtext()`. On SQLite the file's write transaction is the lock.
 - **Outside a transaction.** A file whose first line is `-- outside transaction` (`outsideTransactionMarker`) runs outside a transaction, for `CREATE INDEX CONCURRENTLY` or `VACUUM`. On PostgreSQL it runs under the session lock on one held connection (`withConnection`).
 - **Unknown rows.** `unknown: 'ignore'` lets a run go on past ledger rows the list lacks.
+
+`ensureColumnExists(db, table, column, definition)` adds a column when the table lacks it, on PostgreSQL and SQLite, and resolves `true` when it added the column, `false` when the table had it:
+
+```typescript
+import { ensureColumnExists } from '@framers/sql-storage-adapter';
+
+await ensureColumnExists(db, 'notes', 'archived_at', 'TEXT');
+await ensureColumnExists(db, 'app.notes', 'pinned', 'BOOLEAN NOT NULL DEFAULT false'); // schema-qualified, PostgreSQL only
+```
+
+The table and column must be identifiers (letters, digits and underscores); the definition is SQL, written for the engine. PostgreSQL reads `information_schema.columns` and adds the column with `ADD COLUMN IF NOT EXISTS`; SQLite reads `pragma_table_info`. Names are matched as PostgreSQL folds unquoted names, in lower case.
 
 ### Auth.js
 
