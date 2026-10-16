@@ -19,4 +19,5 @@ export { createStorageFeatures } from './contracts/features';
 export { isUniqueViolation } from '../shared/errors';
 export { setStorageLogger, getStorageLogger, type StorageLogger } from '../shared/logger';
 export * from '../features/migrations/schemaMigrations';
+export * from '../features/auth/authJsAdapter';
 export * from '../shared/parameterUtils';
