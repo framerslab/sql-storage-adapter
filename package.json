@@ -87,6 +87,16 @@
         "default": "./dist/cjs/features/backup/cloudBackup.js"
       }
     },
+    "./authjs": {
+      "import": {
+        "types": "./dist/features/auth/authJsAdapter.d.ts",
+        "default": "./dist/features/auth/authJsAdapter.js"
+      },
+      "require": {
+        "types": "./dist/cjs/features/auth/authJsAdapter.d.ts",
+        "default": "./dist/cjs/features/auth/authJsAdapter.js"
+      }
+    },
     "./types": {
       "import": {
         "types": "./dist/types/index.d.ts",

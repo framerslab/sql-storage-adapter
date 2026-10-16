@@ -1,3 +1,13 @@
+## [Unreleased]
+
+### Added
+- An Auth.js database adapter: `createAuthJsAdapter(db, { tablePrefix?, generateId? })`, with `ensureAuthJsTables()` and `authJsTablesSql()`, from `./authjs`, `./core` and the root.
+  - It keeps users, accounts, sessions and verification tokens in text-keyed tables (`auth_` by default) on PostgreSQL or SQLite.
+  - It has the shape of `@auth/core`'s `Adapter` (CI type-checks it against `@auth/core`), with no dependency on it.
+  - `deleteUser` removes the user's sessions and accounts in one transaction, and `useVerificationToken` deletes and returns a token in one statement.
+  - Auth.js's own adapter test suite, vendored with its ISC notice, runs against it on PostgreSQL, better-sqlite3 and sql.js.
+  - WebAuthn authenticators are not stored.
+
 ## [0.7.3] - 2026-10-15
 
 ### Added

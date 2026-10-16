@@ -27,7 +27,7 @@ const check = (ok, message) => {
 };
 
 // 1. CommonJS
-const entries = ['', '/core', '/postgres', '/better-sqlite3', '/sqljs', '/indexeddb', '/capacitor', '/backup', '/types', '/electron/renderer', '/sync', '/kv'];
+const entries = ['', '/core', '/postgres', '/better-sqlite3', '/sqljs', '/indexeddb', '/capacitor', '/backup', '/authjs', '/types', '/electron/renderer', '/sync', '/kv'];
 for (const entry of entries) {
   try {
     const loaded = requireFromConsumer(`${PACKAGE}${entry}`);
@@ -52,6 +52,7 @@ const reaches = (paths, name) => paths.some((p) => p === name || p.startsWith(`$
 const isolation = [
   { entry: "/postgres", forbidden: ["sql.js", "better-sqlite3", "@aws-sdk/client-s3"], files: [] },
   { entry: "/core", forbidden: ["sql.js", "better-sqlite3", "pg", "@aws-sdk/client-s3"], files: [] },
+  { entry: "/authjs", forbidden: ["sql.js", "better-sqlite3", "pg", "@aws-sdk/client-s3"], files: [] },
   { entry: "/better-sqlite3", forbidden: ["sql.js", "pg", "@aws-sdk/client-s3"], files: [] },
   { entry: "/electron/renderer", forbidden: ["better-sqlite3", "sql.js"], files: ["betterSqliteAdapter", "electronMainAdapter"] },
 ];

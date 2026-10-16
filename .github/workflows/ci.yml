@@ -74,9 +74,12 @@ jobs:
           cd "$consumer_dir"
           echo '{ "name": "nodenext-consumer", "private": true, "type": "module" }' > package.json
           # @types/pg so that a pg Pool, as a host holds one, is checked against the adapter's pool option.
-          npm install --no-audit --no-fund "$pack_dir"/*.tgz @types/pg
+          # @auth/core so that createAuthJsAdapter is checked against Auth.js's own Adapter type.
+          npm install --no-audit --no-fund "$pack_dir"/*.tgz @types/pg @auth/core
           cat > index.ts <<'EOF'
           import type { Pool } from 'pg';
+          import type { Adapter } from '@auth/core/adapters';
+          import { createAuthJsAdapter } from '@framers/sql-storage-adapter/authjs';
           import {
             createDatabase,
             createPostgresAdapter,
@@ -100,6 +103,7 @@ jobs:
           export const openKv = async (adapter: StorageAdapter): Promise<KeyValueStore> =>
             namespaced(await createSqlKeyValueStore(adapter, { table: 'agentos_kv' }), 'user/');
           export const openBrowserKv = (): Promise<KeyValueStore> => openIndexedDbStore({ dbName: 'app', storeName: 'kv' });
+          export const authAdapter = (adapter: StorageAdapter): Adapter => createAuthJsAdapter(adapter);
           EOF
           tsc="$GITHUB_WORKSPACE/node_modules/.bin/tsc"
           "$tsc" --version
