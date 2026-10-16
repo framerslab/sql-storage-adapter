@@ -3,6 +3,7 @@
  * Supports importing from JSON, SQL dumps, and CSV files.
  */
 
+import { syncPostgresSequence } from '../../shared/identitySequence';
 import type { StorageAdapter } from '../../core/contracts';
 import { createStorageFeatures } from '../../core/contracts/features';
 import { splitSqlStatements } from '../../shared/splitSqlStatements';
@@ -84,7 +85,17 @@ export async function importData(
     tablesToImport = Array.from(new Set([...dataTables, ...schemaTables]));
   }
 
+  let foreignKeys: number | undefined;
   try {
+    if (target === 'sqlite') {
+      foreignKeys = (await adapter.get<{ foreign_keys: number }>('PRAGMA foreign_keys'))?.foreign_keys;
+      if (foreignKeys === 1) {
+        await adapter.exec('PRAGMA foreign_keys = OFF');
+        if ((await adapter.get<{ foreign_keys: number }>('PRAGMA foreign_keys'))?.foreign_keys === 1) {
+          throw new Error('Cannot suspend foreign keys inside an active SQLite transaction');
+        }
+      }
+    }
     // Import schema
     if (!skipSchema && data.schema) {
       for (const tableSchema of data.schema) {
@@ -132,6 +143,7 @@ export async function importData(
           const imported = await importTableData(adapter, tableName, rows, {
             batchSize,
             onConflict,
+            sourceDialect: source,
           });
           rowsImported += imported;
           tablesImported++;
@@ -139,6 +151,25 @@ export async function importData(
           errors.push(`Data error for ${tableName}: ${(error as Error).message}`);
         }
       }
+    }
+
+    if (target === 'sqlite' && !skipData) {
+      for (const schema of data.schema ?? []) {
+        if (!tablesToImport.includes(schema.name) || schema.sequence === undefined) continue;
+        if (!/^\d+$/.test(schema.sequence)) throw new Error(`Invalid sequence for ${schema.name}`);
+        const created = await adapter.get<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", [schema.name]);
+        if (!/\bAUTOINCREMENT\b/i.test(created?.sql ?? '')) continue;
+        await adapter.run('UPDATE sqlite_sequence SET seq = MAX(seq, CAST(? AS INTEGER)) WHERE name = ?', [schema.sequence, schema.name]);
+        await adapter.run(
+          'INSERT INTO sqlite_sequence (name, seq) SELECT ?, CAST(? AS INTEGER) WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = ?)',
+          [schema.name, schema.sequence, schema.name],
+        );
+      }
+    }
+
+    if (target === 'sqlite') {
+      const violations = await adapter.all<{ table: string; rowid: number | null }>('PRAGMA foreign_key_check');
+      for (const violation of violations) errors.push(`Foreign key violation in ${violation.table}, row ${violation.rowid}`);
     }
 
     return {
@@ -158,6 +189,8 @@ export async function importData(
       ...(warnings.length > 0 ? { warnings } : {}),
       duration: Date.now() - startTime,
     };
+  } finally {
+    if (foreignKeys === 1) await adapter.exec('PRAGMA foreign_keys = ON');
   }
 }
 
@@ -298,7 +331,7 @@ export async function migrateAdapter(
   // Export from source
   const exportedData = await exportData(sourceAdapter, {
     tables: options.tables,
-    includeSchema: !options.skipSchema,
+    includeSchema: true,
   });
 
   // Import to target
@@ -322,6 +355,8 @@ interface TargetTable {
   sequences: Map<string, string>;
   /** PostgreSQL: columns of type timestamp with time zone. */
   zoned: Set<string>;
+  /** PostgreSQL: JSON columns, whose parsed source values need JSON encoding. */
+  json: Set<string>;
   /** PostgreSQL: the primary key's columns, for onConflict 'replace'. */
   primaryKey: string[];
 }
@@ -334,6 +369,7 @@ async function readTargetTable(adapter: StorageAdapter, table: string, engine: E
     always: new Set(),
     sequences: new Map(),
     zoned: new Set(),
+    json: new Set(),
     primaryKey: [],
   };
   if (engine === 'sqlite') {
@@ -374,19 +410,22 @@ async function readTargetTable(adapter: StorageAdapter, table: string, engine: E
   }
   for (const column of columns) {
     target.columns.set(column.name.toLowerCase(), column.name);
-    if (column.generated === 's') target.generated.add(column.name);
+    if (column.generated === 's' || column.generated === 'v') target.generated.add(column.name);
+    if (column.type === 'json' || column.type === 'jsonb') target.json.add(column.name);
     if (column.identity === 'a') target.always.add(column.name);
     if (column.sequence) target.sequences.set(column.name, column.sequence);
     if (/^timestamp(\(\d+\))? with time zone$/.test(column.type)) target.zoned.add(column.name);
   }
   target.primaryKey = (
     await adapter.all<{ name: string }>(
-      `SELECT kcu.column_name AS name
-       FROM information_schema.table_constraints tc
-       JOIN information_schema.key_column_usage kcu
-         ON kcu.constraint_schema = tc.constraint_schema AND kcu.constraint_name = tc.constraint_name
-       WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = current_schema() AND tc.table_name = ?
-       ORDER BY kcu.ordinal_position`,
+      `SELECT a.attname AS name
+       FROM pg_index i
+       CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, position)
+       JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+       WHERE i.indisprimary
+         AND i.indrelid = to_regclass(quote_ident(current_schema()) || '.' || quote_ident(?))
+         AND k.position <= i.indnkeyatts
+       ORDER BY k.position`,
       [target.name]
     )
   ).map(row => row.name);
@@ -415,7 +454,7 @@ async function importTableData(
   adapter: StorageAdapter,
   tableName: string,
   rows: unknown[],
-  options: { batchSize: number; onConflict: 'replace' | 'ignore' | 'error' }
+  options: { batchSize: number; onConflict: 'replace' | 'ignore' | 'error'; sourceDialect?: Engine }
 ): Promise<number> {
   let imported = 0;
   const { batchSize, onConflict } = options;
@@ -442,7 +481,12 @@ async function importTableData(
         .map(column => [targetColumn(column), record[column]] as const)
         .filter(([column]) => !target.generated.has(column));
       const columns = entries.map(([column]) => column);
-      const values = entries.map(([column, value]) => (target.zoned.has(column) ? zonedValue(value) : value));
+      const values = entries.map(([column, value]) => {
+        if (target.json.has(column) && options.sourceDialect === 'postgres' && value !== null && value !== undefined) {
+          return JSON.stringify(value);
+        }
+        return target.zoned.has(column) ? zonedValue(value) : value;
+      });
       const placeholders = columns.map(() => '?');
       const list = columns.map(quoteIdentifier).join(', ');
 
@@ -453,7 +497,7 @@ async function importTableData(
         if (onConflict === 'ignore') {
           insertSQL += ' ON CONFLICT DO NOTHING';
         } else if (onConflict === 'replace') {
-          const updates = columns.filter(column => !target.primaryKey.includes(column));
+          const updates = columns.filter(column => !target.primaryKey.includes(column) && !target.always.has(column));
           insertSQL +=
             ` ON CONFLICT (${target.primaryKey.map(quoteIdentifier).join(', ')}) ` +
             (updates.length > 0
@@ -466,17 +510,10 @@ async function importTableData(
         insertSQL = `${verb} INTO ${table} (${list}) VALUES (${placeholders.join(', ')})`;
       }
 
-      try {
-        const result = await adapter.run(insertSQL, values);
-        if ((result.changes ?? 1) > 0) {
-          imported++;
-          for (const column of columns) if (target.sequences.has(column)) sequenced.add(column);
-        }
-      } catch (error) {
-        if (onConflict === 'error') {
-          throw error;
-        }
-        // Otherwise silently skip
+      const result = await adapter.run(insertSQL, values);
+      if ((result.changes ?? 1) > 0) {
+        imported++;
+        for (const column of columns) if (target.sequences.has(column)) sequenced.add(column);
       }
     }
   }
@@ -485,8 +522,8 @@ async function importTableData(
   // (https://www.postgresql.org/docs/current/functions-sequence.html).
   for (const column of sequenced) {
     await adapter.get(
-      `SELECT setval(CAST(? AS regclass), GREATEST(COALESCE((SELECT MAX(${quoteIdentifier(column)}) FROM ${table}), 0), 0) + 1, false)`,
-      [target.sequences.get(column)]
+      syncPostgresSequence('CAST(? AS regclass)', `SELECT MAX(${quoteIdentifier(column)}) FROM ${table}`),
+      [target.sequences.get(column), target.sequences.get(column), target.sequences.get(column)]
     );
   }
 

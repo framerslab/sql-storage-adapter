@@ -1,3 +1,21 @@
+## [Unreleased]
+
+### Fixed
+- Make syncIdentitySequence optional on the exported SqlDialect interface, with conditional callers, so existing custom dialects still compile. Correct README identity widths, rowid scope, sequence state and date semantics.
+- Map empty PostgreSQL array defaults to JSON arrays, preserve case-sensitive SQLite strftime directives, and store PostgreSQL NUMERIC values and literal defaults as SQLite text without affinity rounding.
+- Keep PostgreSQL sequence allocation from moving backwards in imports, SQL dumps and the dialect helper; preserve SQLite AUTOINCREMENT high-water marks, including empty tables and deleted ids.
+- Exclude GENERATED ALWAYS identities from PostgreSQL conflict updates while allowing explicit identity values on new rows.
+- Export explicitly selected SQLite and PostgreSQL views without querying unavailable rowid or ctid columns.
+- Convert SQLite boolean defaults on numeric columns to numbers and omit invalid calendar defaults with warnings before PostgreSQL table creation.
+- Make PostgreSQL SQL dumps load into existing ALWAYS identities; retain column metadata and sequence synchronization when includeSchema is false.
+- Read PostgreSQL primary keys from pg_index so SELECT-only source roles preserve single and composite keys.
+- Include SQLite FTS rowids in exports so sparse external-content indexes retain their row associations after copies and SQL reloads.
+- Encode PostgreSQL JSON arrays and scalar values as JSON in copies and SQL dumps.
+- Recognize PostgreSQL 18 virtual generated columns, preserve their expressions and omit their values from inserts; exercise migrations on PostgreSQL 16 and 18 in CI.
+- Load SQLite foreign keys independently of row order, check references after import, and restore enforcement on failure.
+- Report insert failures under ignore and replace instead of silently dropping rows.
+- Preserve PostgreSQL date and zone-less timestamp fields in SQL dumps and copies under non-UTC process time zones.
+
 ## [0.7.9] - 2026-10-16
 
 ### Added

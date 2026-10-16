@@ -102,7 +102,7 @@ const targetType = (kind: Kind, target: Engine, wide: boolean): string => {
       case 'real':
         return 'REAL';
       case 'numeric':
-        return 'NUMERIC';
+        return 'TEXT';
       case 'blob':
         return 'BLOB';
       default:
@@ -173,7 +173,7 @@ const uncast = (expr: string): string => {
   }
 };
 
-type Moment = { what: 'timestamp' | 'date' | 'time' | 'epoch'; format?: string };
+type Moment = { what: 'timestamp' | 'date' | 'time' | 'epoch' | 'seconds'; format?: string };
 
 const SQLITE_ISO_NOW = new SqliteDialect().now();
 
@@ -186,14 +186,10 @@ const moment = (expr: string, from: Engine): Moment | null => {
     if (upper === 'CURRENT_DATE' || upper === "DATE('NOW')") return { what: 'date', format: 'YYYY-MM-DD' };
     if (upper === 'CURRENT_TIME' || upper === "TIME('NOW')") return { what: 'time', format: 'HH24:MI:SS' };
     if (compact === SQLITE_ISO_NOW.replace(/\s+/g, '')) return { what: 'timestamp', format: 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"' };
-    if (
-      upper === 'UNIXEPOCH()' ||
-      upper === "UNIXEPOCH('NOW')" ||
-      upper === "STRFTIME('%S','NOW')" ||
-      upper === "CAST(STRFTIME('%S','NOW')ASINTEGER)"
-    ) {
-      return { what: 'epoch' };
-    }
+    const strftime = /^STRFTIME\('%([sS])','NOW'\)$/i.exec(compact) ??
+      /^CAST\(STRFTIME\('%([sS])','NOW'\)ASINTEGER\)$/i.exec(compact);
+    if (strftime) return { what: strftime[1] === 's' ? 'epoch' : 'seconds' };
+    if (upper === 'UNIXEPOCH()' || upper === "UNIXEPOCH('NOW')") return { what: 'epoch' };
     return null;
   }
   if (
@@ -210,6 +206,7 @@ const moment = (expr: string, from: Engine): Moment | null => {
 const momentFor = (now: Moment, kind: Kind, target: Engine): string | null => {
   if (target === 'postgres') {
     // SQLite's current-time defaults give UTC (https://www.sqlite.org/lang_createtable.html#dfltval).
+    if (now.what === 'seconds') return ['integer', 'bigint', 'numeric'].includes(kind) ? '(FLOOR(EXTRACT(SECOND FROM now())))::integer' : null;
     if (now.what === 'epoch') return kind === 'integer' || kind === 'bigint' || kind === 'numeric' ? '(EXTRACT(EPOCH FROM now()))::bigint' : null;
     if (kind === 'timestamp') return 'CURRENT_TIMESTAMP';
     if (kind === 'date') return "((now() AT TIME ZONE 'UTC')::date)";
@@ -226,16 +223,42 @@ const momentFor = (now: Moment, kind: Kind, target: Engine): string | null => {
 const TRUE_WORDS = new Set(['t', 'true', 'y', 'yes', 'on', '1']);
 const FALSE_WORDS = new Set(['f', 'false', 'n', 'no', 'off', '0']);
 
+/**
+ * Calendar literals that can be carried to PostgreSQL without relying on
+ * DateStyle or accepting SQLite's zero dates. Other forms get a warning.
+ */
+const calendarLiteral = (value: string, kind: Kind): boolean => {
+  if (/^[+-]?infinity$/i.test(value) && kind !== 'time') return true;
+  const time = /^(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}(?::?\d{2})?)?$/;
+  const validTime = (text: string): boolean => {
+    const match = time.exec(text);
+    return !!match && Number(match[1]) < 24 && Number(match[2]) < 60 && Number(match[3]) < 60;
+  };
+  if (kind === 'time') return validTime(value);
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](.+))?$/.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1] &&
+    (!match[4] || (kind === 'timestamp' && validTime(match[4])));
+};
+
 /** A default written for the other engine, or null when it has no form there. */
-const crossDefault = (raw: string, kind: Kind, from: Engine, to: Engine): string | null => {
+const crossDefault = (raw: string, kind: Kind, from: Engine, to: Engine, sourceType: string): string | null => {
   const expr = from === 'postgres' ? uncast(raw) : unwrap(raw);
   const upper = expr.toUpperCase();
   if (upper === 'NULL') return 'NULL';
+  if (from === 'postgres' && sourceType.endsWith('[]')) return expr === "'{}'" ? "'[]'" : null;
   if (NUMBER.test(expr)) {
+    if (kind === 'numeric' && to === 'sqlite') return `'${expr}'`;
     if (kind === 'boolean' && to === 'postgres') return Number(expr) === 0 ? 'FALSE' : 'TRUE';
     return expr;
   }
   if (LITERAL.test(expr)) {
+    if (to === 'postgres' && ['date', 'time', 'timestamp'].includes(kind) && !calendarLiteral(expr.slice(1, -1), kind)) return null;
     if (kind === 'boolean') {
       const word = expr.slice(1, -1).trim().toLowerCase();
       if (TRUE_WORDS.has(word)) return to === 'sqlite' ? '1' : 'TRUE';
@@ -243,7 +266,10 @@ const crossDefault = (raw: string, kind: Kind, from: Engine, to: Engine): string
     }
     return expr;
   }
-  if (upper === 'TRUE' || upper === 'FALSE') return to === 'sqlite' ? (upper === 'TRUE' ? '1' : '0') : upper;
+  if (upper === 'TRUE' || upper === 'FALSE') {
+    if (to === 'sqlite' || ['integer', 'bigint', 'real', 'numeric'].includes(kind)) return upper === 'TRUE' ? '1' : '0';
+    return kind === 'boolean' ? upper : null;
+  }
   const now = moment(expr, from);
   if (now) return momentFor(now, kind, to);
   if (from === 'postgres' && /^(GEN_RANDOM_UUID|UUID_GENERATE_V4)\(\)$/.test(upper.replace(/\s+/g, ''))) {
@@ -335,7 +361,7 @@ export const createTableStatement = (
 
     if (column.generated) {
       if (sameEngine && target === 'postgres' && column.generationExpression) {
-        definition = ` GENERATED ALWAYS AS (${column.generationExpression}) STORED`;
+        definition = ` GENERATED ALWAYS AS (${column.generationExpression}) ${column.generationKind === 'virtual' ? 'VIRTUAL' : 'STORED'}`;
       } else {
         warnings.push(`${where(column)} is a generated column in ${source}; it was created as a plain column holding the copied values.`);
       }
@@ -350,7 +376,7 @@ export const createTableStatement = (
       }
       const fromSequence = column.defaultValue !== undefined && /^\s*nextval\s*\(/i.test(column.defaultValue);
       if (column.defaultValue !== undefined && column.defaultValue !== '' && !fromSequence) {
-        const written = sameEngine ? column.defaultValue : crossDefault(column.defaultValue, kind, source, target);
+        const written = sameEngine ? column.defaultValue : crossDefault(column.defaultValue, kind, source, target, column.type);
         if (written === null) {
           warnings.push(`${where(column)}: the default ${column.defaultValue} has no ${target} form, so the column was created without it.`);
         } else {

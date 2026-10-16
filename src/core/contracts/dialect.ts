@@ -89,8 +89,9 @@ export interface SqlDialect {
    * with ids inserted explicitly. Postgres: `SELECT setval(...)`. SQLite:
    * null, since a rowid and AUTOINCREMENT follow the largest id by themselves.
    * The table may be schema-qualified; names are SQL identifiers.
+   * Optional for existing custom dialects; callers may fall back to no statement.
    */
-  syncIdentitySequence(table: string, column: string): string | null;
+  syncIdentitySequence?(table: string, column: string): string | null;
 
   /**
    * A column type for DDL. PostgreSQL: TEXT, INTEGER, BIGINT, DOUBLE
