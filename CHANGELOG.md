@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.7.7] - 2026-10-16
 
 ### Added
 - Lifecycle hooks around an adapter's calls: `withHooks(adapter, hooks)` on any adapter, and `createDatabase({ hooks })`.
