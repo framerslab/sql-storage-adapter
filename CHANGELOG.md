@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.7.11] - 2026-10-16
 
 ### Added
 - Row-change events: `withChangeEvents(adapter)` adds `onChange(listener, { tables })`, which reports each INSERT, UPDATE, DELETE and TRUNCATE made through the adapter (`run`, `batch`, `get`, `all`, `exec`, `transaction`, `withConnection`) once it commits, with the table, the operation and, from `run` and `batch`, the count. A rolled-back transaction reports nothing.
