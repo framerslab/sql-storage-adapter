@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import initSqlJs from 'sql.js';
 import { SqlJsAdapter } from '../src/adapters/sqlJsAdapter';
+import { setStorageLogger, type StorageLogger } from '../src/shared/logger';
 
 // With a filePath, the sql.js adapter writes the database image to its file
 // after each write outside a transaction. The image comes from sql.js's
@@ -18,6 +19,17 @@ const fileLabels = async (file: string): Promise<string[]> => {
   try {
     const result = db.exec('SELECT label FROM items ORDER BY id');
     return result.length ? result[0].values.map(([label]) => String(label)) : [];
+  } finally {
+    db.close();
+  }
+};
+
+/** A PRAGMA's value in the image the file holds now. */
+const filePragma = async (file: string, name: string): Promise<unknown> => {
+  const SQL = await initSqlJs();
+  const db = new SQL.Database(fs.readFileSync(file));
+  try {
+    return db.exec(`PRAGMA ${name}`)[0]?.values?.[0]?.[0];
   } finally {
     db.close();
   }
@@ -53,6 +65,7 @@ describe('SqlJsAdapter saves to its file', () => {
     for (const adapter of opened.splice(0)) await adapter.close().catch(() => undefined);
     for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
     vi.restoreAllMocks();
+    setStorageLogger(null);
   });
 
   describe('writes through all() and get()', () => {
@@ -82,8 +95,24 @@ describe('SqlJsAdapter saves to its file', () => {
       expect(await adapter.all('WITH recent AS (SELECT label FROM items) SELECT label FROM recent')).toEqual([
         { label: 'kept' },
       ]);
+      // PRAGMA statements that read: a setting, and one that takes a table.
+      expect(await adapter.get('PRAGMA user_version')).toEqual({ user_version: 0 });
+      expect((await adapter.all<{ name: string }>('PRAGMA table_info(items)')).map((column) => column.name)).toEqual([
+        'id',
+        'label',
+      ]);
 
       expect(writes).not.toHaveBeenCalled();
+    });
+
+    it('saves a PRAGMA that sets a value in the file, run through get(), though it changes no rows', async () => {
+      // user_version lives in the database header.
+      const file = tempFile();
+      const adapter = await openWithItems(file);
+
+      await adapter.get('PRAGMA user_version = 7');
+
+      expect(await filePragma(file, 'user_version')).toBe(7);
     });
   });
 
@@ -125,6 +154,50 @@ describe('SqlJsAdapter saves to its file', () => {
       expect(await labels(adapter)).toEqual(['kept']);
       expect(await fileLabels(file)).toEqual(['kept']);
     });
+
+    it('saves a script that commits a transaction run() began, and the writes after it', async () => {
+      const file = tempFile();
+      const adapter = await openWithItems(file);
+
+      await adapter.run('BEGIN');
+      await adapter.exec("INSERT INTO items (label) VALUES ('in the transaction'); COMMIT");
+      expect(await fileLabels(file)).toEqual(['in the transaction']);
+
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['after it']);
+      expect(await fileLabels(file)).toEqual(['in the transaction', 'after it']);
+    });
+  });
+
+  describe('transactions begun with statements', () => {
+    it('keeps a savepoint open across ROLLBACK TO, so RELEASE ends it and saves what it kept', async () => {
+      const file = tempFile();
+      const adapter = await openWithItems(file);
+
+      await adapter.run('SAVEPOINT outer_work');
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['undone']);
+      await adapter.run('ROLLBACK TO SAVEPOINT outer_work');
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['kept']);
+      expect(await fileLabels(file)).toEqual([]);
+
+      await adapter.run('RELEASE outer_work');
+      expect(await labels(adapter)).toEqual(['kept']);
+      expect(await fileLabels(file)).toEqual(['kept']);
+    });
+
+    it('saves again after close() rolled back a transaction the caller left open', async () => {
+      const file = tempFile();
+      const adapter = await openWithItems(file);
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['committed']);
+      await adapter.run('BEGIN');
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['never committed']);
+
+      await adapter.close();
+      expect(await fileLabels(file)).toEqual(['committed']);
+
+      await adapter.open({ filePath: file });
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['after the reopen']);
+      expect(await fileLabels(file)).toEqual(['committed', 'after the reopen']);
+    });
   });
 
   describe('connection settings across a save', () => {
@@ -153,6 +226,32 @@ describe('SqlJsAdapter saves to its file', () => {
       await adapter.exec('CREATE TABLE parent (id INTEGER PRIMARY KEY)');
 
       expect(await adapter.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 0 });
+    });
+
+    it('keeps PRAGMA secure_delete = FAST, which reads back as 2', async () => {
+      const file = tempFile();
+      const adapter = await openWithItems(file);
+
+      await adapter.exec('PRAGMA secure_delete = FAST');
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['saved']);
+
+      expect(await fileLabels(file)).toEqual(['saved']);
+      expect(await adapter.get('PRAGMA secure_delete')).toEqual({ secure_delete: 2 });
+    });
+
+    it('warns once, through the host logger, that a save dropped TEMP tables', async () => {
+      const warn = vi.fn();
+      const logger: StorageLogger = { info: vi.fn(), warn, error: vi.fn() };
+      setStorageLogger(logger);
+      const file = tempFile();
+      const adapter = await openWithItems(file);
+
+      await adapter.exec('CREATE TEMP TABLE scratch (x INTEGER)');
+      await adapter.exec('CREATE TEMP TABLE scratch_again (x INTEGER)');
+
+      const tempWarnings = warn.mock.calls.filter((call) => /TEMP/.test(String(call[1])));
+      expect(tempWarnings).toHaveLength(1);
+      expect(tempWarnings[0][0]).toMatchObject({ scope: 'sqljs' });
     });
   });
 });

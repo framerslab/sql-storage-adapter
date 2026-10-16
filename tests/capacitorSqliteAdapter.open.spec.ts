@@ -368,6 +368,31 @@ describe('CapacitorSqliteAdapter open() and close() on @capacitor-community/sqli
     expect(await off.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 0 });
   });
 
+  it('stays closed, with no native connection left, when foreignKeys cannot be set at open', async () => {
+    const native = plugin.module.CapacitorSQLite;
+    const refuse = <T extends (options: unknown) => Promise<unknown>>(method: T): T =>
+      (async (options: unknown) => {
+        const { statement, statements } = options as { statement?: string; statements?: string };
+        if (/foreign_keys\s*=/i.test(statement ?? statements ?? '')) throw new Error('foreign_keys refused');
+        return method(options);
+      }) as T;
+    // The plugin's own methods, taken before the spies stand in for them.
+    const realQuery = native.query.bind(native);
+    const realExecute = native.execute.bind(native);
+    const query = vi.spyOn(native, 'query').mockImplementation(refuse(realQuery));
+    const execute = vi.spyOn(native, 'execute').mockImplementation(refuse(realExecute));
+    const adapter = new CapacitorSqliteAdapter({ database: 'foreign-keys-refused', enableWal: false });
+    adapters.push(adapter);
+
+    await expect(adapter.open({ foreignKeys: false })).rejects.toThrow(/foreign_keys refused/);
+    expect(plugin.connections.has('RW_foreign-keys-refused')).toBe(false);
+
+    query.mockRestore();
+    execute.mockRestore();
+    await adapter.open({ foreignKeys: false });
+    expect(await adapter.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 0 });
+  });
+
   it('closes its native connection, so the database opens again with its rows', async () => {
     const first = await openAdapter('reopen');
     await first.exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)');

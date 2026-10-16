@@ -374,6 +374,21 @@ describe('IndexedDbAdapter transactions and saving', () => {
       tick();
       expect(await storedLabels('with-insert')).toEqual(['from a common table expression']);
     });
+
+    it('saves a PRAGMA that sets a value in the file, run through get(), though it changes no rows', async () => {
+      // user_version and application_id live in the database header.
+      const adapter = await openWithItems('pragma-set');
+      tick();
+      expect(await storedLabels('pragma-set')).toEqual([]);
+
+      await adapter.get('PRAGMA user_version = 7');
+      await adapter.all('PRAGMA main.application_id(42)');
+
+      await adapter.close();
+      const reopened = await openAdapter('pragma-set');
+      expect(await reopened.get('PRAGMA user_version')).toEqual({ user_version: 7 });
+      expect(await reopened.get('PRAGMA application_id')).toEqual({ application_id: 42 });
+    });
   });
 
   // sql.js's export() closes and reopens the connection, which sets every
@@ -434,6 +449,41 @@ describe('IndexedDbAdapter transactions and saving', () => {
 
       expect(await adapter.get('PRAGMA secure_delete')).toEqual({ secure_delete: 2 });
     });
+
+    it('keeps the journal mode and the busy timeout a statement set, across a save', async () => {
+      const adapter = await openWithItems('journal-mode');
+      await adapter.exec('PRAGMA journal_mode = MEMORY');
+      await adapter.exec('PRAGMA busy_timeout = 2500');
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['saved']);
+
+      tick();
+      expect(await storedLabels('journal-mode')).toEqual(['saved']);
+
+      expect(await adapter.get('PRAGMA journal_mode')).toEqual({ journal_mode: 'memory' });
+      expect(await adapter.get<{ timeout: number }>('PRAGMA busy_timeout')).toEqual({ timeout: 2500 });
+    });
+
+    it('warns once that a save dropped TEMP tables, which do not survive it', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        const adapter = await openWithItems('temp-tables');
+        await adapter.exec('CREATE TEMP TABLE scratch (x INTEGER)');
+        await adapter.run('INSERT INTO items (label) VALUES (?)', ['first']);
+        tick();
+        expect(await storedLabels('temp-tables')).toEqual(['first']);
+
+        await adapter.exec('CREATE TEMP TABLE scratch_again (x INTEGER)');
+        await adapter.run('INSERT INTO items (label) VALUES (?)', ['second']);
+        tick();
+        expect(await storedLabels('temp-tables')).toEqual(['first', 'second']);
+
+        const tempWarnings = warn.mock.calls.filter((call) => /TEMP/.test(String(call[0])));
+        expect(tempWarnings).toHaveLength(1);
+        expect(String(tempWarnings[0][0])).toContain('"temp-tables"');
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 
   describe('importDatabase()', () => {
@@ -468,6 +518,35 @@ describe('IndexedDbAdapter transactions and saving', () => {
       await expect(adapter.importDatabase(image.slice(0, 8_192))).rejects.toThrow(/damaged/);
 
       expect(await labels(adapter)).toEqual(['kept']);
+    });
+
+    it('refuses an image with a damaged page that a read of the schema does not reach, and keeps its own', async () => {
+      const source = await openWithItems('import-damaged-source');
+      await source.transaction(async (trx) => {
+        for (let i = 0; i < 400; i += 1) {
+          await trx.run('INSERT INTO items (label) VALUES (?)', [`row ${i} `.padEnd(200, '.')]);
+        }
+      });
+      const image = source.exportDatabase();
+      // The page size is the big-endian number at offset 16 of the header.
+      const pageSize = (image[16] << 8) | image[17];
+      expect(image.length).toBeGreaterThanOrEqual(pageSize * 6);
+      // Page 1 holds the schema and page 2 the table's root; page 5 is one of
+      // its leaves. A page of zeros is not a b-tree page.
+      const damaged = image.slice();
+      damaged.fill(0, pageSize * 4, pageSize * 5);
+
+      const adapter = await openWithItems('import-damaged');
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['kept']);
+      tick();
+      expect(await storedLabels('import-damaged')).toEqual(['kept']);
+
+      await expect(adapter.importDatabase(damaged)).rejects.toThrow(/damaged/);
+
+      expect(await labels(adapter)).toEqual(['kept']);
+      await adapter.close();
+      const reopened = await openAdapter('import-damaged');
+      expect(await labels(reopened)).toEqual(['kept']);
     });
 
     it('imports an empty image as an empty database', async () => {
@@ -581,6 +660,12 @@ describe('IndexedDbAdapter transactions and saving', () => {
       expect(await adapter.get('SELECT count(*) AS n FROM items')).toEqual({ n: 1 });
       expect(await adapter.all('WITH recent AS (SELECT label FROM items) SELECT label FROM recent')).toEqual([
         { label: 'kept' },
+      ]);
+      // PRAGMA statements that read: a setting, and one that takes a table.
+      expect(await adapter.get('PRAGMA user_version')).toEqual({ user_version: 0 });
+      expect((await adapter.all<{ name: string }>('PRAGMA table_info(items)')).map((column) => column.name)).toEqual([
+        'id',
+        'label',
       ]);
       tick();
       await settle();
