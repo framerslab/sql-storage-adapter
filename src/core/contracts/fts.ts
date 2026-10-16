@@ -1,8 +1,9 @@
 /**
  * Full-text search abstraction.
  *
- * SQLite implementations use FTS5 virtual tables.
- * Postgres implementations use tsvector columns with GIN indexes.
+ * better-sqlite3 uses FTS5 virtual tables; sql.js and IndexedDB use FTS4, which
+ * their stock sql.js build has (it has no FTS5). Postgres implementations use
+ * tsvector columns with GIN indexes.
  * Methods return SQL strings — no database calls.
  */
 export interface IFullTextSearch {
@@ -13,27 +14,39 @@ export interface IFullTextSearch {
    * @param config.columns - Columns to index.
    * @param config.contentTable - Source table (for external-content FTS5).
    * @param config.tokenizer - Tokenizer config (e.g. 'porter ascii').
+   * @param config.weights - PostgreSQL: a weight per column (A highest, D lowest) for ranking. The SQLite engines rank without it.
    */
   createIndex(config: {
     table: string;
     columns: string[];
     contentTable?: string;
     tokenizer?: string;
+    weights?: Record<string, 'A' | 'B' | 'C' | 'D'>;
   }): string;
 
   /**
    * Generate a WHERE clause fragment for full-text matching.
    * SQLite: `memory_traces_fts MATCH ?`
-   * Postgres: `memory_traces._tsv @@ plainto_tsquery('english', $1)`
+   * Postgres: `_tsv @@ websearch_to_tsquery('english', $1)`, in the index's own language
    */
   matchClause(indexName: string, queryPlaceholder: string): string;
 
   /**
-   * Generate an ORDER BY rank expression.
-   * SQLite: `memory_traces_fts.rank`
-   * Postgres: `ts_rank(memory_traces._tsv, plainto_tsquery('english', $1))`
+   * A rank value, in each engine's own direction.
+   * SQLite FTS5: `memory_traces_fts.rank` (lower is better)
+   * SQLite FTS4: `length(offsets(memory_traces_fts))` (higher is better)
+   * Postgres: `ts_rank(_tsv, websearch_to_tsquery('english', $1))` (higher is better)
+   * Use relevanceOrder to order the same way on every engine.
    */
   rankExpression(indexName: string, queryPlaceholder?: string): string;
+
+  /**
+   * An ORDER BY fragment that puts the best match first on every engine.
+   * SQLite FTS5: `memory_traces_fts.rank`
+   * SQLite FTS4: `length(offsets(memory_traces_fts)) DESC`
+   * Postgres: `ts_rank(_tsv, websearch_to_tsquery('english', $1)) DESC`
+   */
+  relevanceOrder(indexName: string, queryPlaceholder?: string): string;
 
   /**
    * Generate the rebuild/reindex command.
@@ -51,8 +64,8 @@ export interface IFullTextSearch {
 
   /**
    * Sanitize natural-language input into a safe search query.
-   * SQLite: wraps words in quotes, strips FTS5 operators.
-   * Postgres: pass-through (plainto_tsquery handles it).
+   * Every engine: the words, quoted, joined with OR, with the operators of
+   * the query syntax stripped, so it matches the same rows everywhere.
    */
   sanitizeQuery(input: string): string;
 

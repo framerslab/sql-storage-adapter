@@ -1,3 +1,19 @@
+## [Unreleased]
+
+### Added
+- `SqliteFts4`, the full-text search `createStorageFeatures` gives sql.js and the IndexedDB adapter.
+- `relevanceOrder(indexName, placeholder)` on every full-text search: an ORDER BY fragment that puts the best match first on every engine.
+- `weights` in the PostgreSQL `createIndex` config: a weight per column (A to D) that `ts_rank` uses.
+
+### Changed
+- `createStorageFeatures` gives sql.js and IndexedDB FTS4, where it gave FTS5. Their stock sql.js build has no FTS5, so every FTS5 statement there failed with "no such module: fts5".
+- `createStorageFeatures` treats the Supabase adapter (`supabase-postgres`) as PostgreSQL: the PostgreSQL dialect, full-text search and exporter, where it gave the SQLite ones.
+- PostgreSQL full-text queries use `websearch_to_tsquery` instead of `plainto_tsquery`. Words are still ANDed, but `or`, `-word` and quoted phrases are now operators.
+- `PostgresFts.sanitizeQuery` returns the words quoted and joined with `or`, as the SQLite implementations join them with OR, where it returned the text unchanged.
+
+### Fixed
+- `PostgresFts` kept each index's table, columns and language on the instance, from the last `createIndex` call. A second index with another tokenizer changed the first one's language, and a features object made later built `UPDATE  SET ...` with no table for `rebuildCommand` and `syncInsert`. The description of each index is now kept per index for the process, and a rebuild or sync of an index no `createIndex` described throws an error that says so.
+
 ## [0.7.4] - 2026-10-16
 
 ### Added
