@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.7.4] - 2026-10-16
 
 ### Added
 - An Auth.js database adapter: `createAuthJsAdapter(db, { tablePrefix?, generateId? })`, with `ensureAuthJsTables()` and `authJsTablesSql()`, from `./authjs`, `./core` and the root.
