@@ -1,3 +1,13 @@
+## [Unreleased]
+
+### Deprecated
+- `SupabaseAdapter`. The PostgreSQL adapter reaches Supabase with its connection string (`createPostgresAdapter({ connectionString, ssl: { rejectUnauthorized: true, ca } })`), with pool control, transaction error handling and `strict` resolution. `open()` says so once per process through the host logger, and adds that `SupabaseAdapter` does not verify the server certificate unless `ssl` is `{ rejectUnauthorized: true, ca }`.
+
+### Fixed
+- `SupabaseAdapter` reads `?` and `@name` placeholders as the PostgreSQL adapter does, in and out of a transaction. It passed the statement to pg as written, so a `?` failed with a syntax error and named parameters were dropped.
+- `SupabaseAdapter` keeps PostgreSQL's error code (`code`) and the database error (`cause`) on the errors it throws, so `isUniqueViolation` reads a duplicate. It threw a new Error carrying only the message.
+- `SupabaseAdapter` passes an `ssl` object it is given to pg. It replaced any `ssl` option other than `false` with `{ rejectUnauthorized: false }`, so certificate verification could not be turned on.
+
 ## [0.7.5] - 2026-10-16
 
 ### Added
