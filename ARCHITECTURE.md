@@ -139,7 +139,8 @@ const db = await resolveStorageAdapter({
 - ❌ No true concurrency (single-threaded)
 
 **Limitations**:
-- In-memory by default (data lost on refresh)
+- In memory unless opened with a `filePath` on Node, where it writes the whole database to the file after each write (the README's "sql.js Saves to a File"); in a browser, the IndexedDB adapter keeps it
+- A save reopens the connection: PRAGMA settings are kept, TEMP tables, attached databases and registered functions are not (the README's "What a sql.js Save Keeps")
 - Browser storage limits (50-80% of free disk, typically 50MB-2GB)
 - No file locking
 - No native extensions support
@@ -183,7 +184,7 @@ const db = new SQL.Database(new Uint8Array(saved));
 
 **Pros**:
 - ✅ Native performance on mobile
-- ✅ Encrypted database support
+- ✅ WAL on by default (`enableWal`), and foreign keys enforced, as the plugin turns them on at open
 - ✅ Background execution support
 - ✅ Handles app lifecycle (suspend/resume)
 - ✅ Cross-platform mobile (iOS + Android)
@@ -196,6 +197,8 @@ const db = new SQL.Database(new Uint8Array(saved));
 - ❌ Additional app size overhead
 
 **Limitations**:
+- The adapter opens databases unencrypted
+- One adapter at a time holds a database
 - Mobile platform restrictions apply
 - Database location varies by platform (iOS: Documents, Android: internal storage)
 - Limited debugging tools
@@ -205,10 +208,10 @@ const db = new SQL.Database(new Uint8Array(saved));
 **Configuration**:
 ```typescript
 const db = await resolveStorageAdapter({
+  priority: ['capacitor'],
   capacitor: {
     database: 'myapp',
-    encrypted: false,
-    mode: 'no-encryption'
+    enableWal: true // the default
   }
 });
 ```
@@ -238,22 +241,24 @@ type StorageCapability =
 
 ### Capability Matrix
 
-| Capability | PostgreSQL | better-sqlite3 | SQL.js | Capacitor |
-|------------|------------|----------------|--------|-----------|
-| sync | ❌ | ✅ | ❌ | ❌ |
-| transactions | ✅ | ✅ | ✅ | ✅ |
-| wal | ❌ | ✅ | ❌ | ✅ |
-| locks | ✅ | ✅ | ❌ | ✅ |
-| persistence | ✅ | ✅ | ⚠️* | ✅ |
-| streaming | 🚧 | 🚧 | ❌ | ❌ |
-| batch | ✅ | ✅ | ⚠️** | ⚠️** |
-| prepared | ✅ | ✅ | ❌ | ❌ |
-| concurrent | ✅ | ❌ | ❌ | ❌ |
-| json | ✅ | ❌ | ❌ | ❌ |
-| arrays | ✅ | ❌ | ❌ | ❌ |
+What each adapter's `capabilities` set holds:
 
-*SQL.js requires manual persistence  
-**Implemented as sequential operations  
+| Capability | PostgreSQL | better-sqlite3 | sql.js | IndexedDB | Capacitor |
+|------------|------------|----------------|--------|-----------|-----------|
+| sync | ❌ | ✅ | ❌ | ❌ | ❌ |
+| transactions | ✅ | ✅ | ✅ | ✅ | ✅ |
+| wal | ❌ | ✅ | ❌ | ❌ | ✅ |
+| locks | ✅ | ✅ | ❌ | ❌ | ✅ |
+| persistence | ✅ | ✅ | ✅* | ✅ | ✅ |
+| streaming | 🚧 | 🚧 | ❌ | ❌ | ❌ |
+| batch | ❌ | ✅ | ❌ | ❌ | ❌ |
+| prepared | ✅ | ✅ | ✅ | ✅ | ❌ |
+| concurrent | ✅ | ❌ | ❌ | ❌ | ❌ |
+| json | ✅ | ❌ | ✅ | ✅ | ❌ |
+| arrays | ✅ | ❌ | ❌ | ❌ | ❌ |
+
+*Where it can reach a file system (Node): opened with a `filePath`, sql.js writes the database to the file after each write. In a browser it holds the database in memory.  
+Only better-sqlite3 has `batch()`.  
 🚧 Planned feature
 
 ## Runtime Introspection
