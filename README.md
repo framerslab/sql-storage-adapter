@@ -730,30 +730,41 @@ const ddl = `CREATE TABLE notes (id ${d.columnType('uuid')} PRIMARY KEY DEFAULT 
 - Column values follow each engine: a PostgreSQL `BOOLEAN` returns `true` and the SQLite `INTEGER` returns `1`, and a `TIMESTAMPTZ` returns a `Date` where SQLite returns text. `typeParsers` (see "Values") narrows the PostgreSQL side.
 - `pragma()` returns null on PostgreSQL and `advisoryTransactionLock()` returns null on SQLite: skip the statement when it is null.
 
-### IFullTextSearch — FTS5 & tsvector
+### IFullTextSearch — FTS5, FTS4 & tsvector
+
+`createStorageFeatures` gives each engine the full-text search it has:
+- FTS5 on better-sqlite3;
+- FTS4 on sql.js and IndexedDB, whose stock sql.js build compiles FTS3 and FTS4 and no FTS5;
+- a tsvector column with a GIN index on PostgreSQL, the Supabase adapter included.
+
+The same calls return the same rows on all three, and `tests/fts.parity.spec.ts` runs them on each.
 
 ```typescript
 const { fts } = features;
 
-// Create index: FTS5 virtual table (SQLite) or tsvector + GIN (Postgres)
-await adapter.exec(fts.createIndex({
+// FTS5 or FTS4 virtual table (SQLite), or a _tsv column with a GIN index (PostgreSQL)
+await db.exec(fts.createIndex({
   table: 'docs_fts',
   columns: ['title', 'body'],
   contentTable: 'documents',
   tokenizer: 'porter ascii',
+  weights: { title: 'A', body: 'C' },   // PostgreSQL ranks with them; SQLite ignores them
 }));
+await db.exec(fts.rebuildCommand('docs_fts'));
 
-// Search query
-const sql = `
-  SELECT t.*
-  FROM ${fts.joinClause('documents', 't', 'fts', 'docs_fts')}
-  WHERE ${fts.matchClause('docs_fts', '?')}
-  ORDER BY ${fts.rankExpression('fts')}
-`;
-
-// Rebuild index
-await adapter.exec(fts.rebuildCommand('docs_fts'));
+// The best match first on every engine; a named placeholder binds once wherever it appears
+const rows = await db.all(
+  `SELECT t.id FROM ${fts.joinClause('documents', 't', 'docs_fts', 'docs_fts')}
+   WHERE ${fts.matchClause('docs_fts', '@q')} ORDER BY ${fts.relevanceOrder('docs_fts', '@q')}`,
+  { q: fts.sanitizeQuery(userText) },
+);
 ```
+
+- **Ordering.** `relevanceOrder` orders best first everywhere. `rankExpression` keeps each engine's own direction: FTS5's `rank` is lower-better, FTS4's `length(offsets())` and PostgreSQL's `ts_rank` are higher-better.
+- **Queries.** `sanitizeQuery` turns text into its words, quoted and joined with OR, on every engine. PostgreSQL reads queries with `websearch_to_tsquery`: words are ANDed, and `or`, `-word` and quoted phrases work as in a search box.
+- **One index, many features objects.** On PostgreSQL, `createIndex` records each index's table, columns, language and weights for the whole process, so a features object made later syncs, rebuilds and queries an index another one created, and each index keeps its own language. Run `createIndex` (it is idempotent) in each process before `syncInsert` or `rebuildCommand`.
+- **Aliases.** On SQLite, alias the index as itself in `joinClause` (or pass the alias as `indexName` to `matchClause`), since a MATCH names the table as the query writes it.
+
 
 ### IBlobCodec — Cross-Platform Binary Encoding
 

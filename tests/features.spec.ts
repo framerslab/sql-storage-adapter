@@ -3,6 +3,7 @@ import { createStorageFeatures } from '../src/core/contracts/features.js';
 import { SqliteDialect } from '../src/dialects/SqliteDialect.js';
 import { PostgresDialect } from '../src/dialects/PostgresDialect.js';
 import { SqliteFts5 } from '../src/fts/SqliteFts5.js';
+import { SqliteFts4 } from '../src/fts/SqliteFts4.js';
 import { PostgresFts } from '../src/fts/PostgresFts.js';
 import { NodeBlobCodec } from '../src/codecs/NodeBlobCodec.js';
 import { SqliteFileExporter } from '../src/exporters/SqliteFileExporter.js';
@@ -33,10 +34,10 @@ describe('createStorageFeatures', () => {
     expect(features.exporter).toBeInstanceOf(SqliteFileExporter);
   });
 
-  it('returns SqliteDialect for sqljs adapter', () => {
+  it('returns SqliteDialect and FTS4 for the sqljs adapter, whose build has no FTS5', () => {
     const features = createStorageFeatures(mockAdapter('sqljs'));
     expect(features.dialect).toBeInstanceOf(SqliteDialect);
-    expect(features.fts).toBeInstanceOf(SqliteFts5);
+    expect(features.fts).toBeInstanceOf(SqliteFts4);
   });
 
   it('returns PostgresDialect + PostgresFts for postgres adapter', () => {

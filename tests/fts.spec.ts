@@ -71,7 +71,7 @@ describe('PostgresFts', () => {
   it('matchClause generates @@ expression', () => {
     const clause = fts.matchClause('memory_traces_fts', '$1');
     expect(clause).toContain('@@');
-    expect(clause).toContain('plainto_tsquery');
+    expect(clause).toContain('websearch_to_tsquery');
   });
 
   it('rankExpression generates ts_rank', () => {
