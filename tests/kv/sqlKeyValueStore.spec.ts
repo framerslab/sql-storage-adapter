@@ -254,6 +254,22 @@ describe.each(backends)('createSqlKeyValueStore on %s', (_name, make) => {
     expect(await kv.get('k')).toBe('before');
   });
 
+  // A proxy reads as the object it wraps to every check but the structured
+  // clone's own, which refuses it, as IndexedDB's put does.
+  it('refuses a proxy, which the structured clone refuses, and keeps what the key held', async () => {
+    const kv = await store();
+    await kv.set('k', 'before');
+
+    for (const value of [new Proxy({ text: 'wrapped' }, {}), new Proxy(['wrapped'], {}), { inner: new Proxy({}, {}) }]) {
+      const refused = await kv.set('k', value).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect((refused as { name?: string } | null)?.name).toBe('DataCloneError');
+    }
+    expect(await kv.get('k')).toBe('before');
+  });
+
   it('keeps what it holds when the database is opened again', async () => {
     const first = await open();
     const kv = await store(first);

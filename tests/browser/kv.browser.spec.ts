@@ -54,6 +54,32 @@ const throughIndexedDb = async (dbName: string, value: unknown): Promise<unknown
   });
 };
 
+/** What IndexedDB's own put does with `value`: 'stored', or the name of the error it throws. */
+const putOutcome = (dbName: string, value: unknown): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const request = indexedDB.open(dbName, 1);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore('kv');
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction('kv', 'readwrite');
+      let outcome = 'stored';
+      try {
+        tx.objectStore('kv').put(value, 'value');
+      } catch (error) {
+        outcome = (error as { name?: string }).name ?? 'Error';
+      }
+      const done = (): void => {
+        db.close();
+        resolve(outcome);
+      };
+      tx.oncomplete = done;
+      tx.onabort = done;
+    };
+    request.onerror = () => reject(request.error);
+  });
+
 class Point {
   constructor(
     public x: number,
@@ -119,6 +145,23 @@ describe('the key-value module in a browser', () => {
 
     expect(back).toStrictEqual(await throughIndexedDb(unique('kv-clone'), make()));
     expect(back).toStrictEqual(structuredClone(make()));
+  });
+
+  // A proxy reads as the object it wraps to every check but the structured
+  // clone's own. The SQL store answers it as this browser's IndexedDB does.
+  it("answers a proxy as the browser's IndexedDB does", async () => {
+    const adapter = new IndexedDbAdapter({ dbName: unique('kv-proxy'), sqlJsConfig, durability: 'commit' });
+    opened.push(adapter);
+    await adapter.open();
+    const store = await createSqlKeyValueStore(adapter, { table: 'kv' });
+
+    for (const make of [() => new Proxy({ text: 'wrapped' }, {}), () => new Proxy(['wrapped'], {})]) {
+      const sql = await store.set('value', make()).then(
+        () => 'stored',
+        (error: unknown) => (error as { name?: string }).name ?? 'Error',
+      );
+      expect(sql).toBe(await putOutcome(unique('kv-proxy-idb'), make()));
+    }
   });
 
   it('refuses a Blob, which it cannot hold as text', async () => {
