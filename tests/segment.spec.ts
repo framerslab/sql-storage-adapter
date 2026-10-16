@@ -26,17 +26,26 @@ const { capacitorNames, ipc } = vi.hoisted(() => ({
 }));
 
 // @capacitor-community/sqlite is an optional peer that CI does not install; the
-// adapter loads it in open(), and this stands in for it.
+// adapter loads it in open(), and this stands in for it: the native plugin,
+// CapacitorSQLite, and the plugin's SQLiteConnection over it, which makes the
+// connections (tests/capacitorSqliteAdapter.open.spec.ts keeps the native rules).
 vi.mock('@capacitor-community/sqlite', () => ({
-  createConnection: async (name: string) => {
-    capacitorNames.push(name);
-    return {
-      open: async () => undefined,
-      close: async () => undefined,
-      execute: async () => ({ changes: { changes: 0 } }),
-      run: async () => ({ changes: { changes: 0, lastId: 0 } }),
-      query: async () => ({ values: [] }),
-    };
+  CapacitorSQLite: {},
+  SQLiteConnection: class {
+    async createConnection(name: string) {
+      capacitorNames.push(name);
+      return {
+        open: async () => undefined,
+        close: async () => undefined,
+        execute: async () => ({ changes: { changes: 0 } }),
+        run: async () => ({ changes: { changes: 0, lastId: 0 } }),
+        query: async () => ({ values: [] }),
+      };
+    }
+
+    async closeConnection() {
+      return undefined;
+    }
   },
 }));
 
