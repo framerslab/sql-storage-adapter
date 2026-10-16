@@ -13,8 +13,10 @@
  * and cause. An object reached twice comes back as one object, and a cycle as a cycle.
  *
  * Refused with a `DataCloneError`, as the structured clone refuses them: functions, symbols, `WeakMap`, `WeakSet`,
- * `WeakRef`, promises, iterators, generators, `SharedArrayBuffer`. Refused too, though IndexedDB keeps them: `Blob`,
- * `File`, `ImageData`, `CryptoKey` and the other host objects, which text cannot hold.
+ * `WeakRef`, promises, iterators, generators, `SharedArrayBuffer`, and proxies, which only the runtime's own
+ * `structuredClone` tells apart from the objects they wrap (where the runtime has none, a proxy is kept as the object
+ * it reads as). Refused too, though IndexedDB keeps them: `Blob`, `File`, `ImageData`, `CryptoKey` and the other host
+ * objects, which text cannot hold.
  *
  * The text is JSON: it holds no NUL character, which PostgreSQL's text type refuses, and no lone surrogate, which
  * cannot be encoded as UTF-8.
@@ -155,6 +157,16 @@ const numberNode = (value: number): Node => {
  * @throws {Error} A `DataCloneError` for a value the structured clone refuses, or one text cannot hold.
  */
 export function encodeValue(value: unknown): string {
+  // The runtime's own structured clone runs first, for what no inspection can
+  // tell apart from what it copies: a proxy answers every check below as the
+  // object it wraps would (an array proxy is an array to Array.isArray), and the
+  // structured clone, as IndexedDB's put, refuses it. The text is still written
+  // from the value itself, so what comes back does not change.
+  const runtimeClone = (globalThis as unknown as { structuredClone?: (input: unknown) => unknown }).structuredClone;
+  if (typeof runtimeClone === 'function') {
+    runtimeClone(value);
+  }
+
   /** Each object met so far, by the order it was met in, which the decoder repeats. */
   const ids = new Map<object, number>();
 
