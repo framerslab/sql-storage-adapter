@@ -10,31 +10,57 @@ import { PostgresFts } from '../../fts/PostgresFts.js';
 import { NodeBlobCodec } from '../../codecs/NodeBlobCodec.js';
 import { BrowserBlobCodec } from '../../codecs/BrowserBlobCodec.js';
 import { SqliteFileExporter } from '../../exporters/SqliteFileExporter.js';
-import { PostgresExporter } from '../../exporters/PostgresExporter.js';
+import { PostgresExporter, type PostgresExporterOptions } from '../../exporters/PostgresExporter.js';
 
-interface PostgresAdapterOptionsLike {
+/** Connection settings, as the Postgres adapter's options and a pg Pool's `options` hold them. */
+interface PostgresConnectionLike {
   connectionString?: string;
   host?: string;
   port?: number;
   database?: string;
   user?: string;
-  password?: string;
+  /** pg also takes a function here, which a connection string cannot hold. */
+  password?: unknown;
   ssl?: boolean | object;
 }
 
-function extractPostgresConnectionString(adapter: StorageAdapter): string | undefined {
-  const options = (adapter as StorageAdapter & { options?: PostgresAdapterOptionsLike }).options;
-  if (!options) return undefined;
-  if (options.connectionString) return options.connectionString;
-  if (!options.database) return undefined;
+interface PostgresAdapterOptionsLike extends PostgresConnectionLike {
+  segment?: string;
+  /** A pool of the caller's; a pg Pool keeps the settings it was made with as `options`. */
+  pool?: { options?: PostgresConnectionLike } | null;
+}
 
-  const host = options.host ?? 'localhost';
-  const port = options.port ?? 5432;
-  const user = options.user ? encodeURIComponent(options.user) : '';
-  const password = options.password ? `:${encodeURIComponent(options.password)}` : '';
+/** A connection string pg_dump reaches the database of these settings with. */
+function connectionStringOf(settings: PostgresConnectionLike | undefined): string | undefined {
+  if (!settings) return undefined;
+  if (settings.connectionString) return settings.connectionString;
+  if (!settings.database) return undefined;
+
+  const host = settings.host ?? 'localhost';
+  const port = settings.port ?? 5432;
+  const user = settings.user ? encodeURIComponent(settings.user) : '';
+  // A password pg reads from a function is left to PGPASSWORD or ~/.pgpass.
+  const password = typeof settings.password === 'string' && settings.password ? `:${encodeURIComponent(settings.password)}` : '';
   const auth = user ? `${user}${password}@` : '';
-  const sslQuery = options.ssl ? '?sslmode=require' : '';
-  return `postgresql://${auth}${host}:${port}/${options.database}${sslQuery}`;
+  const sslQuery = settings.ssl ? '?sslmode=require' : '';
+  return `postgresql://${auth}${host}:${port}/${encodeURIComponent(settings.database)}${sslQuery}`;
+}
+
+/**
+ * Where the exporter of a Postgres adapter reaches its database, and what it
+ * exports: the adapter's own connection settings, else the settings of the
+ * pool its caller gave it; the segment's schema alone on a segmented adapter.
+ */
+function postgresExport(adapter: StorageAdapter): { connectionString?: string; options: PostgresExporterOptions } {
+  const options = (adapter as StorageAdapter & { options?: PostgresAdapterOptionsLike }).options;
+  const exportOptions: PostgresExporterOptions = options?.segment ? { schema: options.segment } : {};
+  const connectionString = connectionStringOf(options) ?? connectionStringOf(options?.pool?.options);
+  if (connectionString === undefined && options?.pool) {
+    exportOptions.missingConnection =
+      'PostgresExporter: the adapter runs on a pool its caller made, and the pool names no connection string or ' +
+      'database for pg_dump to reach. Make the pool with a connectionString, or with host, database, user and password.';
+  }
+  return { connectionString, options: exportOptions };
 }
 
 /**
@@ -59,14 +85,14 @@ export interface StorageFeatures {
 export function createStorageFeatures(adapter: StorageAdapter): StorageFeatures {
   const isPostgres = adapter.kind === 'postgres';
   const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'undefined';
-  const postgresConnectionString = isPostgres ? extractPostgresConnectionString(adapter) : undefined;
+  const postgresTarget = isPostgres ? postgresExport(adapter) : undefined;
 
   return {
     dialect: isPostgres ? new PostgresDialect() : new SqliteDialect(),
     fts: isPostgres ? new PostgresFts() : new SqliteFts5(),
     blobCodec: isBrowser ? new BrowserBlobCodec() : new NodeBlobCodec(),
-    exporter: isPostgres
-      ? new PostgresExporter(postgresConnectionString)
+    exporter: postgresTarget
+      ? new PostgresExporter(postgresTarget.connectionString, postgresTarget.options)
       : new SqliteFileExporter(adapter),
   };
 }
