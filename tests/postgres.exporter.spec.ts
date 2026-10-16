@@ -110,4 +110,21 @@ describe.skipIf(!POSTGRES_TEST_URL)('the PostgreSQL exporter, through pg_dump', 
       await pool.end();
     }
   });
+
+  // open({ connectionString }) gives the adapter a database its options do not
+  // name: the exporter reads the pool the adapter runs on when an export runs.
+  it('exports an adapter given its connection string at open(), from features made before it opened', async () => {
+    const segment = unique('seg');
+    schemas.push(segment);
+    const adapter = createPostgresAdapter({ segment });
+    opened.push(adapter);
+    const { exporter } = createStorageFeatures(adapter);
+    await adapter.open({ connectionString: url });
+    await adapter.exec('CREATE TABLE opened_items (id INTEGER PRIMARY KEY)');
+
+    const file = path.join(dir, `${segment}-opened.dump`);
+    await exporter.exportToFile(file);
+
+    expect(dumpedTables(file)).toEqual([`${segment}.opened_items`]);
+  });
 });

@@ -78,6 +78,60 @@ describe('PostgresExporter', () => {
     expect(calls[0].env.PGPASSWORD).toBe('s3cr@t');
   });
 
+  // pg_dump reads a URI as libpq does: the user part runs to the first @ that
+  // comes before any /, and a password parameter after the path wins over the
+  // user part's password. The WHATWG URL parser reads several of these
+  // differently, or refuses them.
+  it.each([
+    [
+      'an empty host and a socket directory as a parameter',
+      'postgresql://app:s3cret@/app?host=/var/run/postgresql',
+      'postgresql://app@/app?host=/var/run/postgresql',
+      's3cret',
+    ],
+    [
+      'several hosts',
+      'postgresql://app:s3cret@one.example:5432,two.example:5433/app',
+      'postgresql://app@one.example:5432,two.example:5433/app',
+      's3cret',
+    ],
+    ['a # and a ? in the password', 'postgresql://app:s3cr#t?@db.example/app', 'postgresql://app@db.example/app', 's3cr#t?'],
+    ['no user name', 'postgres://:s3cret@db.example/app', 'postgres://db.example/app', 's3cret'],
+    [
+      'a password parameter',
+      'postgresql://app@db.example/app?sslmode=require&password=s3cr%26t',
+      'postgresql://app@db.example/app?sslmode=require',
+      's3cr&t',
+    ],
+    [
+      'a password parameter and a password in the user part',
+      'postgresql://app:s3cr-user@db.example/app?password=s3cret',
+      'postgresql://app@db.example/app',
+      's3cret',
+    ],
+  ])('keeps the password off the command line with %s', async (_name, connectionString, dbname, password) => {
+    await new PostgresExporter(connectionString).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe(dbname);
+    expect(calls[0].args.join(' ')).not.toContain('s3cr');
+    expect(calls[0].env.PGPASSWORD).toBe(password);
+  });
+
+  it('leaves the password to the environment when the connection string holds none, or one libpq cannot decode', async () => {
+    for (const connectionString of [
+      'postgresql://app@db.example/app',
+      'postgresql://app:@db.example/app',
+      'postgresql://app:s3cr%zz@db.example/app',
+      'host=db.example dbname=app user=app',
+    ]) {
+      calls.length = 0;
+      await new PostgresExporter(connectionString).exportToBytes();
+
+      expect(dbnameOf(calls[0].args)).toBe(connectionString);
+      expect(calls[0].env.PGPASSWORD).toBe(process.env.PGPASSWORD);
+    }
+  });
+
   it("fails with pg_dump's own words, and never with the command line that held the password", async () => {
     outcome.error = Object.assign(new Error('Command failed: pg_dump --dbname=postgresql://app:hunter2@db/app'), { code: 1 });
     outcome.stderr = 'pg_dump: error: connection to server failed: password authentication failed';
@@ -139,6 +193,57 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     const { exporter } = createStorageFeatures(postgresAdapter({ pool: { options: {} } }));
 
     await expect(exporter.exportToBytes()).rejects.toThrow(/pool its caller made/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('writes a Unix-socket directory as libpq reads a host in a URI', async () => {
+    const { exporter } = createStorageFeatures(postgresAdapter({ host: '/var/run/postgresql', database: 'app', user: 'app' }));
+
+    await exporter.exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@%2Fvar%2Frun%2Fpostgresql:5432/app');
+  });
+
+  it('gives PGPASSWORD a password set with no user name', async () => {
+    const { exporter } = createStorageFeatures(postgresAdapter({ host: 'db.example', database: 'app', password: 's3cret' }));
+
+    await exporter.exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://db.example:5432/app');
+    expect(calls[0].env.PGPASSWORD).toBe('s3cret');
+  });
+
+  // open({ connectionString }) makes the adapter's pool from a connection
+  // string its options do not hold, after its features may have been made.
+  it('reaches the database of the pool the adapter runs on, read when the export runs', async () => {
+    let live: { options: Record<string, unknown> } | null = null;
+    const adapter = Object.assign(postgresAdapter({ segment: 'agentos' }), { getPool: () => live });
+    const { exporter } = createStorageFeatures(adapter);
+    live = {
+      options: { connectionString: 'postgresql://app:s3cret@db.example/app', options: '-c search_path=agentos,public' },
+    };
+
+    await exporter.exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example/app');
+    expect(calls[0].env.PGPASSWORD).toBe('s3cret');
+    expect(calls[0].args).toContain('--schema="agentos"');
+  });
+
+  it('prefers the pool the adapter runs on to the settings it was made with', async () => {
+    const adapter = Object.assign(postgresAdapter({ connectionString: 'postgresql://app@made.example/app' }), {
+      getPool: () => ({ options: { connectionString: 'postgresql://app@opened.example/app' } }),
+    });
+
+    await createStorageFeatures(adapter).exporter.exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@opened.example/app');
+  });
+
+  it('says what the adapter lacks when nothing names its database', async () => {
+    const adapter = Object.assign(postgresAdapter({ segment: 'agentos' }), { getPool: () => null });
+
+    await expect(createStorageFeatures(adapter).exporter.exportToBytes()).rejects.toThrow(/names no database/);
     expect(calls).toHaveLength(0);
   });
 });

@@ -48,7 +48,10 @@ describe('createStorageFeatures', () => {
     expect(features.dialect).toBeInstanceOf(PostgresDialect);
     expect(features.fts).toBeInstanceOf(PostgresFts);
     expect(features.exporter).toBeInstanceOf(PostgresExporter);
-    expect((features.exporter as PostgresExporter & { connectionString?: string })['connectionString'])
-      .toBe('postgresql://user:pass@localhost:5432/testdb');
+    // The exporter may name the adapter's database when an export runs.
+    const target = (features.exporter as unknown as { connectionString?: string | (() => string | undefined) })[
+      'connectionString'
+    ];
+    expect(typeof target === 'function' ? target() : target).toBe('postgresql://user:pass@localhost:5432/testdb');
   });
 });
