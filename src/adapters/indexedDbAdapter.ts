@@ -233,10 +233,43 @@ interface StoredImage {
   stamp: string | null;
 }
 
+/** A statement past its leading comments and whitespace. */
+const pastLeadingComments = (statement: string): string =>
+  statement.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/, '');
+
 /** The first keyword of a statement, past its leading comments and whitespace. */
-const firstKeyword = (statement: string): string => {
-  const rest = statement.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/, '');
-  return (/^[A-Za-z]+/.exec(rest)?.[0] ?? '').toUpperCase();
+const firstKeyword = (statement: string): string =>
+  (/^[A-Za-z]+/.exec(pastLeadingComments(statement))?.[0] ?? '').toUpperCase();
+
+/**
+ * PRAGMAs whose assignment changes the database image: the header's
+ * user_version, application_id and schema_version, and the settings a new
+ * database or a VACUUM writes (page_size, auto_vacuum, encoding). SQLite's
+ * change counter, `total_changes()`, counts none of them.
+ */
+const IMAGE_PRAGMAS_WHEN_SET = new Set(['user_version', 'application_id', 'schema_version', 'page_size', 'auto_vacuum', 'encoding']);
+
+/** PRAGMAs that change the image in any form: incremental_vacuum frees pages, optimize may run ANALYZE. */
+const IMAGE_PRAGMAS_ALWAYS = new Set(['incremental_vacuum', 'optimize']);
+
+/** An identifier as SQLite reads one: bare, or in double quotes, brackets or backticks. */
+const SQL_IDENTIFIER = '(?:"(?:[^"]|"")*"|\\[[^\\]]*\\]|`(?:[^`]|``)*`|[A-Za-z_][A-Za-z0-9_$]*)';
+
+/** `PRAGMA [schema.]name`, then `=` or `(` when the statement gives the pragma a value. */
+const PRAGMA_STATEMENT = new RegExp(`^PRAGMA\\s+(?:${SQL_IDENTIFIER}\\s*\\.\\s*)?(${SQL_IDENTIFIER})\\s*(=|\\()?`, 'i');
+
+/**
+ * Whether a PRAGMA statement changes the database image although no row
+ * changes: an assignment to a header field or a file setting, or a pragma that
+ * rewrites pages. Reads (`PRAGMA table_info(t)`, `PRAGMA user_version`) and
+ * connection settings (`PRAGMA foreign_keys = ON`) do not.
+ */
+const pragmaChangesImage = (statement: string): boolean => {
+  const match = PRAGMA_STATEMENT.exec(pastLeadingComments(statement));
+  if (!match) return false;
+  const quoted = /^["[`]/.test(match[1]);
+  const name = (quoted ? match[1].slice(1, -1) : match[1]).toLowerCase();
+  return IMAGE_PRAGMAS_ALWAYS.has(name) || (match[2] !== undefined && IMAGE_PRAGMAS_WHEN_SET.has(name));
 };
 
 /**
@@ -505,10 +538,13 @@ export class IndexedDbAdapter implements StorageAdapter {
     this.ensureOpen();
     // A statement that is not a plain read can write (INSERT ... RETURNING,
     // WITH ... DELETE): it marks the database unsaved when it changed rows,
-    // and a statement that can only write marks it whatever it changed.
+    // and a statement that can only write marks it whatever it changed. A
+    // PRAGMA that sets a header field (user_version) changes no row, so it
+    // marks the database unsaved by its name.
     const keyword = firstKeyword(statement);
     const reads = keyword === 'SELECT' || keyword === 'EXPLAIN' || keyword === 'VALUES';
     const mayWrite = keyword === 'WITH' || keyword === 'PRAGMA';
+    const setsImage = keyword === 'PRAGMA' && pragmaChangesImage(statement);
     const changesBefore = mayWrite ? this.totalChanges() : 0;
     const stmt = this.db!.prepare(statement);
     try {
@@ -532,7 +568,7 @@ export class IndexedDbAdapter implements StorageAdapter {
         results.push(obj as T);
       }
 
-      if (!reads && (!mayWrite || this.totalChanges() !== changesBefore)) {
+      if (!reads && (!mayWrite || setsImage || this.totalChanges() !== changesBefore)) {
         this.writeGeneration += 1;
       }
       return results;
