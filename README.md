@@ -628,10 +628,17 @@ See [**guides/OPTIMIZATION_GUIDE.md**](./guides/OPTIMIZATION_GUIDE.md) for detai
 
 ## Lifecycle Hooks
 
-The package exports the `StorageHooks` types and the `combineHooks()` and `filterHooks()` helpers. `createDatabase()` takes no `hooks` option, and no adapter runs hooks: a host that wants them calls them around its own adapter calls.
+`createDatabase({ hooks })`, or `withHooks(adapter, hooks)` on any adapter, puts lifecycle hooks around each query, write, transaction and error.
+- A `before` hook returns the context, changed or not, to go on, or undefined to stop the call. A stopped `get` returns null, `all` an empty list, and `run` no changes.
+- `onAfterQuery` can replace the result.
+- `onError` returns the error to throw, or undefined to swallow it.
+- The statements inside a transaction pass through the hooks too, and `onAfterTransaction` sees `outcome: 'committed'` or `'rolled_back'`.
+- The adapter keeps its kind, its own methods and its class.
+
+`combineHooks()` and `filterHooks()` compose hook sets.
 
 ```typescript
-import { combineHooks, type StorageHooks } from '@framers/sql-storage-adapter';
+import { createDatabase, combineHooks, type StorageHooks } from '@framers/sql-storage-adapter';
 
 const myHooks: StorageHooks = {
   // Log all writes
@@ -657,8 +664,7 @@ const myHooks: StorageHooks = {
   }
 };
 
-// One StorageHooks object from several; the host calls its hooks itself
-const hooks = combineHooks(myHooks);
+const db = await createDatabase({ url: process.env.DATABASE_URL, strict: true, hooks: combineHooks(myHooks) });
 ```
 
 ### Available Hooks

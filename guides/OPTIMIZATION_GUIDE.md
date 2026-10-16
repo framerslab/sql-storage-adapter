@@ -2,7 +2,7 @@
 
 > Comprehensive guide for configuring performance tiers, cost optimization, and sensible defaults across all platforms.
 
-> **Note:** `createDatabase()` takes no `performance` or `hooks` option, and no adapter applies a tier or runs hooks. The examples below that pass them to `createDatabase()` do not compile against `DatabaseOptions`. The tier presets (`TIER_DEFAULTS`), `resolvePerformanceConfig()` and the hook types and helpers are exported for a host to apply itself.
+> **Note:** `createDatabase()` takes `hooks` (see "Lifecycle Hooks" in the README, and `withHooks()`), but no `performance` option, and no adapter applies a tier. The examples below that pass `performance` to `createDatabase()` do not compile against `DatabaseOptions`. The tier presets (`TIER_DEFAULTS`), `resolvePerformanceConfig()` and the hook types and helpers are exported for a host to apply itself.
 
 ---
 

@@ -15,6 +15,8 @@ import type { PostgresAdapterOptions } from '../adapters/postgresAdapter';
 import type { CapacitorAdapterOptions } from '../adapters/capacitorSqliteAdapter';
 import type { IndexedDbAdapterOptions } from '../adapters/indexedDbAdapter';
 import type { StorageLogger } from '../shared/logger';
+import type { StorageHooks } from './contracts/hooks';
+import { withHooks } from '../shared/withHooks';
 
 /**
  * The options that configure Postgres: `url` when the caller set the key, even
@@ -136,6 +138,13 @@ export interface DatabaseOptions {
    * `setStorageLogger()` set, else the console.
    */
   logger?: StorageLogger;
+
+  /**
+   * Lifecycle hooks around every call of the adapter returned (see withHooks):
+   * each query, write, transaction and error, with the power to change a
+   * statement or a result, or to stop a call by returning undefined.
+   */
+  hooks?: StorageHooks;
 }
 
 /** Whether this runs in a Capacitor app on a phone, where the native SQLite plugin keeps the database. */
@@ -309,7 +318,7 @@ export async function createDatabase(options: DatabaseOptions = {}): Promise<Sto
 
   const adapter = await resolveStorageAdapter(resolverOptions);
   await adapter.open(resolverOptions.openOptions);
-  return adapter;
+  return options.hooks ? withHooks(adapter, options.hooks) : adapter;
 }
 
 /**

@@ -18,6 +18,7 @@ export { SqliteFileExporter } from '../exporters/SqliteFileExporter';
 export { PostgresExporter } from '../exporters/PostgresExporter';
 export { createStorageFeatures } from './contracts/features';
 export { isUniqueViolation } from '../shared/errors';
+export { withHooks } from '../shared/withHooks';
 export { setStorageLogger, getStorageLogger, type StorageLogger } from '../shared/logger';
 export * from '../features/migrations/schemaMigrations';
 export * from '../features/auth/authJsAdapter';
