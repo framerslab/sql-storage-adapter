@@ -184,6 +184,16 @@ describe('SqlJsAdapter saves to its file', () => {
       expect(await fileLabels(file)).toEqual(['kept']);
     });
 
+    it('closes once when close() is called twice at once, and keeps the rows', async () => {
+      const file = tempFile();
+      const adapter = await openWithItems(file);
+      await adapter.run('INSERT INTO items (label) VALUES (?)', ['kept']);
+
+      await Promise.all([adapter.close(), adapter.close()]);
+
+      expect(await fileLabels(file)).toEqual(['kept']);
+    });
+
     it('saves again after close() rolled back a transaction the caller left open', async () => {
       const file = tempFile();
       const adapter = await openWithItems(file);
