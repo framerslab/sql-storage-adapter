@@ -787,7 +787,7 @@ await exporter.exportToFile('/backups/snapshot.db');
 const bytes = await exporter.exportToBytes();
 ```
 
-On Postgres, `features.exporter` runs `pg_dump` in its custom format, so it needs a Node runtime with `pg_dump` on the PATH, and an adapter whose database it can name: one made with a connection string, or with a host, database and user, or with a `pg` `Pool` that was made with them. A segmented adapter's export holds its segment's schema alone (`--schema`). `pg_dump` runs with no shell between, and the password of a `postgresql://` connection string reaches it through `PGPASSWORD`, not its command line. `new PostgresExporter(connectionString, { schema })` exports one schema of any database.
+On Postgres, `features.exporter` runs `pg_dump` in its custom format, so it needs a Node runtime with `pg_dump` on the PATH, and an adapter whose database it can name: one made with a connection string, or with a host (a Unix-socket directory too), database and user, or with a `pg` `Pool` that was made with them, or one given its connection string at `open()`. The exporter names the database when an export runs, from the pool the adapter runs on, so it exports the database the adapter opened. A segmented adapter's export holds its segment's schema alone (`--schema`). `pg_dump` runs with no shell between, and the password of a `postgres://` or `postgresql://` connection string, in its user part or its `password` parameter, reaches it through `PGPASSWORD`, not its command line. `new PostgresExporter(connectionString, { schema })` exports one schema of any database; `connectionString` may be a function that gives it when an export runs.
 
 ## CI, Releases, and Badges
 
