@@ -249,6 +249,35 @@ export interface StorageAdapter {
    * @throws {Error} If adapter doesn't support prepared statements
    */
   prepare?<T = unknown>(statement: string): PreparedStatement<T>;
+
+  /**
+   * Makes a JavaScript function callable from SQL under `name` (if supported:
+   * the better-sqlite3, sql.js and IndexedDB adapters). The function takes as
+   * many arguments as it declares (`fn.length`).
+   *
+   * @param name - An identifier: letters, digits and underscores
+   * @param fn - The function; SQL values arrive as its arguments
+   * @param options - `deterministic` (better-sqlite3)
+   * @throws {Error} If the name is not an identifier
+   * @example
+   * db.registerFunction?.('slugify', (title) => String(title).toLowerCase(), { deterministic: true });
+   * const rows = await db.all('SELECT slugify(title) AS slug FROM posts');
+   */
+  registerFunction?(name: string, fn: SqlFunction, options?: SqlFunctionOptions): void;
+}
+
+/** A JavaScript function SQL can call (see `StorageAdapter.registerFunction`). */
+export type SqlFunction = (...args: unknown[]) => unknown;
+
+/** Options for `StorageAdapter.registerFunction`. */
+export interface SqlFunctionOptions {
+  /**
+   * The function returns the same result for the same arguments, which SQLite
+   * requires of a function in an expression index, a partial index or a
+   * generated column. better-sqlite3 takes it; sql.js registers every function
+   * as non-deterministic.
+   */
+  deterministic?: boolean;
 }
 
 /**

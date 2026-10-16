@@ -264,8 +264,7 @@
     "@aws-sdk/client-s3": "^3.0.0",
     "@capacitor-community/sqlite": "^6.0.0 || ^7.0.0 || ^8.0.0",
     "better-sqlite3": "^12.0.0 || ^13.0.0",
-    "electron": ">=20.0.0",
-    "pg": "^8.13.1"
+    "electron": ">=20.0.0"
   },
   "peerDependenciesMeta": {
     "@aws-sdk/client-s3": {
@@ -278,9 +277,6 @@
       "optional": true
     },
     "electron": {
-      "optional": true
-    },
-    "pg": {
       "optional": true
     }
   }

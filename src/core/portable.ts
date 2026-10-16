@@ -21,5 +21,6 @@ export { isUniqueViolation } from '../shared/errors';
 export { withHooks } from '../shared/withHooks';
 export { setStorageLogger, getStorageLogger, type StorageLogger } from '../shared/logger';
 export * from '../features/migrations/schemaMigrations';
+export * from '../features/migrations/ensureColumnExists';
 export * from '../features/auth/authJsAdapter';
 export * from '../shared/parameterUtils';
