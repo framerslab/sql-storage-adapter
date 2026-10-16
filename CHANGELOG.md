@@ -1,3 +1,19 @@
+## [0.7.5] - 2026-10-16
+
+### Added
+- `PostgresExporterOptions`, the second argument of `new PostgresExporter(connectionString, { schema })`: `schema` exports one schema alone, by its exact name (`pg_dump --schema`). It is exported from the root and `./core`.
+
+### Changed
+- `PostgresExporter` runs `pg_dump` through `execFile`, with no shell between, and no longer blocks the event loop while the dump runs. A connection string or a path holding a quote or a `$` reaches `pg_dump` as it is. The password of a `postgresql://` connection string reaches `pg_dump` through `PGPASSWORD` instead of its command line, where the process list showed it, and a failure reports `pg_dump`'s own words, never the command line. A dump larger than 256 MiB from `exportToBytes()` says to use `exportToFile()`.
+
+### Fixed
+- `createStorageFeatures(adapter).exporter` on a segmented PostgreSQL adapter dumps the segment's schema alone. It dumped every schema of the database: the other segments' tables and the host's in `public`.
+- `createStorageFeatures(adapter).exporter` on an adapter made with a pool of the caller's reaches the database the pool was made for, through the settings a `pg` `Pool` keeps as its `options`. It had no connection string, so both export methods always threw. A pool whose settings name no database says so.
+- A segmented PostgreSQL adapter's `open()` fails when the segment is not the current schema of its first connection, and says what to grant. PostgreSQL leaves a schema the role has no `USAGE` privilege on out of the `search_path` without a word, so on an existing schema another role made, the segment's statements read and created tables in `public`. A pooler that drops startup options did the same.
+- `resolveStorageAdapter()` and `createDatabase()` refuse a segment name in `postgres`, `indexedDb` or `capacitor` that cannot be a segment before any adapter is tried, as they refuse their own. A candidate whose options name no segment, tried after a candidate whose options named one, opens in that segment: without `strict`, an unreachable PostgreSQL with `postgres.segment` fell through to better-sqlite3 on the shared file, outside the segment.
+- IndexedDB adapter: a PRAGMA through `all()` or `get()` that sets `user_version`, `application_id`, `schema_version`, `page_size`, `auto_vacuum` or `encoding`, or runs `incremental_vacuum` or `optimize`, is saved. SQLite's `total_changes()` counts no PRAGMA, so `get('PRAGMA user_version = 3')` was stored neither with `durability: 'commit'` nor by `flush()` or `close()`. PRAGMA reads and connection settings still write nothing.
+- `createSqlKeyValueStore()` refuses a `Proxy` with a `DataCloneError`, as the structured clone and IndexedDB's put do. A proxy reads as the object it wraps to every check but the runtime's own `structuredClone`, which now runs first, so `set()` stored `new Proxy({ x: 1 }, {})` as `{ x: 1 }`.
+
 ## [0.7.4] - 2026-10-16
 
 ### Added
