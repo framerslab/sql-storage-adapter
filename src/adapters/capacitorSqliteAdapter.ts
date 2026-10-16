@@ -96,8 +96,15 @@ const loadSqliteConnection = (): Promise<SQLiteConnection | null> => {
   return sharedSqliteConnection;
 };
 
-/** The databases an adapter of this page has open, or is opening. */
+/** The databases an adapter of this page has open, or is opening, by connectionName(). */
 const openDatabases = new Set<string>();
+
+/**
+ * The name the plugin keeps a database's connection under: its
+ * SQLiteConnection drops a trailing ".db", so "notes.db" and "notes" are one
+ * connection, and one database file.
+ */
+const connectionName = (database: string): string => (database.endsWith('.db') ? database.slice(0, -3) : database);
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -177,6 +184,8 @@ const toRunResult = (answer: unknown): StorageRunResult => {
  * adapter in the page, and close() closes the plugin's connection too, so the
  * database can be opened again. One adapter at a time holds a database: a
  * second open() of the same database fails while the first adapter has it.
+ * The plugin drops a trailing ".db" from a name, so `notes.db` and `notes`
+ * are one database.
  *
  * Transactions use the plugin's beginTransaction, commitTransaction and
  * rollbackTransaction (plugin 5.0.7 and later). The plugin runs every other
@@ -235,7 +244,7 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
 
     const adapterOptions = options?.adapterOptions as { database?: unknown } | undefined;
     const requestedName = typeof adapterOptions?.database === 'string' ? adapterOptions.database : undefined;
-    const name = segmentName(requestedName ?? this.options.database ?? this.dbName, this.segment);
+    const name = connectionName(segmentName(requestedName ?? this.options.database ?? this.dbName, this.segment));
 
     // Two adapters on one connection would run their transactions into each other.
     if (openDatabases.has(name)) {
