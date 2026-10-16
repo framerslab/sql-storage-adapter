@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.7.10] - 2026-10-16
 
 ### Fixed
 - Make syncIdentitySequence optional on the exported SqlDialect interface, with conditional callers, so existing custom dialects still compile. Correct README identity widths, rowid scope, sequence state and date semantics.
