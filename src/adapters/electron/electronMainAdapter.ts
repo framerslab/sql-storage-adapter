@@ -517,8 +517,8 @@ export class ElectronMainAdapter implements StorageAdapter {
     const backupPath = `${this.filePath}.backup`;
     const remotePath = `backups/${path.basename(this.filePath)}_${Date.now()}.db`;
 
-    // Create a backup using VACUUM INTO
-    await this.innerAdapter.exec(`VACUUM INTO '${backupPath}'`);
+    // Create a backup using VACUUM INTO; the path is a SQL string literal, so its quotes are doubled
+    await this.innerAdapter.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
 
     // Upload to cloud
     await this.options.backup.provider.upload(backupPath, remotePath);

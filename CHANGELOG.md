@@ -1,3 +1,11 @@
+## [0.7.12] - 2026-10-16
+
+### Security
+- `PostgresExporter` starts `pg_dump` with `execFile` and an argument array instead of a shell string, so a quote, `$(...)` or `;` in the output path or the connection string can no longer run a command; a `postgres://` URL's password reaches `pg_dump` in `PGPASSWORD` and no longer shows in the process list. `pgDumpInvocation(connectionString, outputPath?)` builds the invocation.
+
+### Fixed
+- The Electron main adapter's cloud backup doubles the quotes of its `VACUUM INTO` path, so a database under a folder with an apostrophe backs up.
+
 ## [0.7.11] - 2026-10-16
 
 ### Added
