@@ -345,7 +345,7 @@ export const createTableStatement = (
     } else {
       if (column.autoIncrement) {
         warnings.push(
-          `${where(column)} takes its values from a sequence in ${source}; SQLite fills only an INTEGER PRIMARY KEY, so it was created as a plain column holding the copied values.`,
+          `${where(column)} takes its values from a sequence in ${source}; SQLite fills only an INTEGER PRIMARY KEY, so it was created as a plain, nullable column holding the copied values.`,
         );
       }
       const fromSequence = column.defaultValue !== undefined && /^\s*nextval\s*\(/i.test(column.defaultValue);
@@ -359,7 +359,9 @@ export const createTableStatement = (
       }
     }
 
-    const notNull = !column.nullable && !(column.autoIncrement && target === 'postgres') ? ' NOT NULL' : '';
+    // An identity is NOT NULL by itself; a column SQLite cannot fill stays
+    // nullable, so a row that leaves it out can still be inserted.
+    const notNull = !column.nullable && !column.autoIncrement ? ' NOT NULL' : '';
     return `${quoteIdentifier(column.name)} ${type}${notNull}${definition}`;
   });
 

@@ -183,10 +183,12 @@ export async function exportAsSQL(
     const columns = schemas.get(tableName)?.columns ?? [];
     const generated = new Set(columns.filter((column) => column.generated).map((column) => column.name));
 
+    const types = new Map(columns.map((column) => [column.name, column.type]));
+
     lines.push(`-- Data for table: ${tableName}`);
     for (const row of rows) {
       const values = Object.fromEntries(Object.entries(row as Record<string, unknown>).filter(([column]) => !generated.has(column)));
-      lines.push(generateInsertSQL(tableName, values));
+      lines.push(generateInsertSQL(tableName, values, engine, types));
     }
     if (engine === 'postgres') {
       // Move each identity's sequence past the ids the inserts gave.
@@ -392,9 +394,9 @@ async function getPostgresTableSchema(adapter: StorageAdapter, table: string): P
 /**
  * Generate INSERT SQL for a row.
  */
-function generateInsertSQL(table: string, row: Record<string, unknown>): string {
+function generateInsertSQL(table: string, row: Record<string, unknown>, engine: Engine, types: Map<string, string>): string {
   const columns = Object.keys(row);
-  const values = columns.map(col => escapeSQLValue(row[col]));
+  const values = columns.map(col => escapeSQLValue(row[col], engine, types.get(col)));
 
   return `INSERT INTO ${escapeIdentifier(table)} (${columns.map(escapeIdentifier).join(', ')}) VALUES (${values.join(', ')});`;
 }
@@ -406,15 +408,38 @@ function escapeIdentifier(identifier: string): string {
   return `"${identifier.replace(/"/g, '""')}"`;
 }
 
+const quoteText = (text: string): string => `'${text.replace(/'/g, "''")}'`;
+
+/** A PostgreSQL array literal's text (`{"a","b"}`), for a column of an array type. */
+const postgresArrayText = (items: unknown[]): string =>
+  `{${items
+    .map(item => {
+      if (item === null || item === undefined) return 'NULL';
+      if (Array.isArray(item)) return postgresArrayText(item);
+      const text = item instanceof Date ? item.toISOString() : typeof item === 'object' ? JSON.stringify(item) : String(item);
+      return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    })
+    .join(',')}}`;
+
 /**
- * Escape SQL value for INSERT statement.
+ * Escape SQL value for INSERT statement, as the engine reads it back: bytes as
+ * a blob or bytea literal, booleans as 1 and 0 on SQLite, arrays as an array
+ * literal in a PostgreSQL array column, and other objects as JSON text.
  */
-function escapeSQLValue(value: unknown): string {
+function escapeSQLValue(value: unknown, engine: Engine, columnType?: string): string {
   if (value === null || value === undefined) return 'NULL';
-  if (typeof value === 'number') return String(value);
-  if (typeof value === 'boolean') return value ? '1' : '0';
-  if (value instanceof Date) return `'${value.toISOString()}'`;
-  return `'${String(value).replace(/'/g, "''")}'`;
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : quoteText(String(value));
+  if (typeof value === 'bigint') return String(value);
+  if (typeof value === 'boolean') return engine === 'postgres' ? (value ? 'TRUE' : 'FALSE') : value ? '1' : '0';
+  if (value instanceof Date) return quoteText(value.toISOString());
+  if (value instanceof Uint8Array) {
+    const hex = Array.from(value, byte => byte.toString(16).padStart(2, '0')).join('');
+    // bytea's hex input format (https://www.postgresql.org/docs/current/datatype-binary.html); SQLite's blob literal.
+    return engine === 'postgres' ? `'\\x${hex}'` : `X'${hex}'`;
+  }
+  if (Array.isArray(value) && engine === 'postgres' && columnType?.endsWith('[]')) return quoteText(postgresArrayText(value));
+  if (typeof value === 'object') return quoteText(JSON.stringify(value));
+  return quoteText(String(value));
 }
 
 /**

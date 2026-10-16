@@ -13,7 +13,8 @@
 - `onConflict: 'ignore'` and `'replace'` write `ON CONFLICT` on PostgreSQL. They wrote SQLite's `INSERT OR IGNORE` and `INSERT OR REPLACE`, which failed there, and the failures were skipped without a word, so nothing was imported.
 - `rowsImported` counts the rows written, leaving out those `onConflict: 'ignore'` skipped.
 - `exportData` pages through each table in primary-key order (else rowid or ctid), so no row repeats or goes missing between pages, and leaves out the shadow tables of a SQLite virtual table.
-- `exportAsSQL` writes the primary key and identity columns, leaves generated columns out of its inserts, and moves PostgreSQL sequences past the inserted ids.
+- `exportAsSQL` writes the primary key and identity columns, leaves generated columns out of its inserts, and moves PostgreSQL sequences past the inserted ids. Its values load back on their engine: bytes as a blob or bytea literal (they were written as text), booleans as `TRUE` and `FALSE` on PostgreSQL, arrays as array literals in PostgreSQL array columns, and other objects as JSON (they were written as `[object Object]`).
+- A column the target engine cannot fill (a PostgreSQL identity outside the primary key, on SQLite) is created nullable, so rows that leave it out can still be inserted.
 
 ## [0.7.8] - 2026-10-16
 
