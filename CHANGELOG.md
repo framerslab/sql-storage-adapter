@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.7.5] - 2026-10-16
 
 ### Added
 - `SqliteFts4`, the full-text search `createStorageFeatures` gives sql.js and the IndexedDB adapter.
