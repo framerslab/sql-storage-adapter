@@ -1,6 +1,6 @@
 {
   "name": "@framers/sql-storage-adapter",
-  "version": "0.7.6",
+  "version": "0.7.7",
   "description": "Robust cross-platform SQL storage abstraction with automatic fallbacks and runtime detection",
   "type": "module",
   "main": "dist/cjs/index.js",
