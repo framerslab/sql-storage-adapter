@@ -1,3 +1,24 @@
+## [0.7.15] - 2026-10-17
+
+### Added
+- `PostgresExporterOptions`, the second argument of `new PostgresExporter(connectionString, { schema })`: `schema` exports one schema alone, by its exact name (`pg_dump --schema`). It is exported from the root and `./core`.
+- `new PostgresExporter(connectionString)` also takes a function that gives the connection string when an export runs.
+- `migrateIndexedDbKeyValue({ source, adapter, into })` in `./kv` (#63) moves one namespace of an old IndexedDB key-value store, the one `openIndexedDbStore` opens, into a `KeyValueStore` over an adapter, behind a marker (`MIGRATION_MARKER`), with the old store's writers locked out by the database's version. It answers `migrated`, `already`, `none` or `blocked`, resumes from the committed side after a reload, copies once when two moves run at once, and refuses a store that keeps nothing past the page.
+
+### Changed
+- `PostgresExporter` reads a `postgres://` or `postgresql://` connection string as libpq reads it, so the password reaches `pg_dump` through `PGPASSWORD`, off its command line, in every form libpq takes: an empty host (`postgresql://app:pw@/app?host=/var/run/postgresql`), several hosts, a `#` or `?` in the password, and a `password` parameter, which libpq takes over the user part's password. 0.7.12 read the string with the WHATWG URL parser, which refuses the first three, so the export threw, and it left a `password` parameter on the command line. The scheme is read in any case, as pg reads it, and handed to `pg_dump` in lower case, the only case libpq reads.
+- A failed `pg_dump` rejects with `pg_dump`'s own words and its exit code, never with the command line, which can hold a password. A missing `pg_dump` says to install the PostgreSQL client tools, and a dump larger than 256 MiB from `exportToBytes()` says to use `exportToFile()`.
+
+### Fixed
+- `createStorageFeatures(adapter).exporter` on a segmented PostgreSQL adapter dumps the segment's schema alone. It dumped every schema of the database: the other segments' tables and the host's in `public`.
+- `createStorageFeatures(adapter).exporter` on an adapter made with a pool of the caller's reaches the database the pool was made for, through the settings a `pg` `Pool` keeps as its `options`. It had no connection string, so both export methods always threw. A pool whose settings name no database says so.
+- `createStorageFeatures(adapter).exporter` names the PostgreSQL adapter's database when an export runs, from the pool the adapter runs on. An adapter given its connection string at `open()` had none to export with, and one opened on another connection string than its options held exported the database of its options.
+- The exporter of a PostgreSQL adapter or pool whose `host` is a Unix-socket directory (`/var/run/postgresql`) reaches the database through it: the path went into the connection string unencoded, where libpq read it as the database name. A password given with no user name reaches `pg_dump` too.
+- A segmented PostgreSQL adapter's `open()` fails when the segment is not the current schema of its first connection, and says what to grant. PostgreSQL leaves a schema the role has no `USAGE` privilege on out of the `search_path` without a word, so on an existing schema another role made, the segment's statements read and created tables in `public`. A pooler that drops startup options did the same.
+- `resolveStorageAdapter()` and `createDatabase()` refuse a segment name in `postgres`, `indexedDb` or `capacitor` that cannot be a segment before any adapter is tried, as they refuse their own. A candidate whose options name no segment, tried after a candidate whose options named one, opens in that segment: without `strict`, an unreachable PostgreSQL with `postgres.segment` fell through to better-sqlite3 on the shared file, outside the segment.
+- IndexedDB adapter: a PRAGMA through `all()` or `get()` that sets `user_version`, `application_id`, `schema_version`, `page_size`, `auto_vacuum` or `encoding`, or runs `incremental_vacuum` or `optimize`, is saved. SQLite's `total_changes()` counts no PRAGMA, so `get('PRAGMA user_version = 3')` was stored neither with `durability: 'commit'` nor by `flush()` or `close()`. PRAGMA reads and connection settings still write nothing.
+- `createSqlKeyValueStore()` refuses a `Proxy` with a `DataCloneError`, as the structured clone and IndexedDB's put do. A proxy reads as the object it wraps to every check but the runtime's own `structuredClone`, which now runs first, so `set()` stored `new Proxy({ x: 1 }, {})` as `{ x: 1 }`.
+
 ## [0.7.14] - 2026-10-17
 
 ### Fixed

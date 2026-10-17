@@ -41,6 +41,19 @@ const storedLabels = async (dbName: string): Promise<string[] | null> => {
   }
 };
 
+/** A PRAGMA's value in the stored image, or null when nothing is stored yet. */
+const storedPragma = async (dbName: string, name: string): Promise<unknown> => {
+  const image = await readStoredImage(dbName);
+  if (!image) return null;
+  const SQL = await initSqlJs();
+  const db = new SQL.Database(image);
+  try {
+    return db.exec(`PRAGMA ${name}`)[0]?.values?.[0]?.[0] ?? null;
+  } finally {
+    db.close();
+  }
+};
+
 /** A promise and the function that settles it. */
 const deferred = () => {
   let resolve!: () => void;
@@ -118,6 +131,41 @@ describe('IndexedDbAdapter durability', () => {
 
       expect(rows).toEqual([{ id: 1 }]);
       expect(await storedLabels('commit-returning')).toEqual(['returned']);
+    });
+
+    // SQLite's change counter, total_changes(), counts no PRAGMA: an assignment
+    // to a header field changes the image all the same.
+    it('stores PRAGMA user_version and application_id set through get() and all() before they resolve', async () => {
+      const adapter = await openWithItems('commit-pragma-header');
+      expect(await storedPragma('commit-pragma-header', 'user_version')).toBe(0);
+
+      await adapter.get('PRAGMA user_version = 3');
+      expect(await storedPragma('commit-pragma-header', 'user_version')).toBe(3);
+
+      await adapter.all('PRAGMA main.application_id = 42');
+      expect(await storedPragma('commit-pragma-header', 'application_id')).toBe(42);
+
+      await adapter.get('PRAGMA user_version(4)');
+      expect(await storedPragma('commit-pragma-header', 'user_version')).toBe(4);
+    });
+
+    it('writes nothing to IndexedDB for PRAGMA reads and connection settings through get() and all()', async () => {
+      const adapter = await openWithItems('commit-pragma-reads');
+      const puts = vi.spyOn(IDBObjectStore.prototype, 'put');
+      try {
+        expect((await adapter.all<{ name: string }>('PRAGMA table_info(items)')).map((column) => column.name)).toEqual([
+          'id',
+          'label',
+        ]);
+        await adapter.all('PRAGMA index_list(items)');
+        expect(await adapter.get('PRAGMA user_version')).toEqual({ user_version: 0 });
+        await adapter.get('PRAGMA foreign_keys = ON');
+        await adapter.get('PRAGMA cache_size = 500');
+
+        expect(puts).not.toHaveBeenCalled();
+      } finally {
+        puts.mockRestore();
+      }
     });
 
     it('stores a transaction before transaction() resolves, and nothing of one that rolls back', async () => {
@@ -263,6 +311,18 @@ describe('IndexedDbAdapter durability', () => {
 
       expect(await storedLabels('interval-returning')).toEqual(['returned']);
     });
+  });
+
+  // close() saves only what is unsaved. A PRAGMA user_version set through get()
+  // after everything else was stored must still reach IndexedDB.
+  it('keeps PRAGMA user_version set through get() across close() and open()', async () => {
+    const adapter = await openWithItems('interval-pragma', 'interval');
+    await adapter.flush();
+    await adapter.get('PRAGMA user_version = 7');
+    await adapter.close();
+
+    const reopened = await openAdapter('interval-pragma', 'interval');
+    expect(await reopened.get('PRAGMA user_version')).toEqual({ user_version: 7 });
   });
 
   describe('flush()', () => {
