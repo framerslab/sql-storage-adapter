@@ -7,14 +7,17 @@
  * it keeps alone with their reasons. Every operation runs under the tab lock, on a freshly reloaded image, in one
  * transaction of the adapter, which a durable adapter has written before it resolves; a stale image is reloaded and the
  * operation run once more, and a failed one reloads the stored image before its error leaves the lock, so a commit
- * IndexedDB refused is never stored by a later save. The lock is the client's own, never the adapter's.
+ * IndexedDB refused is never stored by the client's next operation. Under `crossTab`, open the adapter with
+ * `rollbackRefusedSaves` too, so a statement another part of the page queued on the adapter behind the refused save
+ * stores nothing of it either. The lock is the client's own, never the adapter's.
  *
  * A save commits the caller's data with its mutations and their journal records, or nothing. Only a pull acknowledges:
  * it applies a complete answer's patch and results, keeps the values of refused mutations, drops the pending ones the
  * server processed, replays the rest over the new canonical state and hands the caller what became visible, in one
- * transaction, only while the request's context and cookie still hold. A push moves no state but its own blocks. A
- * changed epoch keeps every downloaded row aside, takes a full snapshot, and pushes again from the journal every issued
- * mutation the restored server lacks, with its id; a journal with a hole retires the client.
+ * transaction, only while the request's context and cookie still hold. A push acknowledges nothing: it records only
+ * that its sends stopped, and hands a changed epoch, a gone group or a gap to the recovery, the leave or the sequence
+ * repair. A changed epoch keeps every downloaded row aside, takes a full snapshot, and pushes again from the journal
+ * every issued mutation the restored server lacks, with its id; a journal with a hole retires the client.
  */
 import type { StorageAdapter } from '../../../core/contracts';
 import { nextCounter, readCounter, writeCounter } from './counter';
@@ -326,7 +329,7 @@ export class MutationClient {
     });
   }
 
-  /** Sends the pending mutations in id order; success schedules a pull and acknowledges nothing. */
+  /** Sends the pending mutations in id order. A sent push acknowledges nothing: the pull after it does. */
   async push(): Promise<SyncOutcome> {
     const work = await this.locked(async (trx, m) => {
       const context = contextOf(m);
@@ -604,8 +607,9 @@ export class MutationClient {
 
   /**
    * Settles the kept rows against the canonical state: a readable row with the same value releases its kept row; a
-   * different readable value marks the kept row as differing, at the same id, and it stays shown; a tombstone removes an
-   * unchanged downloaded row and marks an unreadable one removed; an unreadable or absent row leaves it as it is.
+   * different readable value marks a row kept across a restore or kept unreadable as differing, at the same id, and it
+   * stays shown; a tombstone releases a row kept across a restore (its downloaded value, unchanged here) and marks an
+   * unreadable or differing one removed; an unreadable or absent row leaves it as it is.
    */
   private async reconcileKept(trx: StorageAdapter): Promise<void> {
     const canonical = await this.canonical(trx);
