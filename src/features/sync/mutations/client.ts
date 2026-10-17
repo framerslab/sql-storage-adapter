@@ -132,6 +132,43 @@ export class DeletesChanged extends Error {
   }
 }
 
+/** A removal asked of a joined client that did not begin one. */
+export class RemovalNotStarted extends Error {
+  constructor() {
+    super('a removal begins with beginRemoval while sync is on');
+    this.name = 'RemovalNotStarted';
+  }
+}
+
+/**
+ * A removal that cannot run on the confirmation it was given: this browser changed after the check (a save that issued a
+ * mutation, an off learned at a pull, a retirement), the check could not run (a mutation pending, a recovery open, sends
+ * stopped), or no check was made. Check again and ask again.
+ */
+export class RemovalInvalidated extends Error {
+  constructor(readonly reason: 'changed' | 'unchecked' | 'pending' | 'recovering' | 'sends_blocked') {
+    super(
+      reason === 'changed'
+        ? 'this browser changed after the removal was confirmed'
+        : reason === 'unchecked'
+          ? 'a removal while joined needs the stamp of the check the person confirmed'
+          : `the backed-up check cannot stand while ${reason === 'pending' ? 'a mutation is pending' : reason === 'recovering' ? 'a recovery is open' : 'sends are stopped'}`,
+    );
+    this.name = 'RemovalInvalidated';
+  }
+}
+
+/** What the backed-up check answers. */
+export interface BackupCheck {
+  /** False when the check could not run: not joined, recovering, sends stopped, or a mutation pending. */
+  checked: boolean;
+  reason: 'not_joined' | 'recovering' | 'sends_blocked' | 'pending' | null;
+  /** The blocks no acknowledged readable account copy holds (all of them when the check could not run). */
+  unbacked: Array<{ id: string | null; value: string }>;
+  /** What a removal must present: the membership, the counters and the kept rows as they were checked. */
+  stamp: string;
+}
+
 /** The client's parts. */
 export interface MutationClientOptions {
   adapter: StorageAdapter;
@@ -490,6 +527,137 @@ export class MutationClient {
       await trx.run(`UPDATE ${this.p}pending SET size_error = 0 WHERE scope = ?`, [this.scope]);
       await this.saveMembership(trx, { ...m, sends: 'open' });
     });
+  }
+
+  /**
+   * Starts a removal: every save is refused with `RemovalInProgress` until it finishes or is cancelled. A caller
+   * begins it before the backed-up check, so nothing a save writes changes between the check and the removal.
+   */
+  async beginRemoval(): Promise<void> {
+    await this.locked(async (trx, m) => {
+      await this.saveMembership(trx, { ...m, removing: true });
+    });
+  }
+
+  /** Cancels a removal; saves go on. */
+  async cancelRemoval(): Promise<void> {
+    await this.locked(async (trx, m) => {
+      await this.saveMembership(trx, { ...m, removing: false });
+    });
+  }
+
+  /**
+   * Whether `blocks` are backed by the account: checked only while joined, with nothing pending, no recovery open and
+   * sends open; a block is backed when a readable canonical row of its id holds exactly its text and no kept row of
+   * that id exists. A block with no id is never backed.
+   */
+  async backedUp(blocks: ReadonlyArray<{ id: string | null; value: string }>): Promise<BackupCheck> {
+    return this.locked(async (trx, m): Promise<BackupCheck> => {
+      const stamp = await this.stampOf(trx, m);
+      const all = blocks.map((block) => ({ id: block.id, value: block.value }));
+      if (m.state !== 'joined') return { checked: false, reason: 'not_joined', unbacked: all, stamp };
+      if (m.recovering) return { checked: false, reason: 'recovering', unbacked: all, stamp };
+      if (m.sends !== 'open') return { checked: false, reason: 'sends_blocked', unbacked: all, stamp };
+      if ((await this.pendingRows(trx)).length > 0) return { checked: false, reason: 'pending', unbacked: all, stamp };
+      const canonical = await this.canonical(trx);
+      const kept = await this.keptRows(trx);
+      const unbacked = all.filter((block) => {
+        if (block.id === null || kept.has(block.id)) return true;
+        const row = canonical.get(block.id);
+        return row === undefined || row.state !== 'live' || row.value !== block.value;
+      });
+      return { checked: true, reason: null, unbacked, stamp };
+    }, false);
+  }
+
+  /**
+   * Removes every sync record of this scope and runs `write`, the caller's removal of its own data, in the same
+   * transaction. A stamp given is compared whatever the state, so a confirmation is void once an off learned at a pull,
+   * a retirement, a pull, a push or a save that issued a mutation changed this client's records. The stamp reads the
+   * client's own records alone, never the caller's data: a save that issues no mutation (a block with no id, any block
+   * while not joined) leaves it as it was. So a caller begins the removal before its check, from when every save is
+   * refused, and a caller whose data something besides `save` writes compares that data itself. While joined it runs
+   * only inside a removal, with the stamp of a check that ran (nothing pending, no recovery open, sends open); it leaves
+   * a declined choice for the group with a new activation, and no row of the account changes.
+   */
+  async removeAll(write: (trx: StorageAdapter) => Promise<void>, stamp?: string): Promise<void> {
+    await this.locked(async (trx, m) => {
+      if (stamp !== undefined && stamp !== (await this.stampOf(trx, m))) throw new RemovalInvalidated('changed');
+      if (m.state === 'joined') {
+        if (!m.removing) throw new RemovalNotStarted();
+        if (stamp === undefined) throw new RemovalInvalidated('unchecked');
+        if (m.recovering) throw new RemovalInvalidated('recovering');
+        if (m.sends !== 'open') throw new RemovalInvalidated('sends_blocked');
+        if ((await this.pendingRows(trx)).length > 0) throw new RemovalInvalidated('pending');
+      }
+      for (const table of ['rows', 'base', 'pending', 'journal', 'results', 'kept']) await trx.run(`DELETE FROM ${this.p}${table} WHERE scope = ?`, [this.scope]);
+      const declinedGroup = m.state === 'joined' ? m.group : m.declinedGroup;
+      await this.saveMembership(trx, {
+        ...m,
+        state: declinedGroup === null ? 'off' : 'declined',
+        group: null,
+        clientId: null,
+        epoch: null,
+        cookie: null,
+        nextMutationId: 1,
+        sends: 'open',
+        recovering: false,
+        declinedGroup,
+        removing: false,
+        activation: this.randomId(),
+      });
+      await write(trx);
+    });
+  }
+
+  /** Issues a repair for every kept unreadable row the account still holds unreadable at the kept revision. */
+  async repairUnreadable(): Promise<number> {
+    return this.locked(async (trx, m) => {
+      if (m.state !== 'joined' || m.removing) return 0;
+      const canonical = await this.canonical(trx);
+      const touched = new Set((await this.pendingRows(trx)).map((row) => row.mutation.args.id));
+      let state = m;
+      let issued = 0;
+      for (const row of (await this.keptRows(trx)).values()) {
+        if (row.reason !== 'unreadable' || row.revision === null || touched.has(row.id)) continue;
+        const held = canonical.get(row.id);
+        if (held === undefined || held.state !== 'unreadable' || held.revision.client !== row.revision.client || held.revision.mutation !== row.revision.mutation) continue;
+        state = await this.issue(trx, state, { name: 'repair', args: { id: row.id, expected: row.revision, value: row.value } });
+        issued += 1;
+      }
+      if (issued > 0) await this.saveMembership(trx, state);
+      return issued;
+    });
+  }
+
+  /**
+   * Puts a kept row back into the account with an explicit create under its id (`too_long`, `full`, `recovery` and
+   * `differs` rows); false when it cannot be. A `removed` row is never put back here: its id is a tombstone the server
+   * refuses for good, so its return is a separate explicit save of a new row under a new id, the caller's, with the kept
+   * value; nothing here creates or re-stamps it. A recovery row whose id the restored server tombstoned comes back from
+   * its create refused `removed` and is kept as `removed`.
+   */
+  async restoreKept(id: string): Promise<boolean> {
+    return this.locked(async (trx, m) => {
+      if (m.state !== 'joined' || m.removing) return false;
+      const row = (await this.keptRows(trx)).get(id);
+      if (row === undefined || row.reason === 'unreadable' || row.reason === 'removed' || row.value.length > this.options.policy.maxUnits) return false;
+      const state = await this.issue(trx, m, { name: 'create', args: { id: row.id, value: row.value } });
+      await this.unkeep(trx, row.id);
+      await this.saveMembership(trx, state);
+      return true;
+    });
+  }
+
+  /**
+   * The removal's stamp: the state, the activation, the group, the epoch, the cookie, the counters and the kept rows, the
+   * client's own records alone; a write of the caller's data that issues no mutation does not move it.
+   */
+  private async stampOf(trx: StorageAdapter, m: Membership): Promise<string> {
+    const pending = (await this.pendingRows(trx)).length;
+    const kept = [...(await this.keptRows(trx)).values()].map((row) => `${row.id}:${row.reason}:${row.value.length}`).join(',');
+    const rows = await trx.get<{ n: unknown; v: unknown }>(`SELECT COUNT(*) AS n, COALESCE(MAX(version), 0) AS v FROM ${this.p}rows WHERE scope = ?`, [this.scope]);
+    return [m.state, m.activation, m.group ?? '', m.epoch ?? '', m.cookie ?? '', m.nextMutationId, pending, readCounter(rows?.n ?? 0), readCounter(rows?.v ?? 0), kept].join('|');
   }
 
   private async sendBatch(context: RequestContext, batch: MutationRecord[]): Promise<SyncOutcome> {
