@@ -133,7 +133,7 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('the 
     expect(await flakyServer.push(w.context(), next)).toEqual({ kind: 'ok', processed: 1 });
   });
 
-  it('refuses a create of a deleted id any time later: a tombstone lasts the group's life', async () => {
+  it("refuses a create of a deleted id any time later: a tombstone lasts the group's life", async () => {
     let now = new Date('2026-10-15T10:00:00Z');
     const timed = await world(backend, { clock: () => now });
     try {
