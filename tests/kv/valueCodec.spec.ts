@@ -147,6 +147,11 @@ describe('the SQL key-value store value text', () => {
     ['a WeakMap', new WeakMap()],
     ['a WeakSet', new WeakSet()],
     ['a promise', Promise.resolve(1)],
+    // A proxy answers every check but the structured clone's as the object it
+    // wraps would: an array proxy is an array to Array.isArray.
+    ['a proxy', new Proxy({ x: 1 }, {})],
+    ['a proxy of an array', new Proxy([1, 2], {})],
+    ['an object holding a proxy', { inner: new Proxy({ x: 1 }, {}) }],
   ])('refuses %s, as structuredClone and IndexedDB do', (_name, value) => {
     expect(() => structuredClone(value)).toThrow();
     let refused: unknown;

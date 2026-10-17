@@ -345,6 +345,77 @@ describe('a segment through createDatabase and the resolver', () => {
     );
   });
 
+  it('rejects a segment name it cannot use in postgres, indexedDb or capacitor before it tries any adapter', async () => {
+    const dir = tempDir();
+    const filePath = path.join(dir, 'app.sqlite3');
+    for (const nested of [
+      { postgres: { connectionString: 'postgresql://nobody@127.0.0.1:1/none', segment: 'Bad Name' } },
+      { indexedDb: { segment: 'Bad Name' } },
+      { capacitor: { segment: 'Bad Name' } },
+    ]) {
+      await expect(resolveStorageAdapter({ ...nested, priority: ['sqljs'], filePath, quiet: true })).rejects.toThrow(
+        /segment/i,
+      );
+    }
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  // A candidate that asked for a segment and failed leaves the ones after it
+  // that have no segment of their own: without strict they open in its
+  // segment, never in the database every user of the file shares.
+  it('opens better-sqlite3 in the segment a postgres candidate that failed asked for', async () => {
+    const dir = tempDir();
+    const filePath = path.join(dir, 'app.sqlite3');
+    const adapter = await resolveStorageAdapter({
+      postgres: { connectionString: 'postgresql://nobody@127.0.0.1:1/none', segment: 'agentos', connectionTimeoutMillis: 2_000 },
+      filePath,
+      quiet: true,
+    });
+    adapters.push(adapter);
+
+    expect(adapter.kind).toBe('better-sqlite3');
+    await adapter.exec('CREATE TABLE items (id INTEGER PRIMARY KEY)');
+    expect(fs.existsSync(path.join(dir, 'app-agentos.sqlite3'))).toBe(true);
+    expect(fs.existsSync(filePath)).toBe(false);
+  });
+
+  it('opens sql.js in the segment an IndexedDB candidate that failed asked for', async () => {
+    // Node has no indexedDB, so the IndexedDB candidate fails.
+    const dir = tempDir();
+    const filePath = path.join(dir, 'app.sqlite3');
+    const adapter = await resolveStorageAdapter({
+      priority: ['indexeddb', 'sqljs'],
+      indexedDb: { segment: 'agentos' },
+      filePath,
+      quiet: true,
+    });
+    adapters.push(adapter);
+
+    expect(adapter.kind).toBe('sqljs');
+    await adapter.exec('CREATE TABLE items (id INTEGER PRIMARY KEY)');
+    await adapter.run('INSERT INTO items (id) VALUES (1)');
+    await adapter.close();
+    expect(fs.existsSync(path.join(dir, 'app-agentos.sqlite3'))).toBe(true);
+    expect(fs.existsSync(filePath)).toBe(false);
+  });
+
+  // Only a candidate tried after one that asked for a segment takes it: the
+  // indexedDb options of a host's shared configuration do not put a segment on
+  // the PostgreSQL pool tried before them.
+  it('opens a pool of the caller tried first without the segment another backend asks for', async () => {
+    const pool = {
+      query: async () => ({ rows: [] }),
+      connect: async () => {
+        throw new Error('not used: the adapter takes up a pool of the caller without connecting');
+      },
+      end: async () => undefined,
+    };
+    const adapter = await resolveStorageAdapter({ postgres: { pool }, indexedDb: { segment: 'agentos' }, quiet: true });
+    adapters.push(adapter);
+
+    expect(adapter.kind).toBe('postgres');
+  });
+
   // The Postgres adapter refuses a segment on a pool its caller made. Without
   // strict, the resolver falls through from a postgres candidate that fails,
   // so the pair would open a local SQLite file in the segment instead.

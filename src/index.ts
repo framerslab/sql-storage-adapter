@@ -48,7 +48,7 @@ export { PostgresFts } from './fts/PostgresFts';
 export { NodeBlobCodec } from './codecs/NodeBlobCodec';
 export { BrowserBlobCodec } from './codecs/BrowserBlobCodec';
 export { SqliteFileExporter } from './exporters/SqliteFileExporter';
-export { PostgresExporter } from './exporters/PostgresExporter';
+export { PostgresExporter, type PostgresExporterOptions } from './exporters/PostgresExporter';
 export { createStorageFeatures } from './core/contracts/features';
 export { isUniqueViolation } from './shared/errors';
 export { withHooks } from './shared/withHooks';

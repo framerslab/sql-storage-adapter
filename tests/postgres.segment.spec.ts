@@ -310,6 +310,58 @@ describe.skipIf(!POSTGRES_TEST_URL)('PostgreSQL segments', () => {
     }
   });
 
+  // PostgreSQL leaves out of the search_path, without a word, a schema the role
+  // has no USAGE privilege on. A segment whose schema another role made would
+  // then run its statements in public: open() refuses it instead.
+  describe('on a schema another role made', () => {
+    const role = unique('seg_role');
+    // A role made on CI's own service for these specs, and dropped after them.
+    const rolePassword = 'segment-role';
+    let roleUrl: string;
+
+    const roleAdapter = (segment: string): StorageAdapter => {
+      schemas.push(segment);
+      const adapter = createPostgresAdapter({ connectionString: roleUrl, segment });
+      opened.push(adapter);
+      return adapter;
+    };
+
+    beforeAll(async () => {
+      await admin.exec(`CREATE ROLE ${role} LOGIN PASSWORD '${rolePassword}'`);
+      const parsed = new URL(url);
+      parsed.username = role;
+      parsed.password = rolePassword;
+      roleUrl = parsed.toString();
+    });
+
+    afterAll(async () => {
+      // Drops what the role owns here and takes back what it was granted, so the role can go.
+      await admin.exec(`DROP OWNED BY ${role}`).catch(() => undefined);
+      await admin.exec(`DROP ROLE IF EXISTS ${role}`);
+    });
+
+    it('refuses to open on an existing schema the role has no USAGE on, and holds no pool', async () => {
+      const segment = unique('seg');
+      await admin.exec(`CREATE SCHEMA ${segment}`);
+      const adapter = roleAdapter(segment);
+
+      await expect(adapter.open()).rejects.toThrow(/is not the current schema/);
+      expect((adapter as PostgresAdapter).getPool()).toBeNull();
+    });
+
+    it('opens on that schema once the role has USAGE and CREATE on it, and creates its tables there', async () => {
+      const segment = unique('seg');
+      await admin.exec(`CREATE SCHEMA ${segment}`);
+      await admin.exec(`GRANT USAGE, CREATE ON SCHEMA ${segment} TO ${role}`);
+      const adapter = roleAdapter(segment);
+      await adapter.open();
+
+      expect(await currentSchema(adapter)).toBe(segment);
+      await adapter.exec('CREATE TABLE role_items (id INTEGER PRIMARY KEY)');
+      expect(await schemasHolding('role_items', segment)).toEqual([segment]);
+    });
+  });
+
   it('starts every connection of its pool in the segment, a replaced connection too', async () => {
     const segment = unique('seg');
     const applicationName = unique('app');
