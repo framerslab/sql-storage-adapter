@@ -16,6 +16,7 @@ const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'u
 import type { StorageAdapter, StorageOpenOptions, StorageParameters, StorageRunResult, StorageCapability, BatchOperation, BatchResult } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
 import { integersAsBigInt, toSqliteStatement } from '../shared/sqlPlaceholders';
+import { checkFunctionName, type SqlFunction, type SqlFunctionOptions } from '../shared/sqlFunctions';
 import {
   createSerializedTransactionRunner,
   createSharedConnectionTransactionAdapter,
@@ -386,6 +387,15 @@ export class BetterSqliteAdapter implements StorageAdapter {
    */
   public async batch(operations: BatchOperation[]): Promise<BatchResult> {
     return whenAdmitted(this.gate, () => this.batchNow(operations));
+  }
+
+  /**
+   * Makes a JavaScript function callable from SQL on this connection under
+   * `name`. The adapter must be open.
+   */
+  public registerFunction(name: string, fn: SqlFunction, options: SqlFunctionOptions = {}): void {
+    this.ensureOpen();
+    this.db!.function(checkFunctionName(name), { deterministic: options.deterministic ?? false }, fn);
   }
 
   private batchNow(operations: BatchOperation[]): BatchResult {

@@ -61,16 +61,15 @@ The SQL Storage Adapter provides a single, ergonomic interface over SQLite (nati
 ## Installation
 
 ```bash
-# Core package
+# Core package: brings pg (PostgreSQL) and sql.js (WASM SQLite, and IndexedDB)
 npm install @framers/sql-storage-adapter
 
-# Install only the adapters you plan to use
+# Install only the other engines you plan to use
 npm install better-sqlite3            # Native SQLite for Node/Electron
-npm install pg                        # PostgreSQL
 npm install @capacitor-community/sqlite  # Capacitor / mobile
-npm install sql.js                    # WASM SQLite (auto-included for IndexedDB)
-# IndexedDB uses sql.js (no extra install needed)
 ```
+
+`pg` and `sql.js` are dependencies of the package, listed once each, so they install with it. `better-sqlite3`, `@capacitor-community/sqlite`, `electron` and `@aws-sdk/client-s3` are optional peers: install the ones you use.
 
 > Windows users: ensure the Visual Studio Build Tools (C++ workload) are installed before adding `better-sqlite3`. On Linux, install `python3`, `build-essential`, and `libssl-dev` prior to `npm install`.
 
@@ -293,6 +292,39 @@ The IndexedDB, Capacitor and better-sqlite3 adapters run every transaction on on
 
 The PostgreSQL adapter runs each transaction on its own pooled connection, so transactions run side by side. When the connection breaks during a transaction and its ROLLBACK fails too, `transaction()` still throws the transaction's own error (the callback's, or COMMIT's), with the ROLLBACK error on it as a non-enumerable `rollbackError` property. The broken connection is closed, not returned to the pool. A connection the server closes while a callback holds it, between statements, does not end the process. Once a transaction has ended, its handle runs on the pool, as the adapter's own statements do, and its `transaction()` begins a new transaction.
 
+### Batches
+
+`batch(operations)` runs its operations in one transaction and goes on past one that fails, on better-sqlite3 and PostgreSQL (`capabilities.has('batch')`):
+
+```typescript
+const result = await db.batch([
+  { statement: 'INSERT INTO tags (id, name) VALUES (?, ?)', parameters: [1, 'red'] },
+  { statement: 'INSERT INTO tags (id, name) VALUES (?, ?)', parameters: [1, 'red again'] }, // the id is taken
+  { statement: 'INSERT INTO tags (id, name) VALUES (?, ?)', parameters: [2, 'blue'] },
+]);
+// { successful: 2, failed: 1, results: [...], errors: [{ index: 1, error }] }
+```
+
+- The operations that succeed commit together.
+- An error aborts a PostgreSQL transaction until it rolls back to a savepoint ([Transactions](https://www.postgresql.org/docs/current/tutorial-transactions.html)), so the PostgreSQL adapter runs each operation under a savepoint and rolls back to it when the operation fails ([ROLLBACK TO SAVEPOINT](https://www.postgresql.org/docs/current/sql-rollback-to.html)).
+- When the transaction itself fails (its BEGIN or COMMIT), nothing commits, and the result reports every operation failed, with the error at index -1.
+- A transaction handle's `batch()` runs in that transaction, and its operations commit or roll back with it. On a held PostgreSQL connection (`withConnection`), `batch()` runs in a transaction of its own.
+
+### SQL functions
+
+`registerFunction(name, fn, { deterministic })` on the better-sqlite3, sql.js and IndexedDB adapters makes a JavaScript function callable from SQL:
+
+```typescript
+db.registerFunction('slugify', (title) => String(title).toLowerCase().replace(/[^a-z0-9]+/g, '-'), { deterministic: true });
+const rows = await db.all('SELECT slugify(title) AS slug FROM posts');
+```
+
+- The name must be an identifier: letters, digits and underscores.
+- The function takes as many arguments as it declares (`fn.length`), on both engines, so a rest parameter declares none ([better-sqlite3](https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#functionname-options-function---this), [sql.js](https://github.com/sql-js/sql.js/blob/v1.15.0/src/api.js#L1282)).
+- sql.js drops its functions when `export()` closes and reopens the connection ([source](https://github.com/sql-js/sql.js/blob/v1.15.0/src/api.js#L1115)): a save to a file, an IndexedDB save, `exportDatabase()` and `importDatabase()`. The sql.js and IndexedDB adapters register them again after each reopening.
+- `deterministic: true` tells better-sqlite3 that the function returns the same result for the same arguments, which SQLite requires of a function in an expression index, a partial index's WHERE clause or a generated column ([SQLite](https://www.sqlite.org/deterministic.html)). sql.js registers every function as non-deterministic.
+- The better-sqlite3 adapter must be open; the sql.js and IndexedDB adapters keep a function registered before `open()` and register it when they open.
+
 ### Segments
 
 A segment keeps one user's tables apart from another's in a database they share: AgentOS's tables beside an app's, in one PostgreSQL database or one browser.
@@ -385,6 +417,72 @@ const status = await schemaMigrationStatus(db, migrations);            // { appl
 - **Locking.** On PostgreSQL each file's transaction takes `pg_advisory_xact_lock(lockKey)` and checks the ledger again, so two runners at once apply each file once. `lockKey` is an integer, or text hashed with `hashtext()`. On SQLite the file's write transaction is the lock.
 - **Outside a transaction.** A file whose first line is `-- outside transaction` (`outsideTransactionMarker`) runs outside a transaction, for `CREATE INDEX CONCURRENTLY` or `VACUUM`. On PostgreSQL it runs under the session lock on one held connection (`withConnection`).
 - **Unknown rows.** `unknown: 'ignore'` lets a run go on past ledger rows the list lacks.
+
+`ensureColumnExists(db, table, column, definition)` adds a column when the table lacks it, on PostgreSQL and SQLite, and resolves `true` when it added the column, `false` when the table had it:
+
+```typescript
+import { ensureColumnExists } from '@framers/sql-storage-adapter';
+
+await ensureColumnExists(db, 'notes', 'archived_at', 'TEXT');
+await ensureColumnExists(db, 'app.notes', 'pinned', 'BOOLEAN NOT NULL DEFAULT false'); // schema-qualified, PostgreSQL only
+```
+
+The table and column must be identifiers (letters, digits and underscores); the definition is SQL, written for the engine. PostgreSQL reads `information_schema.columns` and adds the column with `ADD COLUMN IF NOT EXISTS`; SQLite reads `pragma_table_info`. Names are matched as PostgreSQL folds unquoted names, in lower case.
+
+### Copying data between engines
+
+`migrateAdapter(source, target, options)` copies tables and rows from one adapter to another, on one engine or between SQLite and PostgreSQL. `exportData()` and `importData()` are its two halves, and `migrateAdapters()`, `cloneAdapter()` and `createBackup()` run on them.
+
+```typescript
+import { migrateAdapter } from '@framers/sql-storage-adapter';
+
+const sqlite = await createDatabase({ file: './app.db' });
+const postgres = await createDatabase({ url: process.env.DATABASE_URL });
+
+const result = await migrateAdapter(sqlite, postgres);
+// { success, tablesImported, rowsImported, errors?, warnings?, duration }
+```
+
+What the target table gets:
+
+| Source column | PostgreSQL target | SQLite target |
+|---|---|---|
+| SQLite `INTEGER PRIMARY KEY`, PostgreSQL identity or serial | `INTEGER GENERATED BY DEFAULT AS IDENTITY` (or `BIGINT` when copied ids exceed INTEGER) (a PostgreSQL identity keeps its type and `ALWAYS`) | `INTEGER PRIMARY KEY AUTOINCREMENT` |
+| integers | `INTEGER`, or `BIGINT` when a copied value is outside `INTEGER`'s range | `INTEGER` |
+| PostgreSQL `NUMERIC`, `DECIMAL` | exact source type | `TEXT` to preserve decimal precision |
+| `REAL`, `DOUBLE`, `FLOAT` | `DOUBLE PRECISION` | `REAL` |
+| `BOOLEAN` | `BOOLEAN` | `INTEGER` |
+| `DATETIME`, `TIMESTAMP` | `TIMESTAMPTZ` | `TEXT` |
+| `DATE`, `TIME` | `DATE`, `TIME` | `TEXT` |
+| `JSON`, arrays | `JSONB` | `TEXT` |
+| `BLOB` | `BYTEA` | `BLOB` |
+| text, `UUID`, others | `TEXT`, `UUID`, `NUMERIC` by SQLite's affinity rules | `TEXT` |
+
+- **SQLite foreign keys.** Imports suspend enforcement while loading, report `foreign_key_check` violations, and restore the original setting even on failure. Import outside an active transaction so SQLite can change enforcement.
+- **Same engine.** SQLite to SQLite runs the `CREATE TABLE` statement SQLite keeps for the table, so its keys, `AUTOINCREMENT`, constraints and generated columns come along. SQLite copies and SQL dumps also carry the AUTOINCREMENT high-water mark, including deleted ids and empty tables. PostgreSQL to PostgreSQL keeps each type as `format_type` names it (`character varying(20)`, `numeric(10,2)`, `integer[]`), and regenerates stored and PostgreSQL 18 virtual columns from their expressions. Virtual definitions require PostgreSQL 18 or later on the target.
+- **Keys and NOT NULL.** The primary key and NOT NULL carry over between engines, including exports by a PostgreSQL role with only SELECT permission. Other constraints and indexes do not; create them with your schema migrations.
+- **Array and numeric defaults.** PostgreSQL empty-array defaults become JSON `[]` on SQLite; other array defaults are omitted with a warning. PostgreSQL NUMERIC values and literal defaults become text so SQLite numeric affinity cannot round them. SQLite `strftime('%S','now')` keeps seconds within the minute; `%s` keeps epoch seconds.
+- **Defaults.** Compatible literals carry over; `true` and `false` become 1 and 0 on SQLite and for numeric PostgreSQL columns. Invalid or unrecognized SQLite calendar defaults are omitted with a warning, and the current-time defaults map to the target engine's (`CURRENT_TIMESTAMP` and `datetime('now')` to `CURRENT_TIMESTAMP` on PostgreSQL; `now()` to the ISO `strftime` on SQLite). A default with no form on the target engine is left off, and `warnings` names it.
+- **Ids.** Explicit id columns keep their values. SQLite FTS rowids are included so external-content indexes keep pointing to the same rows. Implicit rowids of ordinary tables are not preserved; use an explicit INTEGER PRIMARY KEY for stable references. On PostgreSQL each identity or serial column that took ids has its sequence moved past the largest one without lowering its existing allocation ([setval](https://www.postgresql.org/docs/current/functions-sequence.html)). A target table that already exists is written as it is, and an identity `GENERATED ALWAYS` takes the ids through `OVERRIDING SYSTEM VALUE` ([INSERT](https://www.postgresql.org/docs/current/sql-insert.html)).
+- **Sequence state.** Run imports and sequence synchronization while writers are stopped. PostgreSQL synchronization may leave gaps; custom descending or cycling sequences are not preserved. SQLite AUTOINCREMENT high-water marks are restored for SQLite targets.
+- **Timestamps.** Text without a zone, as SQLite's `CURRENT_TIMESTAMP` writes it in UTC ([SQLite](https://www.sqlite.org/lang_createtable.html#dfltval)), goes into a `TIMESTAMPTZ` column as UTC, where PostgreSQL would read it in the session's time zone ([PostgreSQL](https://www.postgresql.org/docs/current/datatype-datetime.html)).
+- **Views.** Views explicitly named in `tables` are read in one query and imported as ordinary tables containing their current rows; view definitions are not recreated.
+- **SQL dumps.** PostgreSQL inserts use `OVERRIDING SYSTEM VALUE` for existing ALWAYS identities. `includeSchema: false` omits DDL while retaining type-aware literals, generated-column omission and sequence synchronization.
+- **JSON.** PostgreSQL JSON arrays, objects and scalars are encoded as JSON for imports and SQL dumps, including string, number and boolean scalars.
+- **Conflicts.** `onConflict: 'ignore'` and `'replace'` use `INSERT OR IGNORE` and `INSERT OR REPLACE` on SQLite, and `ON CONFLICT DO NOTHING` and `ON CONFLICT (primary key) DO UPDATE` on PostgreSQL. On PostgreSQL, replacement keeps an existing ALWAYS identity outside the key; new rows still take explicit identity values. `rowsImported` counts the rows written. Insert failures not handled by the SQL conflict clause are reported in `errors`, including under `ignore` and `replace`.
+- **Options.** `columnTypes: { 'events.at_ms': 'BIGINT' }` sets a column's type. `sourceDialect` names the source engine for an export made before `ExportedData.dialect` recorded it. Exports preserve PostgreSQL `DATE` and zone-less `TIMESTAMP` as local calendar text, so the day and clock time do not shift with the process time zone. Zoned timestamps keep their UTC instant.
+
+`syncIdentitySequence` is optional on `SqlDialect` so existing custom implementations remain compatible; call it conditionally. Built-in dialects implement it.
+
+The identity column the dialect writes refuses an id an insert gives, as PostgreSQL's `GENERATED ALWAYS` does. `autoIncrementPrimaryKey({ acceptExplicitIds: true })` writes one that takes it, and `syncIdentitySequence(table, column)` gives the statement that moves the sequence past the inserted ids (null on SQLite, which follows the largest id by itself):
+
+```typescript
+const d = createStorageFeatures(db).dialect;
+await db.exec(`CREATE TABLE tags (id ${d.autoIncrementPrimaryKey({ acceptExplicitIds: true })}, label TEXT)`);
+await db.run('INSERT INTO tags (id, label) VALUES (?, ?)', [41, 'imported']);
+const sync = d.syncIdentitySequence?.('tags', 'id') ?? null;
+if (sync) await db.get(sync);
+```
 
 ### Auth.js
 
@@ -533,11 +631,16 @@ await adapter.flush();                                              // stores ev
 - ✅ Several tabs on one database (`crossTab`)
 - ✅ A database of its own per segment (`segment`)
 
-**Durability.** With `durability: 'interval'`, the default, the auto-save tick stores the writes made since the last save every `saveIntervalMs`, and a write can be lost when the page goes before the next tick. With `durability: 'commit'`, `run()`, `exec()`, a write through `all()` or `get()` (`INSERT ... RETURNING`, or a PRAGMA that sets `user_version`, `application_id`, `schema_version`, `page_size`, `auto_vacuum` or `encoding`), `transaction()` and `importDatabase()` resolve once their write is in IndexedDB, committed there (the IndexedDB transaction's `complete` event, not the put request's success), and reject when IndexedDB refuses or aborts it; the write stays in the database and the next save stores it. Each save writes the whole database image, so batch many writes in one `transaction()`. While a transaction begun with `BEGIN` is open nothing can be saved: its statements resolve at once, and its rows are stored when its `COMMIT` resolves. `flush()` stores every write made so far in either mode: it waits for an open `transaction()`, and rejects while a transaction begun with `BEGIN` is open, which sql.js's export would end.
+**Durability.** With `durability: 'interval'`, the default, the auto-save tick stores the writes made since the last save every `saveIntervalMs`, and a write can be lost when the page goes before the next tick. With `durability: 'commit'`, `run()`, `exec()`, a write through `all()` or `get()` (`INSERT ... RETURNING`, or a PRAGMA that sets `user_version`, `application_id`, `schema_version`, `page_size`, `auto_vacuum` or `encoding`), `transaction()` and `importDatabase()` resolve once their write is in IndexedDB, committed there (the IndexedDB transaction's `complete` event, not the put request's success), and reject when IndexedDB refuses or aborts it; the write stays in the database and the next save stores it, unless `crossTab`'s `rollbackRefusedSaves` gives it up (below). Each save writes the whole database image, so batch many writes in one `transaction()`. While a transaction begun with `BEGIN` is open nothing can be saved: its statements resolve at once, and its rows are stored when its `COMMIT` resolves. `flush()` stores every write made so far in either mode: it waits for an open `transaction()`, and rejects while a transaction begun with `BEGIN` is open, which sql.js's export would end.
 
 **Several tabs.** Each tab holds the whole database in memory and writes it back whole, so without coordination the tab that saves last overwrites the other's writes. With `crossTab`, every statement and transaction runs under a [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) on the database, on the newest stored image (a tab reloads it when a version stamp stored beside the image says another tab has saved), and is stored before the lock is let go: `durability` is `'commit'` whatever it says, and a tab reads what another tab stored. A transaction holds the other tabs' statements until it commits or rolls back. A transaction begun with `BEGIN` through `run()` or `exec()` cannot be held across tabs: it is rolled back and refused, so use `transaction()`. Web Locks need a secure context and are in Chrome 69, Firefox 96 and Safari 15.4 and later (on WebKit the feature is on by default and off in Lockdown Mode). Where there are none, the version stamp alone keeps both tabs' writes: a statement that finds another tab saved first runs again on that tab's image, and a `transaction()` another tab saved over is refused with `IndexedDbConflictError`, storing nothing of it, for its caller to run again. The adapter says once when it runs without Web Locks. A tab running a version of this package before 0.7 writes no stamp, so a tab with `crossTab` does not see its saves.
 
 **When it saves:** every `saveIntervalMs`, the adapter writes the database image to IndexedDB if anything changed. It skips the tick while a transaction is open, its own or one begun with `BEGIN`, because sql.js's export closes and reopens the connection, which would end the transaction; the next tick saves it once it has committed. A save counts as done when IndexedDB commits it, not when the put request succeeds. A save that fails or aborts is reported once, and the next tick tries again. A write made while a save is in flight is saved by the next one. A transaction's commit marks its writes for saving, including writes made through `all()` or `get()` (`INSERT ... RETURNING`). `close()` rolls back a transaction still open and saves the committed state. `importDatabase()` saves the imported image before it resolves. `exportDatabase()` throws while a transaction is open.
+
+**Memory alone, and the stored image put back:**
+- `memoryOnly: true` keeps the database in memory alone, for a browser that refuses IndexedDB (a private window, a blocked storage setting), where `open()` would otherwise reject: IndexedDB is never opened, nothing is stored, and `capabilities` carries no `persistence`. `durability` reads `'interval'` and `crossTab` is off, since there is nothing to store or to share; `flush()` and `close()` store nothing, and `exportDatabase()` and `importDatabase()` work on the image in memory.
+- `reload()` puts the stored image in place of the one in memory, whatever the version stamp says, and resolves with whether anything changed: `true` when another connection stored a newer image since this one loaded or saved, or when this connection holds writes that are not stored (one IndexedDB refused, which a `durability: 'commit'` call reports by rejecting, or with `durability: 'interval'` one the auto-save has not stored yet), which are then gone; `false` when the memory image already is the stored one, and in memory-only mode. A caller whose commit was refused runs it before its next statement: the next save, under `crossTab` the next coordinated statement, would store the refused writes with its own. A connection without `crossTab` runs it to read what another connection stored; there, a `durability: 'commit'` write or a `flush()` still waiting for the save of a write it puts back rejects instead of resolving as stored. It waits for an open `transaction()` to end, holds statements while it runs, and refuses while a transaction begun with `BEGIN` is open.
+- `crossTab: { rollbackRefusedSaves: true }` gives refused writes up inside the lock. A statement already waiting on the lock when a refusal reaches its caller runs before anything the caller's `catch` does under the lock, and without this option it stores the refused writes with its own, a read included, so a `reload()` in that `catch` comes too late. With it, when IndexedDB refuses a save made under the coordination (a statement's, a transaction's, an import's or `close()`'s), the adapter reads the stored image back in place of the one in memory before the next coordinated call runs, and the call still rejects. When IndexedDB cannot be read back either, no save stores the refused writes, and the next statement or transaction reads the stored image before it runs, failing while it cannot.
 
 **Why IndexedDB Adapter vs sql.js Adapter?**
 
@@ -631,10 +734,17 @@ See [**guides/OPTIMIZATION_GUIDE.md**](./guides/OPTIMIZATION_GUIDE.md) for detai
 
 ## Lifecycle Hooks
 
-The package exports the `StorageHooks` types and the `combineHooks()` and `filterHooks()` helpers. `createDatabase()` takes no `hooks` option, and no adapter runs hooks: a host that wants them calls them around its own adapter calls.
+`createDatabase({ hooks })`, or `withHooks(adapter, hooks)` on any adapter, puts lifecycle hooks around each query, write, transaction and error.
+- A `before` hook returns the context, changed or not, to go on, or undefined to stop the call. A stopped `get` returns null, `all` an empty list, and `run` no changes.
+- `onAfterQuery` can replace the result.
+- `onError` returns the error to throw, or undefined to swallow it.
+- The statements inside a transaction pass through the hooks too, and `onAfterTransaction` sees `outcome: 'committed'` or `'rolled_back'`.
+- The adapter keeps its kind, its own methods and its class.
+
+`combineHooks()` and `filterHooks()` compose hook sets.
 
 ```typescript
-import { combineHooks, type StorageHooks } from '@framers/sql-storage-adapter';
+import { createDatabase, combineHooks, type StorageHooks } from '@framers/sql-storage-adapter';
 
 const myHooks: StorageHooks = {
   // Log all writes
@@ -660,8 +770,7 @@ const myHooks: StorageHooks = {
   }
 };
 
-// One StorageHooks object from several; the host calls its hooks itself
-const hooks = combineHooks(myHooks);
+const db = await createDatabase({ url: process.env.DATABASE_URL, strict: true, hooks: combineHooks(myHooks) });
 ```
 
 ### Available Hooks
@@ -675,6 +784,45 @@ const hooks = combineHooks(myHooks);
 | `onError` | On any error | Error transformation, alerting |
 
 See [**guides/OPTIMIZATION_GUIDE.md**](./guides/OPTIMIZATION_GUIDE.md) for complete configuration options.
+
+## Row-Change Events
+
+`withChangeEvents(adapter)` reports each write made through the adapter, on every engine:
+
+```typescript
+import { createDatabase, withChangeEvents } from '@framers/sql-storage-adapter';
+
+const db = withChangeEvents(await createDatabase());
+const stop = db.onChange((change) => cache.invalidate(change.table), { tables: ['notes'] });
+// change: { table: 'notes', operation: 'insert' | 'update' | 'delete', changes?, lastInsertRowid?, statement }
+
+await db.run('UPDATE notes SET title = ? WHERE id = ?', ['Plans', 7]); // reports { table: 'notes', operation: 'update', changes: 1 }
+stop();
+```
+
+- **What counts.** An INSERT (with `OR REPLACE`, `REPLACE` and upserts), UPDATE, DELETE or TRUNCATE, through `run()`, `batch()`, `get()`, `all()`, `exec()`, `transaction()` and, on PostgreSQL, `withConnection()`. A `WITH` clause before the statement and quoted or schema-qualified names are read as SQL reads them.
+- **When.** At once outside a transaction; when `transaction()` commits inside one; not at all when it rolls back.
+- **Counts.** `run()` and `batch()` give the engine's count and report only a statement that changed a row. `get()`, `all()` and `exec()` report the statement without a count.
+- **Scope.** Writes made through this adapter. Another adapter, another process, prepared statements, and a transaction begun with `BEGIN` through `run()` (reported as its statements run) are outside it.
+- **Listeners.** A listener that throws, or whose promise rejects, is logged through the host logger, and the write stands.
+
+On PostgreSQL, `listen()` and `notify()` carry notifications between sessions ([LISTEN](https://www.postgresql.org/docs/current/sql-listen.html), [NOTIFY](https://www.postgresql.org/docs/current/sql-notify.html)), and the dialect's `changeNotificationSql(table, channel)` installs a statement-level trigger that sends one for each write to the table, from any session:
+
+```typescript
+const db = new PostgresAdapter(process.env.DATABASE_URL);
+await db.open();
+for (const statement of createStorageFeatures(db).dialect.changeNotificationSql('runs', 'run_changes') ?? []) {
+  await db.exec(statement);
+}
+const stop = await db.listen('run_changes', (payload) => {
+  const { schema, table, operation } = JSON.parse(payload); // operation: 'insert' | 'update' | 'delete'
+});
+await db.notify('run_changes', 'any text under 8000 bytes');
+```
+
+- One connection of the pool is held while any channel has a handler. When the server ends it, the adapter listens again on a new one after 1 second, then 2, up to 30, and logs it; notifications sent meanwhile are lost, since PostgreSQL keeps none for a session that is not listening.
+- A notification arrives when the transaction that sent it commits. PostgreSQL delivers identical payloads sent on one channel in one transaction once, so the trigger sends one notification per table and operation per transaction.
+- The channel name is exact, case included. `close()` stops every channel. SQLite has no notifications between connections: its `changeNotificationSql` returns null.
 
 ## SQL Dialect & Feature Abstractions
 
@@ -767,6 +915,7 @@ const rows = await db.all(
 - **Ordering.** `relevanceOrder` orders best first everywhere. `rankExpression` keeps each engine's own direction: FTS5's `rank` is lower-better, FTS4's `length(offsets())` and PostgreSQL's `ts_rank` are higher-better.
 - **Queries.** `sanitizeQuery` turns text into its words, quoted and joined with OR, on every engine. PostgreSQL reads queries with `websearch_to_tsquery`: words are ANDed, and `or`, `-word` and quoted phrases work as in a search box.
 - **One index, many features objects.** On PostgreSQL, `createIndex` records each index's table, columns, language and weights for the whole process, so a features object made later syncs, rebuilds and queries an index another one created, and each index keeps its own language. Run `createIndex` (it is idempotent) in each process before `syncInsert` or `rebuildCommand`.
+- **Opening an existing index.** On PostgreSQL, `createIndex` reads the catalog before it alters the table or creates the index, so an open that finds the `_tsv` column and the index takes no lock on the table beyond the backfill's ROW EXCLUSIVE, and does not queue behind a long read of the table such as an export. Run its script with `exec()`: it holds `DO` blocks, which a split on `;` would cut.
 - **Aliases.** On SQLite, alias the index as itself in `joinClause` (or pass the alias as `indexName` to `matchClause`), since a MATCH names the table as the query writes it.
 
 

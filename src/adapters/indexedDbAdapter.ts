@@ -41,6 +41,15 @@
  * const session = await adapter.get('SELECT * FROM sessions WHERE id = ?', ['session-1']);
  * console.log(session);
  * ```
+ *
+ * `memoryOnly: true` keeps the database in memory alone, for a browser that refuses IndexedDB or a private window:
+ * the same SQL, no `persistence` capability, nothing opened or stored, whatever `durability` and `crossTab` say.
+ *
+ * `reload()` puts the stored image in place of the one in memory, whatever the version stamp says. A caller whose
+ * `durability: 'commit'` call was refused runs it before its next statement, so the refused write is gone rather than
+ * stored by the next save; a connection without `crossTab` runs it to read what another connection stored. Under
+ * `crossTab`, `rollbackRefusedSaves: true` does the same inside the lock, before a statement queued behind the refused
+ * call runs.
  */
 
 import initSqlJs from 'sql.js';
@@ -54,6 +63,7 @@ import type {
 } from '../core/contracts';
 import { expandNamedParameters, normaliseParameters } from '../shared/parameterUtils';
 import { toSqliteStatement } from '../shared/sqlPlaceholders';
+import { checkFunctionName, type SqlFunction, type SqlFunctionOptions } from '../shared/sqlFunctions';
 import {
   createSerializedTransactionRunner,
   createSharedConnectionTransactionAdapter,
@@ -148,6 +158,25 @@ export interface IndexedDbCrossTabOptions {
    * browser has no Web Locks.
    */
   locks?: IndexedDbLockManager | null;
+  /**
+   * Gives up the writes of a save IndexedDB refused (a quota error, an
+   * aborted IndexedDB transaction) before the next coordinated call runs:
+   * the stored image is read back in place of the one in memory while the
+   * Web Lock is still held (without Web Locks, before this adapter's next
+   * coordinated call starts), so a statement queued behind the refused call
+   * neither reads its writes nor stores them, and the call still rejects. It
+   * covers every save made under the coordination: a statement's, a
+   * transaction's, an import's and close()'s. When IndexedDB cannot be read
+   * back either, no save stores the refused writes, and the next statement
+   * or transaction reads the stored image before it runs, failing while it
+   * cannot.
+   *
+   * Off by default: the refused writes stay in memory, and the next
+   * coordinated statement, a read included, stores them with its own. A
+   * caller's `reload()` in its `catch` runs after the statements already
+   * waiting on the lock, so it cannot take them back first.
+   */
+  rollbackRefusedSaves?: boolean;
 }
 
 /** When a write is stored in IndexedDB. */
@@ -178,7 +207,8 @@ export interface IndexedDbAdapterOptions {
    * - `'commit'`: `run()`, `exec()`, a write through `all()` or `get()`
    *   (`INSERT ... RETURNING`) and `transaction()` resolve once their write is
    *   in IndexedDB, and reject when IndexedDB refuses it (the write stays in
-   *   the database and the next save stores it). Each save writes the whole
+   *   the database and the next save stores it, unless `crossTab`'s
+   *   `rollbackRefusedSaves` gives it up). Each save writes the whole
    *   database image, so batch many writes in one `transaction()`. While a
    *   transaction a caller opened with `BEGIN` is open, nothing can be saved:
    *   its statements resolve at once, and its rows are stored when its
@@ -211,6 +241,14 @@ export interface IndexedDbAdapterOptions {
    * underscores.
    */
   segment?: string;
+  /**
+   * Keeps the database in memory alone: IndexedDB is never opened, nothing is
+   * stored, and `capabilities` carries no `persistence`. `durability` reads
+   * `'interval'` and `crossTab` is off, since there is nothing to store or to
+   * share. For a browser that refuses IndexedDB (a private window, a blocked
+   * storage setting), where `open()` would otherwise reject.
+   */
+  memoryOnly?: boolean;
 }
 
 /**
@@ -231,6 +269,12 @@ const DB_VERSION = 1;
 interface StoredImage {
   image: Uint8Array | null;
   stamp: string | null;
+}
+
+/** A call waiting for its writes to be stored: the generation it waits for, and whether reload() put them back. */
+interface SaveWaiter {
+  generation: number;
+  discarded: boolean;
 }
 
 /** A statement past its leading comments and whitespace. */
@@ -313,12 +357,14 @@ const pragmaChangesImage = (statement: string): boolean => {
  */
 export class IndexedDbAdapter implements StorageAdapter {
   public readonly kind = 'indexeddb';
-  public readonly capabilities: ReadonlySet<StorageCapability> = new Set(['transactions', 'persistence', 'json', 'prepared']);
+  public readonly capabilities: ReadonlySet<StorageCapability>;
 
   private SQL: SqlJsStatic | null = null;
   private db: SqlJsDatabase | null = null;
   /** Foreign-key enforcement as open() was asked for it (undefined: the engine default); sql.js forgets the PRAGMA when export() reopens the connection. */
   private foreignKeys: boolean | undefined;
+  /** The functions registerFunction made callable from SQL, registered again after each reopening. */
+  private readonly sqlFunctions = new Map<string, SqlFunction>();
   private idb: IDBDatabase | null = null;
   private saveTimer: ReturnType<typeof setInterval> | null = null;
   /** Bumped by every statement that can change the database. */
@@ -327,6 +373,13 @@ export class IndexedDbAdapter implements StorageAdapter {
   private savedGeneration = 0;
   /** The save in progress, if any. */
   private saving: Promise<void> | null = null;
+  /**
+   * Without `crossTab`, the calls waiting for their writes to be stored: a
+   * `durability: 'commit'` write and `flush()`. reload() marks the ones whose
+   * writes it puts the stored image in place of, and they reject instead of
+   * resolving as stored.
+   */
+  private readonly saveWaiters = new Set<SaveWaiter>();
   /** The generation the save in progress exported. */
   private savingGeneration = 0;
   /** Whether a failed auto-save has been reported since the last one that succeeded. */
@@ -341,6 +394,13 @@ export class IndexedDbAdapter implements StorageAdapter {
   private lockWaitReported = false;
   /** The stamp of the image the database in memory was loaded from or last saved as. */
   private loadedStamp: string | null = null;
+  /**
+   * With `rollbackRefusedSaves`: the database in memory holds writes
+   * IndexedDB refused, and the stored image could not be read back in its
+   * place. No save stores them, and the next coordinated statement or
+   * transaction reads the stored image before it runs.
+   */
+  private holdsRefusedWrites = false;
   /** How many stamps this adapter has made, which keeps two of its stamps apart. */
   private stampCount = 0;
   /** The connection settings a fresh connection has, which a save need not set again. */
@@ -375,6 +435,8 @@ export class IndexedDbAdapter implements StorageAdapter {
   private readonly saveIntervalMs: number;
   private readonly durability: IndexedDbDurability;
   private readonly crossTab: IndexedDbCrossTabOptions | null;
+  /** The database lives in memory alone: IndexedDB is never opened. */
+  private readonly memoryOnly: boolean;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly sqlJsConfig: any;
 
@@ -382,12 +444,21 @@ export class IndexedDbAdapter implements StorageAdapter {
   constructor(options: IndexedDbAdapterOptions = {}) {
     this.dbName = segmentName(options.dbName || 'app-db', options.segment);
     this.storeName = options.storeName || 'sqliteDb';
-    this.autoSave = options.autoSave ?? true;
+    this.memoryOnly = options.memoryOnly ?? false;
+    this.autoSave = this.memoryOnly ? false : (options.autoSave ?? true);
     this.saveIntervalMs = options.saveIntervalMs || 5000;
     this.sqlJsConfig = options.sqlJsConfig || {};
-    this.crossTab =
-      options.crossTab === true ? {} : typeof options.crossTab === 'object' && options.crossTab !== null ? options.crossTab : null;
-    this.durability = this.crossTab ? 'commit' : options.durability ?? 'interval';
+    this.crossTab = this.memoryOnly
+      ? null
+      : options.crossTab === true
+        ? {}
+        : typeof options.crossTab === 'object' && options.crossTab !== null
+          ? options.crossTab
+          : null;
+    this.durability = this.memoryOnly ? 'interval' : this.crossTab ? 'commit' : (options.durability ?? 'interval');
+    this.capabilities = new Set<StorageCapability>(
+      this.memoryOnly ? ['transactions', 'json', 'prepared'] : ['transactions', 'persistence', 'json', 'prepared'],
+    );
   }
 
   /** The name of the Web Lock that coordinates the tabs on this database. */
@@ -419,6 +490,14 @@ export class IndexedDbAdapter implements StorageAdapter {
   private async openNow(): Promise<void> {
     // Initialize sql.js using global singleton (prevents race conditions)
     this.SQL = await getGlobalSQL(this.sqlJsConfig);
+
+    if (this.memoryOnly) {
+      const db = new this.SQL.Database();
+      this.pragmaDefaults = readPragmas(db);
+      this.db = db;
+      this.applyConnectionSettings();
+      return;
+    }
 
     // Open IndexedDB with retry logic for race conditions
     this.idb = await this.openIndexedDbWithRetry();
@@ -720,20 +799,85 @@ export class IndexedDbAdapter implements StorageAdapter {
   }
 
   /**
+   * Puts the stored image in place of the one in memory, whatever the version stamp says, and answers whether anything
+   * changed: true when another connection stored a newer image since this one loaded or saved, or when this connection
+   * holds writes that are not stored (one IndexedDB refused, which a `durability: 'commit'` call reports by rejecting,
+   * or with `durability: 'interval'` one the auto-save has not stored yet), which are then gone; false when the memory
+   * image already is the stored one, and in memory-only mode. A caller whose commit was refused runs it before its next
+   * statement: the next save, under `crossTab` the next coordinated statement, would store the refused writes with its
+   * own. A statement already waiting on the lock when the refusal reaches the caller runs first, so under `crossTab`
+   * set `rollbackRefusedSaves`, which gives the refused writes up before the lock is let go. Without `crossTab`, a
+   * `durability: 'commit'` write or a `flush()` still waiting for the save of a write it puts back rejects instead of
+   * resolving as stored. It waits for an open `transaction()` to end, holds statements while it runs, and refuses while
+   * a transaction begun with `BEGIN` is open, which replacing the database would end.
+   */
+  public async reload(): Promise<boolean> {
+    this.ensureOpen();
+    if (this.memoryOnly || !this.idb) return false;
+    const refuseOpenBegin = (): void => {
+      if (this.inTransaction()) {
+        throw new Error(
+          `IndexedDbAdapter: reload() cannot replace "${this.dbName}" while a transaction begun with BEGIN is open: COMMIT or ROLLBACK it first.`,
+        );
+      }
+    };
+    const replace = async (): Promise<boolean> => {
+      this.ensureOpen();
+      await this.settleSave();
+      const stored = await this.loadFromIndexedDb();
+      // close() may have begun while the image was read.
+      this.ensureOpen();
+      if (stored.stamp === this.loadedStamp && !this.hasUnsavedWrites() && !this.holdsRefusedWrites) return false;
+      this.replaceDatabase(stored.image ? new this.SQL!.Database(stored.image) : new this.SQL!.Database());
+      this.loadedStamp = stored.stamp;
+      // The writes after the last save are gone: a call still waiting for
+      // their save rejects instead of reading them as stored.
+      for (const waiter of this.saveWaiters) {
+        if (waiter.generation > this.savedGeneration) waiter.discarded = true;
+      }
+      this.savedGeneration = this.writeGeneration;
+      this.holdsRefusedWrites = false;
+      return true;
+    };
+    if (this.crossTab) {
+      return this.withCoordination(async () => {
+        this.ensureOpen();
+        refuseOpenBegin();
+        return replace();
+      });
+    }
+    // refuseOpenBegin runs before the gate is held: inside the hold,
+    // inTransaction() would read the hold's own token as an open transaction.
+    return this.runSerializedTransaction(async () => {
+      this.ensureOpen();
+      refuseOpenBegin();
+      return this.gate.hold(replace);
+    });
+  }
+
+  /**
    * Stores every write made so far in IndexedDB. A `transaction()` that is
    * open is waited for and stored with the rest; a transaction a caller began
    * with `BEGIN` cannot be stored without ending it, so flush() rejects while
-   * one is open. Resolves at once when nothing is waiting to be saved.
+   * one is open. Resolves at once when nothing is waiting to be saved, and
+   * rejects when reload() puts the stored image in place of writes it was
+   * waiting to store.
    */
   public async flush(): Promise<void> {
     this.ensureOpen();
     if (this.crossTab) {
       // Every write is stored before it resolves; this stores one whose save
-      // failed, unless another tab has saved since.
+      // failed, unless another tab has saved since or rollbackRefusedSaves
+      // gave it up.
       await this.coordinatedStatement(() => undefined);
       return;
     }
     const target = this.writeGeneration;
+    await this.waitForSave(target, () => this.flushThrough(target));
+  }
+
+  /** flush() without `crossTab`: stores the writes up to `target`, and rejects while a `BEGIN` is open. */
+  private async flushThrough(target: number): Promise<void> {
     while (this.savedGeneration < target && this.db && this.idb) {
       if (this.saving) {
         const covering = this.savingGeneration >= target;
@@ -794,10 +938,11 @@ export class IndexedDbAdapter implements StorageAdapter {
         }
         if (this.crossTab) {
           // Under the lock, once the transaction that holds it has failed: a
-          // write whose save failed is stored, unless another tab saved since.
+          // write whose save failed is stored, unless another tab saved since
+          // or rollbackRefusedSaves gave it up.
           await this.withCoordination(async () => {
             if (this.db && this.hasUnsavedWrites()) {
-              await this.saveIfStampIs(this.loadedStamp);
+              await this.coordinatedSave(this.loadedStamp);
             }
           });
         } else {
@@ -848,6 +993,24 @@ export class IndexedDbAdapter implements StorageAdapter {
     if (this.foreignKeys !== undefined) {
       this.db!.run(`PRAGMA foreign_keys = ${this.foreignKeys ? 'ON' : 'OFF'};`);
     }
+    this.applyFunctions();
+  }
+
+  /** Registers the functions registerFunction keeps: sql.js drops them when export() reopens the connection. */
+  private applyFunctions(): void {
+    for (const [name, fn] of this.sqlFunctions) {
+      this.db!.create_function(name, fn);
+    }
+  }
+
+  /**
+   * Makes a JavaScript function callable from SQL under `name`. It is
+   * registered again after each save, export, import and reload, which
+   * reopen the sql.js connection and drop the functions it had.
+   */
+  public registerFunction(name: string, fn: SqlFunction, _options: SqlFunctionOptions = {}): void {
+    this.sqlFunctions.set(checkFunctionName(name), fn);
+    if (this.db) this.db.create_function(name, fn);
   }
 
   /**
@@ -863,7 +1026,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     if (this.crossTab) {
       await this.withCoordination(async () => {
         this.swapIn(data);
-        await this.saveIfStampIs(undefined);
+        await this.coordinatedSave(undefined);
       });
       return;
     }
@@ -902,6 +1065,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     this.db!.close();
     this.db = next;
     this.applyPragmas(settings);
+    this.applyFunctions();
   }
 
   // ==========================================================================
@@ -942,7 +1106,7 @@ export class IndexedDbAdapter implements StorageAdapter {
               'cannot be held open; it was rolled back. Use transaction().',
           );
         }
-        if (!this.hasUnsavedWrites() || (await this.saveIfStampIs(this.loadedStamp))) {
+        if (!this.hasUnsavedWrites() || (await this.coordinatedSave(this.loadedStamp))) {
           return result;
         }
         if (attempt >= MAX_CONFLICT_RETRIES) {
@@ -969,7 +1133,7 @@ export class IndexedDbAdapter implements StorageAdapter {
       this.ensureOpen();
       await this.syncFromStore();
       const result = await this.runSerializedTransaction(() => this.transactionNow(fn));
-      if (this.hasUnsavedWrites() && !(await this.saveIfStampIs(this.loadedStamp))) {
+      if (this.hasUnsavedWrites() && !(await this.coordinatedSave(this.loadedStamp))) {
         await this.syncFromStore();
         throw new IndexedDbConflictError(
           `IndexedDbAdapter: another tab saved "${this.dbName}" while this transaction ran, so nothing of it is stored. ` +
@@ -980,9 +1144,12 @@ export class IndexedDbAdapter implements StorageAdapter {
     });
   }
 
-  /** Loads the stored image when another tab (or adapter) has saved since this one loaded or saved. */
+  /**
+   * Loads the stored image when another tab (or adapter) has saved since this one loaded or saved, and whatever the
+   * stamp says while the database in memory holds writes IndexedDB refused (`rollbackRefusedSaves`).
+   */
   private async syncFromStore(): Promise<void> {
-    const stored = await this.readIfChanged(this.loadedStamp);
+    const stored = this.holdsRefusedWrites ? await this.loadFromIndexedDb() : await this.readIfChanged(this.loadedStamp);
     if (!stored || !this.db) {
       return;
     }
@@ -991,6 +1158,37 @@ export class IndexedDbAdapter implements StorageAdapter {
     this.replaceDatabase(stored.image ? new this.SQL!.Database(stored.image) : new this.SQL!.Database());
     this.loadedStamp = stored.stamp;
     this.savedGeneration = this.writeGeneration;
+    this.holdsRefusedWrites = false;
+  }
+
+  /**
+   * Stores the image as saveIfStampIs does, for work that holds the lock. With `rollbackRefusedSaves`, a save
+   * IndexedDB refused gives up the writes it held before the error reaches the caller, while the lock is still held.
+   */
+  private async coordinatedSave(expected: string | null | undefined): Promise<boolean> {
+    try {
+      return await this.saveIfStampIs(expected);
+    } catch (error) {
+      if (this.crossTab?.rollbackRefusedSaves) {
+        await this.rollBackRefusedSave();
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Puts the stored image in place of one whose save IndexedDB refused. The refused writes are marked first, so no
+   * save stores them even when IndexedDB cannot be read back now; the next coordinated statement or transaction then
+   * reads the stored image before it runs.
+   */
+  private async rollBackRefusedSave(): Promise<void> {
+    this.holdsRefusedWrites = true;
+    this.savedGeneration = this.writeGeneration;
+    try {
+      await this.syncFromStore();
+    } catch {
+      // Read again by the next coordinated statement or transaction, which fails while IndexedDB cannot be read.
+    }
   }
 
   /** Reads the stored stamp, and the image with it when the stamp is not `known`; null when it is. */
@@ -1054,6 +1252,9 @@ export class IndexedDbAdapter implements StorageAdapter {
     if (stored) {
       this.loadedStamp = stamp;
       this.savedGeneration = Math.max(this.savedGeneration, generation);
+      // The flag is set only under the lock, where a save stores the database
+      // in memory as it is (an import's, say): none of it is refused now.
+      this.holdsRefusedWrites = false;
     }
     return stored;
   }
@@ -1076,6 +1277,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     const settings = this.changedPragmas();
     const image = this.db!.export();
     this.applyPragmas(settings);
+    this.applyFunctions();
     return image;
   }
 
@@ -1252,9 +1454,15 @@ export class IndexedDbAdapter implements StorageAdapter {
    * progress that holds them is waited for; an open transaction() is waited
    * for, since its own save holds them; while a transaction a caller began
    * with BEGIN is open, nothing can be stored, and its COMMIT stores them.
-   * Rejects when the save that held them failed.
+   * Rejects when the save that held them failed, and when reload() put the
+   * stored image in their place before they were stored.
    */
   private async saveThrough(generation: number): Promise<void> {
+    await this.waitForSave(generation, () => this.storeThrough(generation));
+  }
+
+  /** saveThrough()'s loop: settles once the writes up to `generation` are stored, or while a `BEGIN` is open. */
+  private async storeThrough(generation: number): Promise<void> {
     while (this.savedGeneration < generation && this.db && this.idb) {
       if (this.saving) {
         const covering = this.savingGeneration >= generation;
@@ -1273,6 +1481,27 @@ export class IndexedDbAdapter implements StorageAdapter {
         return;
       }
       await this.startSave();
+    }
+  }
+
+  /**
+   * Runs `wait`, which settles once the writes up to `generation` are stored,
+   * with the call among the save waiters, and rejects when reload() put the
+   * stored image in place of those writes before they were stored: the loop
+   * would otherwise read reload()'s generation as theirs and resolve.
+   */
+  private async waitForSave(generation: number, wait: () => Promise<void>): Promise<void> {
+    const waiter: SaveWaiter = { generation, discarded: false };
+    this.saveWaiters.add(waiter);
+    try {
+      await wait();
+    } finally {
+      this.saveWaiters.delete(waiter);
+    }
+    if (waiter.discarded) {
+      throw new Error(
+        `IndexedDbAdapter: reload() put the stored image of "${this.dbName}" in place of writes that were waiting to be stored; they are gone.`,
+      );
     }
   }
 

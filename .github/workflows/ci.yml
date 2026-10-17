@@ -15,7 +15,9 @@ jobs:
     # POSTGRES_TEST_URL. DATABASE_URL stays unset here: it moves the resolver's
     # default to Postgres for every other suite. The image is PostgreSQL 16 with
     # the pgvector extension available, so the segment specs can check that the
-    # vector type resolves through public.
+    # vector type resolves through public. The sync suites (tests/mutations) read
+    # SYNC_TEST_POSTGRES_URL, and SYNC_TEST_REQUIRE_POSTGRES=1 makes them fail
+    # when it is missing instead of leaving Postgres out.
     services:
       postgres:
         image: pgvector/pgvector:0.8.7-pg16
@@ -31,7 +33,10 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
+      TZ: Europe/Berlin
       POSTGRES_TEST_URL: postgresql://adapter:adapter@localhost:5432/adapter_test
+      SYNC_TEST_REQUIRE_POSTGRES: '1'
+      SYNC_TEST_POSTGRES_URL: postgresql://adapter:adapter@localhost:5432/adapter_test
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -51,8 +56,9 @@ jobs:
         run: npx vitest run
 
       - name: Run tests with coverage
-        run: npx vitest run --coverage
-        continue-on-error: true
+        run: |
+          : "${POSTGRES_TEST_URL:?Coverage requires the PostgreSQL integration service}"
+          npx vitest run --coverage
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
@@ -86,6 +92,7 @@ jobs:
             resolveStorageAdapter,
             type PostgresAdapter,
             type StorageAdapter,
+            type SqlDialect,
           } from '@framers/sql-storage-adapter';
           import {
             createSqlKeyValueStore,
@@ -93,6 +100,11 @@ jobs:
             openIndexedDbStore,
             type KeyValueStore,
           } from '@framers/sql-storage-adapter/kv';
+
+          declare const legacyDialect: Omit<SqlDialect, 'syncIdentitySequence'>;
+          export const compatibleDialect: SqlDialect = legacyDialect;
+          export const syncIfAvailable = (dialect: SqlDialect) =>
+            dialect.syncIdentitySequence?.('items', 'id') ?? null;
 
           export const openDefault = (): Promise<StorageAdapter> => createDatabase({ segment: 'agentos' });
           export const openResolved = (): Promise<StorageAdapter> => resolveStorageAdapter();
@@ -134,9 +146,38 @@ jobs:
           node "$GITHUB_WORKSPACE/scripts/verify-package.mjs" "$consumer_dir"
 
 
+  postgres18:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: adapter
+          POSTGRES_PASSWORD: adapter
+          POSTGRES_DB: adapter_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U adapter -d adapter_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TZ: Europe/Berlin
+      POSTGRES_TEST_URL: postgresql://adapter:adapter@localhost:5432/adapter_test
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: npm install
+      - name: Run migration specs on PostgreSQL 18
+        run: npx vitest run tests/migrateAdapter.engines.spec.ts
+
   # The IndexedDB adapter's cross-tab coordination and durability, and the
   # key-value module, on the browsers' own IndexedDB, Web Locks and structured
-  # clone: Chromium and WebKit, through Playwright.
+  # clone: Chromium, WebKit and Firefox, through Playwright.
   browser:
     runs-on: ubuntu-latest
     steps:
@@ -148,8 +189,8 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Install Chromium and WebKit
-        run: npx playwright install --with-deps chromium webkit
+      - name: Install Chromium, WebKit and Firefox
+        run: npx playwright install --with-deps chromium webkit firefox
 
       - name: Run the browser specs
         run: npx vitest run --config vitest.browser.config.ts

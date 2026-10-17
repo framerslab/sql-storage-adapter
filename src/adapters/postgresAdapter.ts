@@ -7,11 +7,15 @@ const __isBrowser = typeof window !== 'undefined' && typeof window.document !== 
 type PgModule = typeof import('pg');
 type PoolConfig = import('pg').PoolConfig;
 
-import type { StorageAdapter, StorageCapability, StorageOpenOptions, StorageParameters, StorageRunResult } from '../core/contracts';
+import type { BatchOperation, BatchResult, StorageAdapter, StorageCapability, StorageOpenOptions, StorageParameters, StorageRunResult } from '../core/contracts';
 import { toPostgresStatement } from '../shared/sqlPlaceholders';
 import { splitSqlStatements } from '../shared/splitSqlStatements';
 import { validateSegment } from '../shared/segment';
 import { getStorageLogger } from '../shared/logger';
+import { checkChannelName } from '../dialects/shared';
+import { PostgresListener, type PostgresNotificationHandler } from './postgresListener';
+
+export type { PostgresNotificationHandler } from './postgresListener';
 
 /** What the adapter reads from the answer to a query. */
 export interface PostgresQueryResultLike {
@@ -444,6 +448,56 @@ const unqualifiedCreateExtension = (statement: string): string | null => {
 /** An unknown thrown value as an Error. */
 const asError = (value: unknown): Error => (value instanceof Error ? value : new Error(String(value)));
 
+/** The savepoint each operation of a batch runs under. */
+const BATCH_SAVEPOINT = 'storage_adapter_batch';
+
+/**
+ * Runs a batch's operations on `trx`, a handle inside an open transaction,
+ * each under a savepoint. A failed statement aborts a PostgreSQL transaction,
+ * so a failure rolls back to its savepoint and the batch goes on, as the
+ * better-sqlite3 adapter's batch does.
+ */
+const runBatchSteps = async (trx: StorageAdapter, operations: BatchOperation[]): Promise<BatchResult> => {
+  const results: StorageRunResult[] = [];
+  const errors: Array<{ index: number; error: Error }> = [];
+  for (const [index, operation] of operations.entries()) {
+    await trx.exec(`SAVEPOINT ${BATCH_SAVEPOINT}`);
+    let result: StorageRunResult;
+    try {
+      result = await trx.run(operation.statement, operation.parameters);
+    } catch (error) {
+      await trx.exec(`ROLLBACK TO SAVEPOINT ${BATCH_SAVEPOINT}`);
+      await trx.exec(`RELEASE SAVEPOINT ${BATCH_SAVEPOINT}`);
+      errors.push({ index, error: asError(error) });
+      continue;
+    }
+    await trx.exec(`RELEASE SAVEPOINT ${BATCH_SAVEPOINT}`);
+    results.push(result);
+  }
+  return { successful: results.length, failed: errors.length, results, errors };
+};
+
+/**
+ * Runs a batch in a transaction of its own, begun by `transaction`. When the
+ * transaction itself fails (its BEGIN, a savepoint statement or its COMMIT),
+ * nothing commits, and the result says so as the better-sqlite3 adapter's
+ * does: every operation failed, with the error at index -1.
+ */
+const batchInOwnTransaction = async (
+  transaction: (fn: (trx: StorageAdapter) => Promise<BatchResult>) => Promise<BatchResult>,
+  operations: BatchOperation[],
+): Promise<BatchResult> => {
+  try {
+    return await transaction((trx) => runBatchSteps(trx, operations));
+  } catch (error) {
+    return { successful: 0, failed: operations.length, errors: [{ index: -1, error: asError(error) }] };
+  }
+};
+
+/** The error a second transaction on one held connection throws. */
+const TRANSACTION_ALREADY_OPEN =
+  'A transaction is already open on this connection. Run its statements through the handle its callback receives.';
+
 /**
  * Puts a failed ROLLBACK's error on the transaction's error, as a
  * non-enumerable `rollbackError` property, when that error can take one.
@@ -820,6 +874,17 @@ class PostgresTransactionAdapter implements StorageAdapter {
     return fn(this);
   }
 
+  /**
+   * Runs the operations inside this transaction, each under a savepoint, going
+   * on past one that fails; the ones that succeed commit or roll back with the
+   * transaction. After the transaction has ended, the batch runs in a
+   * transaction of its own where afterEnd runs it.
+   */
+  public async batch(operations: BatchOperation[]): Promise<BatchResult> {
+    if (this.ended) return batchInOwnTransaction((fn) => this.afterEnd.transaction(fn), operations);
+    return runBatchSteps(this, operations);
+  }
+
   public async close(): Promise<void> {
     // The owning transaction releases the checked-out client after completion.
   }
@@ -935,17 +1000,23 @@ class PostgresConnectionAdapter implements PostgresConnection {
   ): Promise<T> {
     const begin = beginStatement(options);
     const client = this.live();
-    if (this.transactionOpen) {
-      throw new Error(
-        'A transaction is already open on this connection. Run its statements through the handle its callback receives.'
-      );
-    }
+    if (this.transactionOpen) throw new Error(TRANSACTION_ALREADY_OPEN);
     this.transactionOpen = true;
     try {
       return await runTransaction(client, begin, fn, this.capabilities, this.segment, this, this.onBroken);
     } finally {
       this.transactionOpen = false;
     }
+  }
+
+  /**
+   * Runs the operations in one transaction on this connection, as the
+   * adapter's batch() does on the pool.
+   */
+  public async batch(operations: BatchOperation[]): Promise<BatchResult> {
+    this.live();
+    if (this.transactionOpen) throw new Error(TRANSACTION_ALREADY_OPEN);
+    return batchInOwnTransaction((fn) => this.transaction(fn), operations);
   }
 
   public async close(): Promise<void> {
@@ -1101,7 +1172,8 @@ export class PostgresAdapter implements StorageAdapter {
     'concurrent',    // Excellent concurrent access
     'json',          // Native JSON/JSONB support
     'arrays',        // Native array data types
-    'prepared'       // Prepared statements for security/performance
+    'prepared',      // Prepared statements for security/performance
+    'batch'          // batch(): one transaction, a savepoint per operation
   ]);
 
   private options: PostgresAdapterOptions;
@@ -1122,6 +1194,8 @@ export class PostgresAdapter implements StorageAdapter {
   private listening: { pool: PostgresPoolLike; listener: (error: Error) => void } | null = null;
   private opening: Promise<void> | null = null;
   private closing: Promise<void> | null = null;
+  /** The LISTEN side, made by the first listen(). */
+  private notifications: PostgresListener | null = null;
 
   constructor(options: PostgresAdapterOptions | string) {
     // Support both string and object initialization
@@ -1425,6 +1499,53 @@ export class PostgresAdapter implements StorageAdapter {
   }
 
   /**
+   * Runs the operations in one transaction, going on past one that fails, as
+   * the better-sqlite3 adapter's batch does. Each operation runs under a
+   * savepoint, since a failed statement aborts a PostgreSQL transaction; a
+   * failure rolls back to it and is reported with its index in `errors`. The
+   * operations that succeed commit together. When the transaction itself
+   * fails, nothing commits and the error is reported at index -1.
+   */
+  public async batch(operations: BatchOperation[]): Promise<BatchResult> {
+    this.requirePool();
+    return batchInOwnTransaction((fn) => this.transaction(fn), operations);
+  }
+
+  /**
+   * Calls `handler` with each notification sent on `channel` (PostgreSQL
+   * LISTEN) from any session: `notify()`, `pg_notify()`, or the trigger the
+   * dialect's `changeNotificationSql` installs. The channel name is exact,
+   * case included, as pg_notify() takes it.
+   *
+   * One connection of the pool is held while any channel has a handler. When
+   * the server ends it, the adapter listens again on a new one after 1 second,
+   * then 2, up to 30, and logs it; notifications sent meanwhile are lost
+   * (https://www.postgresql.org/docs/current/sql-notify.html). `close()`
+   * stops every channel. Resolves, once listening, to a function that stops
+   * this handler.
+   *
+   * @example
+   * ```typescript
+   * const stop = await db.listen('notes_changes', (payload) => refresh(JSON.parse(payload)));
+   * ```
+   */
+  public listen(channel: string, handler: PostgresNotificationHandler): Promise<() => Promise<void>> {
+    this.requirePool();
+    if (!this.notifications) this.notifications = new PostgresListener(() => this.requirePool().connect());
+    return this.notifications.listen(channel, handler);
+  }
+
+  /**
+   * Sends `payload` on `channel` (pg_notify) to every session listening
+   * there. PostgreSQL delivers it when the sending transaction commits, and
+   * refuses a payload of 8000 bytes or more.
+   */
+  public async notify(channel: string, payload = ''): Promise<void> {
+    checkChannelName(channel);
+    await this.get('SELECT pg_notify(?, ?)', [channel, payload]);
+  }
+
+  /**
    * The pool's counts, or null when the adapter is not open. A pool of the
    * caller's that does not count its connections, as pg's Pool does, reads 0.
    */
@@ -1454,6 +1575,9 @@ export class PostgresAdapter implements StorageAdapter {
     if (this.opening) {
       await this.opening.catch(() => undefined);
     }
+    // The listening connection goes back first: the pool's end() waits for it.
+    this.notifications?.close();
+    this.notifications = null;
     const pool = this.pool;
     this.pool = null;
     if (!pool) {

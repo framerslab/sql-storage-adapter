@@ -1,249 +1,124 @@
-import { describe, expect, it, beforeEach, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import pg from 'pg';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { PostgresExporter, pgDumpInvocation } from '../src/exporters/PostgresExporter';
 
-// PostgresExporter runs pg_dump. These specs read what it hands pg_dump: the
-// arguments, each passed as it is with no shell between, and the environment.
-// tests/postgres.exporter.spec.ts runs the real pg_dump against CI's PostgreSQL.
+// The exporter built pg_dump's command as one shell string, so a quote or a $(...) in the output path or the
+// connection string ran as a command, and the password showed in the process list for as long as pg_dump ran.
 
-const { calls, outcome } = vi.hoisted(() => ({
-  calls: [] as Array<{ file: string; args: string[]; env: Record<string, string | undefined> }>,
-  outcome: { error: null as (Error & { code?: string | number }) | null, stderr: '' },
-}));
+/** A path that starts a second command when a shell reads it. */
+const HOSTILE_PATH = '/tmp/x"; touch /tmp/pwned; echo "';
 
-vi.mock('node:child_process', () => ({
-  execFile: (
-    file: string,
-    args: string[],
-    options: { env?: Record<string, string | undefined> },
-    callback: (error: Error | null, stdout: Buffer, stderr: Buffer) => void,
-  ) => {
-    calls.push({ file, args, env: options.env ?? {} });
-    callback(outcome.error, Buffer.from('PGDMP'), Buffer.from(outcome.stderr));
-  },
-}));
-
-import { PostgresExporter } from '../src/exporters/PostgresExporter.js';
-import { createStorageFeatures } from '../src/core/contracts/features.js';
-import type { StorageAdapter } from '../src/core/contracts/index.js';
-
-/** An adapter of kind postgres with these options, as createStorageFeatures reads one. */
-const postgresAdapter = (options: Record<string, unknown>): StorageAdapter =>
-  ({
-    kind: 'postgres',
-    capabilities: new Set(),
-    open: async () => {},
-    run: async () => ({ changes: 0 }),
-    get: async () => null,
-    all: async () => [],
-    exec: async () => {},
-    transaction: async (fn: (trx: StorageAdapter) => Promise<unknown>) => fn({} as StorageAdapter),
-    close: async () => {},
-    options,
-  }) as unknown as StorageAdapter;
-
-/** The one --dbname argument of the last pg_dump run. */
-const dbnameOf = (args: string[]): string | undefined =>
-  args.find((arg) => arg.startsWith('--dbname='))?.slice('--dbname='.length);
-
-describe('PostgresExporter', () => {
-  beforeEach(() => {
-    calls.length = 0;
-    outcome.error = null;
-    outcome.stderr = '';
-  });
-
-  it('runs pg_dump with the schema it was given, in the custom format', async () => {
-    const exporter = new PostgresExporter('postgresql://app@db.example:5432/app', { schema: 'agentos' });
-
-    expect(await exporter.exportToBytes()).toEqual(new Uint8Array(Buffer.from('PGDMP')));
-
-    expect(calls).toHaveLength(1);
-    expect(calls[0].file).toBe('pg_dump');
-    expect(calls[0].args).toContain('--format=custom');
-    expect(calls[0].args).toContain('--schema="agentos"');
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app');
-  });
-
-  it('exports the whole database without a schema, and writes a file where it is told', async () => {
-    await new PostgresExporter('postgresql://app@db.example/app').exportToFile('/backups/a "quoted" name.dump');
-
-    expect(calls[0].args.some((arg) => arg.startsWith('--schema'))).toBe(false);
-    expect(calls[0].args).toContain('--file=/backups/a "quoted" name.dump');
-  });
-
-  it('keeps the password off the command line, in PGPASSWORD', async () => {
-    await new PostgresExporter('postgresql://app:s3cr%40t@db.example:5432/app?sslmode=require').exportToBytes();
-
-    expect(calls[0].args.join(' ')).not.toContain('s3cr');
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=require');
-    expect(calls[0].env.PGPASSWORD).toBe('s3cr@t');
-  });
-
-  // pg_dump reads a URI as libpq does: the user part runs to the first @ that
-  // comes before any /, and a password parameter after the path wins over the
-  // user part's password. The WHATWG URL parser reads several of these
-  // differently, or refuses them.
-  it.each([
-    [
-      'an empty host and a socket directory as a parameter',
-      'postgresql://app:s3cret@/app?host=/var/run/postgresql',
-      'postgresql://app@/app?host=/var/run/postgresql',
-      's3cret',
-    ],
-    [
-      'several hosts',
-      'postgresql://app:s3cret@one.example:5432,two.example:5433/app',
-      'postgresql://app@one.example:5432,two.example:5433/app',
-      's3cret',
-    ],
-    ['a # and a ? in the password', 'postgresql://app:s3cr#t?@db.example/app', 'postgresql://app@db.example/app', 's3cr#t?'],
-    ['no user name', 'postgres://:s3cret@db.example/app', 'postgres://db.example/app', 's3cret'],
-    [
-      'a password parameter',
-      'postgresql://app@db.example/app?sslmode=require&password=s3cr%26t',
-      'postgresql://app@db.example/app?sslmode=require',
-      's3cr&t',
-    ],
-    [
-      'a password parameter and a password in the user part',
-      'postgresql://app:s3cr-user@db.example/app?password=s3cret',
-      'postgresql://app@db.example/app',
-      's3cret',
-    ],
-  ])('keeps the password off the command line with %s', async (_name, connectionString, dbname, password) => {
-    await new PostgresExporter(connectionString).exportToBytes();
-
-    expect(dbnameOf(calls[0].args)).toBe(dbname);
-    expect(calls[0].args.join(' ')).not.toContain('s3cr');
-    expect(calls[0].env.PGPASSWORD).toBe(password);
-  });
-
-  it('leaves the password to the environment when the connection string holds none, or one libpq cannot decode', async () => {
-    for (const connectionString of [
-      'postgresql://app@db.example/app',
-      'postgresql://app:@db.example/app',
-      'postgresql://app:s3cr%zz@db.example/app',
-      'host=db.example dbname=app user=app',
-    ]) {
-      calls.length = 0;
-      await new PostgresExporter(connectionString).exportToBytes();
-
-      expect(dbnameOf(calls[0].args)).toBe(connectionString);
-      expect(calls[0].env.PGPASSWORD).toBe(process.env.PGPASSWORD);
+describe('pgDumpInvocation', () => {
+  it('passes the path and the connection string as single arguments and the password in PGPASSWORD alone', () => {
+    const { file, args, env } = pgDumpInvocation('postgresql://dump_user:p%40ss%20word@db.example:5432/app?sslmode=require', HOSTILE_PATH);
+    expect(file).toBe('pg_dump');
+    expect(args).toEqual(['--dbname=postgresql://dump_user@db.example:5432/app?sslmode=require', '--format=custom', `--file=${HOSTILE_PATH}`]);
+    expect(env.PGPASSWORD).toBe('p@ss word');
+    for (const arg of args) {
+      expect(arg).not.toContain('p@ss');
+      expect(arg).not.toContain('p%40ss');
     }
   });
 
-  it("fails with pg_dump's own words, and never with the command line that held the password", async () => {
-    outcome.error = Object.assign(new Error('Command failed: pg_dump --dbname=postgresql://app:hunter2@db/app'), { code: 1 });
-    outcome.stderr = 'pg_dump: error: connection to server failed: password authentication failed';
-
-    const failure = await new PostgresExporter('postgresql://app:hunter2@db/app').exportToBytes().then(
-      () => null,
-      (error: Error) => error,
-    );
-
-    expect(failure?.message).toMatch(/password authentication failed/);
-    expect(failure?.message).not.toContain('hunter2');
-  });
-
-  it('says so when pg_dump is not installed', async () => {
-    outcome.error = Object.assign(new Error('spawn pg_dump ENOENT'), { code: 'ENOENT' });
-
-    await expect(new PostgresExporter('postgresql://app@db/app').exportToBytes()).rejects.toThrow(/pg_dump was not found/);
+  it('leaves PGPASSWORD as the environment had it when the URL holds no password, and passes a keyword string whole', () => {
+    const before = process.env.PGPASSWORD;
+    expect(pgDumpInvocation('postgres://reader@db.example/app').env.PGPASSWORD).toBe(before);
+    const keyword = 'host=db.example dbname=app user=reader';
+    expect(pgDumpInvocation(keyword).args).toEqual([`--dbname=${keyword}`, '--format=custom']);
   });
 });
 
-describe('createStorageFeatures exporter on PostgreSQL', () => {
-  beforeEach(() => {
-    calls.length = 0;
-    outcome.error = null;
-    outcome.stderr = '';
+describe('PostgresExporter starts pg_dump without a shell', () => {
+  afterEach(() => {
+    vi.doUnmock('node:child_process');
+    vi.resetModules();
   });
 
-  it("exports a segmented adapter's segment alone", async () => {
-    const { exporter } = createStorageFeatures(
-      postgresAdapter({ connectionString: 'postgresql://app@db.example/app', segment: 'agentos' }),
-    );
+  it('hands execFile the program and an argument array, so a hostile path is one argument and no shell runs', async () => {
+    const calls: Array<{ file: string; args: string[]; options: Record<string, unknown> }> = [];
+    vi.doMock('node:child_process', () => ({
+      execFile: (file: string, args: string[], options: Record<string, unknown>, done: (error: Error | null, stdout: Buffer) => void) => {
+        calls.push({ file, args, options });
+        done(null, Buffer.from([1, 2, 3]));
+      },
+    }));
+    const { PostgresExporter: Fresh } = await import('../src/exporters/PostgresExporter');
+    const exporter = new Fresh('postgresql://dump_user:secret@db.example/app');
+    await exporter.exportToFile(HOSTILE_PATH);
+    expect(await exporter.exportToBytes()).toEqual(new Uint8Array([1, 2, 3]));
+    expect(calls.map((call) => call.file)).toEqual(['pg_dump', 'pg_dump']);
+    expect(calls[0]!.args).toContain(`--file=${HOSTILE_PATH}`);
+    for (const call of calls) {
+      expect(call.options.shell).toBeUndefined();
+      expect(call.args.join(' ')).not.toContain('secret');
+      expect((call.options.env as NodeJS.ProcessEnv).PGPASSWORD).toBe('secret');
+    }
+  });
+});
 
-    await exporter.exportToBytes();
+/** Whether a pg_dump binary answers on this machine. */
+function hasPgDump(): boolean {
+  try {
+    execFileSync('pg_dump', ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-    expect(calls[0].args).toContain('--schema="agentos"');
+// pg_dump reads every table of the database it dumps, and the other spec files create and drop tables in the test
+// database while this one runs: a table dropped between pg_dump's catalog read and its LOCK TABLE fails the dump with
+// "relation ... does not exist". So the dump reads a database of its own, made here and dropped after.
+describe.skipIf(!process.env.POSTGRES_TEST_URL || !hasPgDump())('PostgresExporter against a PostgreSQL server', () => {
+  const dirs: string[] = [];
+  const database = `dump_${process.pid}_${Math.random().toString(36).slice(2, 10)}`;
+  let admin: pg.Client | undefined;
+  let databaseUrl = '';
+
+  beforeAll(async () => {
+    admin = new pg.Client({ connectionString: process.env.POSTGRES_TEST_URL });
+    await admin.connect();
+    await admin.query(`CREATE DATABASE ${database}`);
+    const parsed = new URL(process.env.POSTGRES_TEST_URL as string);
+    parsed.pathname = `/${database}`;
+    databaseUrl = parsed.toString();
+    const own = new pg.Client({ connectionString: databaseUrl });
+    await own.connect();
+    try {
+      await own.query('CREATE TABLE exported_rows (id INTEGER PRIMARY KEY, label TEXT NOT NULL)');
+      await own.query("INSERT INTO exported_rows (id, label) VALUES (1, 'kept')");
+    } finally {
+      await own.end();
+    }
   });
 
-  it('reaches the database a pool of the caller was made for, by its connection string', async () => {
-    const pool = { options: { connectionString: 'postgresql://app:pool-secret@db.example:5432/app' } };
-    const { exporter } = createStorageFeatures(postgresAdapter({ pool }));
-
-    await exporter.exportToBytes();
-
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app');
-    expect(calls[0].env.PGPASSWORD).toBe('pool-secret');
+  afterAll(async () => {
+    if (admin === undefined) return;
+    try {
+      await admin.query(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
+    } finally {
+      await admin.end();
+    }
   });
 
-  it('reaches the database a pool of the caller was made for, by its host, database, user and password', async () => {
-    const pool = { options: { host: 'db.example', port: 6543, database: 'app', user: 'app', password: 'pool-secret' } };
-    const { exporter } = createStorageFeatures(postgresAdapter({ pool }));
-
-    await exporter.exportToBytes();
-
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:6543/app');
-    expect(calls[0].env.PGPASSWORD).toBe('pool-secret');
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('says what the pool lacks when a pool of the caller names no database', async () => {
-    const { exporter } = createStorageFeatures(postgresAdapter({ pool: { options: {} } }));
-
-    await expect(exporter.exportToBytes()).rejects.toThrow(/pool its caller made/);
-    expect(calls).toHaveLength(0);
-  });
-
-  it('writes a Unix-socket directory as libpq reads a host in a URI', async () => {
-    const { exporter } = createStorageFeatures(postgresAdapter({ host: '/var/run/postgresql', database: 'app', user: 'app' }));
-
-    await exporter.exportToBytes();
-
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@%2Fvar%2Frun%2Fpostgresql:5432/app');
-  });
-
-  it('gives PGPASSWORD a password set with no user name', async () => {
-    const { exporter } = createStorageFeatures(postgresAdapter({ host: 'db.example', database: 'app', password: 's3cret' }));
-
-    await exporter.exportToBytes();
-
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://db.example:5432/app');
-    expect(calls[0].env.PGPASSWORD).toBe('s3cret');
-  });
-
-  // open({ connectionString }) makes the adapter's pool from a connection
-  // string its options do not hold, after its features may have been made.
-  it('reaches the database of the pool the adapter runs on, read when the export runs', async () => {
-    let live: { options: Record<string, unknown> } | null = null;
-    const adapter = Object.assign(postgresAdapter({ segment: 'agentos' }), { getPool: () => live });
-    const { exporter } = createStorageFeatures(adapter);
-    live = {
-      options: { connectionString: 'postgresql://app:s3cret@db.example/app', options: '-c search_path=agentos,public' },
-    };
-
-    await exporter.exportToBytes();
-
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example/app');
-    expect(calls[0].env.PGPASSWORD).toBe('s3cret');
-    expect(calls[0].args).toContain('--schema="agentos"');
-  });
-
-  it('prefers the pool the adapter runs on to the settings it was made with', async () => {
-    const adapter = Object.assign(postgresAdapter({ connectionString: 'postgresql://app@made.example/app' }), {
-      getPool: () => ({ options: { connectionString: 'postgresql://app@opened.example/app' } }),
-    });
-
-    await createStorageFeatures(adapter).exporter.exportToBytes();
-
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@opened.example/app');
-  });
-
-  it('says what the adapter lacks when nothing names its database', async () => {
-    const adapter = Object.assign(postgresAdapter({ segment: 'agentos' }), { getPool: () => null });
-
-    await expect(createStorageFeatures(adapter).exporter.exportToBytes()).rejects.toThrow(/names no database/);
-    expect(calls).toHaveLength(0);
+  it('writes the dump to the literal path a shell would have split, and nothing runs', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-dump-'));
+    dirs.push(dir);
+    const marker = `pwned-${process.pid}-${Date.now()}`;
+    const target = path.join(dir, `dump"; touch ${marker}; echo "$(touch ${marker}-sub).custom`);
+    await new PostgresExporter(databaseUrl).exportToFile(target);
+    expect(fs.existsSync(target)).toBe(true);
+    // the custom format keeps each object's definition as plain text beside the compressed data
+    expect(fs.readFileSync(target).toString('latin1')).toContain('CREATE TABLE public.exported_rows');
+    expect(fs.existsSync(path.join(process.cwd(), marker))).toBe(false);
+    expect(fs.existsSync(path.join(process.cwd(), `${marker}-sub`))).toBe(false);
   });
 });

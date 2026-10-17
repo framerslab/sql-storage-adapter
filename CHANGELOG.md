@@ -1,11 +1,12 @@
-## [0.7.7] - 2026-10-16
+## [0.7.14] - 2026-10-17
 
 ### Added
 - `PostgresExporterOptions`, the second argument of `new PostgresExporter(connectionString, { schema })`: `schema` exports one schema alone, by its exact name (`pg_dump --schema`). It is exported from the root and `./core`.
 - `new PostgresExporter(connectionString)` also takes a function that gives the connection string when an export runs.
 
 ### Changed
-- `PostgresExporter` runs `pg_dump` through `execFile`, with no shell between, and no longer blocks the event loop while the dump runs. A connection string or a path holding a quote or a `$` reaches `pg_dump` as it is. The password of a `postgres://` or `postgresql://` connection string, in its user part or its `password` parameter, reaches `pg_dump` through `PGPASSWORD` instead of its command line, where the process list showed it, and a failure reports `pg_dump`'s own words, never the command line. The connection string is read as libpq reads it, so an empty host, several hosts, or a `#` or `?` in the password keep the password off the command line too. A dump larger than 256 MiB from `exportToBytes()` says to use `exportToFile()`.
+- `PostgresExporter` reads a `postgres://` or `postgresql://` connection string as libpq reads it, so the password reaches `pg_dump` through `PGPASSWORD`, off its command line, in every form libpq takes: an empty host (`postgresql://app:pw@/app?host=/var/run/postgresql`), several hosts, a `#` or `?` in the password, and a `password` parameter, which libpq takes over the user part's password. 0.7.12 read the string with the WHATWG URL parser, which refuses the first three, so the export threw, and it left a `password` parameter on the command line. The scheme is read in any case, as pg reads it, and handed to `pg_dump` in lower case, the only case libpq reads.
+- A failed `pg_dump` rejects with `pg_dump`'s own words and its exit code, never with the command line, which can hold a password. A missing `pg_dump` says to install the PostgreSQL client tools, and a dump larger than 256 MiB from `exportToBytes()` says to use `exportToFile()`.
 
 ### Fixed
 - `createStorageFeatures(adapter).exporter` on a segmented PostgreSQL adapter dumps the segment's schema alone. It dumped every schema of the database: the other segments' tables and the host's in `public`.
@@ -16,6 +17,88 @@
 - `resolveStorageAdapter()` and `createDatabase()` refuse a segment name in `postgres`, `indexedDb` or `capacitor` that cannot be a segment before any adapter is tried, as they refuse their own. A candidate whose options name no segment, tried after a candidate whose options named one, opens in that segment: without `strict`, an unreachable PostgreSQL with `postgres.segment` fell through to better-sqlite3 on the shared file, outside the segment.
 - IndexedDB adapter: a PRAGMA through `all()` or `get()` that sets `user_version`, `application_id`, `schema_version`, `page_size`, `auto_vacuum` or `encoding`, or runs `incremental_vacuum` or `optimize`, is saved. SQLite's `total_changes()` counts no PRAGMA, so `get('PRAGMA user_version = 3')` was stored neither with `durability: 'commit'` nor by `flush()` or `close()`. PRAGMA reads and connection settings still write nothing.
 - `createSqlKeyValueStore()` refuses a `Proxy` with a `DataCloneError`, as the structured clone and IndexedDB's put do. A proxy reads as the object it wraps to every check but the runtime's own `structuredClone`, which now runs first, so `set()` stored `new Proxy({ x: 1 }, {})` as `{ x: 1 }`.
+
+## [0.7.13] - 2026-10-17
+
+### Added
+- `memoryOnly: true` on the IndexedDB adapter keeps the database in memory alone, for a browser that refuses IndexedDB (a private window, a blocked storage setting): IndexedDB is never opened, nothing is stored, and `capabilities` carries no `persistence`.
+- `reload()` on the IndexedDB adapter puts the stored image in place of the one in memory, whatever the version stamp says, and resolves with whether anything changed. A caller whose durable commit IndexedDB refused runs it before its next statement; a connection without `crossTab` runs it to read what another connection stored.
+- `crossTab: { rollbackRefusedSaves: true }` on the IndexedDB adapter reads the stored image back inside the lock when IndexedDB refuses a save made under the coordination, so a statement already waiting on the lock does not store the refused writes with its own. The call still rejects.
+
+### Fixed
+- `PostgresFts.createIndex` reads the catalog before it alters the table or creates the index, so an open that finds the `_tsv` column and the GIN index takes no lock on the table beyond the backfill's ROW EXCLUSIVE. `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` took ACCESS EXCLUSIVE, and `CREATE INDEX IF NOT EXISTS` took SHARE, before reading `IF NOT EXISTS`: an open behind a long read of the table (an export, `pg_dump`, a report) queued, and every later read and write of the table queued behind it until the read ended. The two statements run in `DO` blocks that check `pg_attribute` and `to_regclass` first. The script keeps its three statements; run it with `exec()`, since a split on `;` would cut the blocks.
+- Without `crossTab`, a `durability: 'commit'` write or a `flush()` on the IndexedDB adapter still waiting for the save of a write that `reload()` puts back rejects instead of resolving as stored.
+
+## [0.7.12] - 2026-10-16
+
+### Security
+- `PostgresExporter` starts `pg_dump` with `execFile` and an argument array instead of a shell string, so a quote, `$(...)` or `;` in the output path or the connection string can no longer run a command; a `postgres://` URL's password reaches `pg_dump` in `PGPASSWORD` and no longer shows in the process list. `pgDumpInvocation(connectionString, outputPath?)` builds the invocation.
+
+### Fixed
+- The Electron main adapter's cloud backup doubles the quotes of its `VACUUM INTO` path, so a database under a folder with an apostrophe backs up.
+
+## [0.7.11] - 2026-10-16
+
+### Added
+- Row-change events: `withChangeEvents(adapter)` adds `onChange(listener, { tables })`, which reports each INSERT, UPDATE, DELETE and TRUNCATE made through the adapter (`run`, `batch`, `get`, `all`, `exec`, `transaction`, `withConnection`) once it commits, with the table, the operation and, from `run` and `batch`, the count. A rolled-back transaction reports nothing.
+- PostgreSQL notifications between sessions: `PostgresAdapter.listen(channel, handler)` and `notify(channel, payload)`. The listening connection is taken again when the server ends it.
+- `changeNotificationSql(table, channel)` on the dialects: on PostgreSQL a statement-level trigger that sends `{"schema", "table", "operation"}` on the channel for each write to the table from any session; null on SQLite.
+
+## [0.7.10] - 2026-10-16
+
+### Fixed
+- Make syncIdentitySequence optional on the exported SqlDialect interface, with conditional callers, so existing custom dialects still compile. Correct README identity widths, rowid scope, sequence state and date semantics.
+- Map empty PostgreSQL array defaults to JSON arrays, preserve case-sensitive SQLite strftime directives, and store PostgreSQL NUMERIC values and literal defaults as SQLite text without affinity rounding.
+- Keep PostgreSQL sequence allocation from moving backwards in imports, SQL dumps and the dialect helper; preserve SQLite AUTOINCREMENT high-water marks, including empty tables and deleted ids.
+- Exclude GENERATED ALWAYS identities from PostgreSQL conflict updates while allowing explicit identity values on new rows.
+- Export explicitly selected SQLite and PostgreSQL views without querying unavailable rowid or ctid columns.
+- Convert SQLite boolean defaults on numeric columns to numbers and omit invalid calendar defaults with warnings before PostgreSQL table creation.
+- Make PostgreSQL SQL dumps load into existing ALWAYS identities; retain column metadata and sequence synchronization when includeSchema is false.
+- Read PostgreSQL primary keys from pg_index so SELECT-only source roles preserve single and composite keys.
+- Include SQLite FTS rowids in exports so sparse external-content indexes retain their row associations after copies and SQL reloads.
+- Encode PostgreSQL JSON arrays and scalar values as JSON in copies and SQL dumps.
+- Recognize PostgreSQL 18 virtual generated columns, preserve their expressions and omit their values from inserts; exercise migrations on PostgreSQL 16 and 18 in CI.
+- Load SQLite foreign keys independently of row order, check references after import, and restore enforcement on failure.
+- Report insert failures under ignore and replace instead of silently dropping rows.
+- Preserve PostgreSQL date and zone-less timestamp fields in SQL dumps and copies under non-UTC process time zones.
+
+## [0.7.9] - 2026-10-16
+
+### Added
+- `autoIncrementPrimaryKey({ acceptExplicitIds: true })` on the dialects: on PostgreSQL an identity `GENERATED BY DEFAULT`, which takes an id an insert gives. The default stays `GENERATED ALWAYS`.
+- `syncIdentitySequence(table, column)` on the dialects: the statement that moves an identity or serial column's sequence past the largest id (PostgreSQL `setval`; null on SQLite).
+- `ExportedData.dialect`, and on each table's schema its primary key, the columns the engine fills or generates, and on SQLite the `CREATE TABLE` statement it keeps.
+- `importData` and `migrateAdapter` options `columnTypes` (a column's target type) and `sourceDialect` (for an export without `dialect`), and `warnings` on the result.
+
+### Changed
+- `migrateAdapter` and `importData` create the target engine's table: its types, the defaults it has a form of, NOT NULL and the primary key, with a column the source engine fills made an identity on PostgreSQL or an `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite. They copied the source's types and defaults as written and dropped the primary key, so a SQLite table failed on PostgreSQL (`DATETIME`, `BLOB`, `datetime('now')`) and a PostgreSQL one on SQLite (`::` casts, `nextval`).
+- SQLite to SQLite recreates each table from the statement SQLite keeps for it, with its keys, `AUTOINCREMENT`, constraints and generated columns. PostgreSQL to PostgreSQL keeps each exact type (`character varying(20)`, `integer[]`), makes a serial an identity, and regenerates a generated column.
+- On PostgreSQL, rows keep their ids in an identity `GENERATED ALWAYS` (`OVERRIDING SYSTEM VALUE`), and each identity or serial column that took ids has its sequence moved past them. Text without a zone goes into a `timestamptz` column as UTC. A source column matches a target column of another case.
+- `onConflict: 'ignore'` and `'replace'` write `ON CONFLICT` on PostgreSQL. They wrote SQLite's `INSERT OR IGNORE` and `INSERT OR REPLACE`, which failed there, and the failures were skipped without a word, so nothing was imported.
+- `rowsImported` counts the rows written, leaving out those `onConflict: 'ignore'` skipped.
+- `exportData` pages through each table in primary-key order (else rowid or ctid), so no row repeats or goes missing between pages, and leaves out the shadow tables of a SQLite virtual table.
+- `exportAsSQL` writes the primary key and identity columns, leaves generated columns out of its inserts, and moves PostgreSQL sequences past the inserted ids. Its values load back on their engine: bytes as a blob or bytea literal (they were written as text), booleans as `TRUE` and `FALSE` on PostgreSQL, arrays as array literals in PostgreSQL array columns, and other objects as JSON (they were written as `[object Object]`).
+- A column the target engine cannot fill (a PostgreSQL identity outside the primary key, on SQLite) is created nullable, so rows that leave it out can still be inserted.
+
+## [0.7.8] - 2026-10-16
+
+### Added
+- `batch()` on the PostgreSQL adapter, with `batch` in its capabilities: the operations run in one transaction, each under a savepoint, and the batch goes on past one that fails, as the better-sqlite3 adapter's does. The result has the same shape, a failure of the transaction itself included (index -1). A transaction handle's `batch()` runs in that transaction; a held connection's runs in a transaction of its own.
+- `registerFunction(name, fn, { deterministic })` on the better-sqlite3, sql.js and IndexedDB adapters: a JavaScript function callable from SQL. The sql.js and IndexedDB adapters register it again each time sql.js reopens the connection (a save, an export, an import), which drops it.
+- `ensureColumnExists(db, table, column, definition)`, named under 0.5.2 below and missing from the package since: it adds a column when the table lacks it, on PostgreSQL and SQLite, and says whether it did.
+
+### Changed
+- `pg` is listed once, as a dependency. It was also an optional peer dependency.
+
+## [0.7.7] - 2026-10-16
+
+### Added
+- Lifecycle hooks around an adapter's calls: `withHooks(adapter, hooks)` on any adapter, and `createDatabase({ hooks })`.
+  - The `StorageHooks` the package exported now run: `onBeforeQuery`, `onAfterQuery`, `onBeforeWrite`, `onAfterWrite`, `onBeforeTransaction`, `onAfterTransaction` and `onError`.
+  - A `before` hook returning undefined stops the call, as `combineHooks` already read it.
+  - The statements inside a transaction pass through the hooks too.
+  - The adapter keeps its kind, its own methods and its class.
+  - The performance tiers stay types for a host to apply.
 
 ## [0.7.6] - 2026-10-16
 

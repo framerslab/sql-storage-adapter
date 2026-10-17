@@ -1,4 +1,6 @@
+import { syncPostgresSequence } from '../shared/identitySequence.js';
 import type {
+  AutoIncrementOptions,
   CastType,
   ColumnKind,
   DateBucketUnit,
@@ -6,7 +8,16 @@ import type {
   JsonValueType,
   SqlDialect,
 } from '../core/contracts/dialect.js';
-import { checkChoice, checkDateBucketUnit, intervalSeconds, parseJsonPath, upsertUpdateColumns } from './shared.js';
+import {
+  checkChannelName,
+  checkChoice,
+  checkColumnName,
+  checkDateBucketUnit,
+  checkTableName,
+  intervalSeconds,
+  parseJsonPath,
+  upsertUpdateColumns,
+} from './shared.js';
 
 const COLUMN_TYPES: Record<ColumnKind, string> = {
   text: 'TEXT',
@@ -89,8 +100,36 @@ export class PostgresDialect implements SqlDialect {
     return `COALESCE(${expr}, ${fallback})`;
   }
 
-  autoIncrementPrimaryKey(): string {
-    return 'INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY';
+  autoIncrementPrimaryKey(options: AutoIncrementOptions = {}): string {
+    return `INTEGER GENERATED ${options.acceptExplicitIds ? 'BY DEFAULT' : 'ALWAYS'} AS IDENTITY PRIMARY KEY`;
+  }
+
+  changeNotificationSql(table: string, channel: string): string[] {
+    const name = checkTableName(table);
+    const literal = `'${checkChannelName(channel).replace(/'/g, "''")}'`;
+    return [
+      'CREATE OR REPLACE FUNCTION storage_adapter_notify_change() RETURNS trigger LANGUAGE plpgsql AS $storage_adapter$\n' +
+        'BEGIN\n' +
+        "  PERFORM pg_notify(TG_ARGV[0], json_build_object('schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME, 'operation',\n" +
+        "    CASE TG_OP WHEN 'TRUNCATE' THEN 'delete' ELSE lower(TG_OP) END)::text);\n" +
+        '  RETURN NULL;\n' +
+        'END;\n' +
+        '$storage_adapter$',
+      `DROP TRIGGER IF EXISTS storage_adapter_change ON ${name}`,
+      `CREATE TRIGGER storage_adapter_change AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON ${name} ` +
+        `FOR EACH STATEMENT EXECUTE FUNCTION storage_adapter_notify_change(${literal})`,
+    ];
+  }
+
+  syncIdentitySequence(table: string, column: string): string {
+    const name = checkTableName(table);
+    const col = checkColumnName(column);
+    // pg_get_serial_sequence parses its first argument as SQL does (unquoted
+    // names fold to lower case) and takes the column name literally.
+    return syncPostgresSequence(
+      `pg_get_serial_sequence('${name}', '${col.toLowerCase()}')`,
+      `SELECT MAX(${col}) FROM ${name}`,
+    );
   }
 
   columnType(kind: ColumnKind): string {

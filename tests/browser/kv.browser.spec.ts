@@ -4,10 +4,11 @@ import browserWasmUrl from 'sql.js/dist/sql-wasm-browser.wasm?url';
 import { IndexedDbAdapter } from '../../src/adapters/indexedDbAdapter';
 import { createSqlKeyValueStore, openIndexedDbStore } from '../../src/features/kv/index';
 
-// The key-value module in the browsers themselves, Chromium and WebKit: the
-// IndexedDB store reads a database another page made where it is, and the SQL
-// store, over the IndexedDB adapter, gives back each value as the browser's own
-// structured clone (which IndexedDB applies to every value it stores) does.
+// The key-value module in the browsers themselves, Chromium, WebKit and
+// Firefox: the IndexedDB store reads a database another page made where it is,
+// and the SQL store, over the IndexedDB adapter, gives back each value as the
+// browser's own structured clone (which IndexedDB applies to every value it
+// stores) does.
 
 const sqlJsConfig = {
   locateFile: (file: string): string => (file.includes('browser') ? browserWasmUrl : wasmUrl),
