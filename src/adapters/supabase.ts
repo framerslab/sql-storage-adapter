@@ -57,11 +57,12 @@ const failure = (message: string, error: unknown): Error => {
 };
 
 /**
- * Whether the query cache may keep a statement's answer: a plain read, whose first word past white space and comments
- * is SELECT and which names no INTO, so it makes no table. Block comments nest, as PostgreSQL reads them. Any other
- * statement can write, such as `UPDATE ... RETURNING` through `get`, and runs each time it is asked.
+ * Whether the query cache may hold a statement's answer: a SELECT, whose first word past white space and comments is
+ * SELECT. Block comments nest, as PostgreSQL reads them. Any other statement can write, such as `UPDATE ... RETURNING`
+ * through `get`, and runs each time it is asked. A SELECT can write too, through a function it calls or with `INTO`,
+ * which its text cannot show, so its answer is kept only when PostgreSQL says it wrote nothing (`readAndCheck`).
  */
-const isPlainRead = (statement: unknown): boolean => {
+const isSelect = (statement: unknown): boolean => {
   if (typeof statement !== 'string') return false;
   let at = 0;
   for (;;) {
@@ -86,7 +87,7 @@ const isPlainRead = (statement: unknown): boolean => {
         }
       }
     } else {
-      return /^select\b/i.test(statement.slice(at, at + 7)) && !/\binto\b/i.test(statement);
+      return /^select\b/i.test(statement.slice(at, at + 7));
     }
   }
 };
@@ -196,8 +197,21 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     }
   }
 
-  private getCacheKey(query: string, params?: unknown): string {
-    return `${query}::${JSON.stringify(params || {})}`;
+  /**
+   * The key of an answer: the call, the statement and the parameters as they are bound. `get` and `all` keep apart, as
+   * one answers a row and the other a list. JSON.stringify throws on a bigint, writes NaN and the infinities as null,
+   * and writes a Date as its ISO text, which pg binds as local time with its offset, so those are written as text that
+   * starts with U+0000, which no string bound to PostgreSQL's text holds.
+   */
+  private getCacheKey(call: 'get' | 'all', query: string, params?: unknown): string {
+    const bound = JSON.stringify(params || {}, function (this: unknown, key: string, value: unknown) {
+      const raw = (this as Record<string, unknown>)[key];
+      if (raw instanceof Date) return `\u0000date:${raw.getTime()}`;
+      if (typeof value === 'bigint') return `\u0000bigint:${value}`;
+      if (typeof value === 'number' && !Number.isFinite(value)) return `\u0000number:${value}`;
+      return value;
+    });
+    return `${call}::${query}::${bound}`;
   }
 
   async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
@@ -219,9 +233,57 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     }
   }
 
-  /** The key a plain read is cached under while the cache is on; `undefined` for any other statement or with it off. */
-  private cacheKeyOf(read: boolean, statement: string, parameters?: StorageParameters): string | undefined {
-    return this.cacheEnabled && read ? this.getCacheKey(statement, parameters) : undefined;
+  /** The key a SELECT is cached under while the cache is on; `undefined` for any other statement or with it off. */
+  private cacheKeyOf(
+    call: 'get' | 'all',
+    statement: string,
+    parameters?: StorageParameters
+  ): string | undefined {
+    return this.cacheEnabled && isSelect(statement) ? this.getCacheKey(call, statement, parameters) : undefined;
+  }
+
+  /**
+   * Runs a SELECT the cache may keep, once, in a transaction of its own on one client, and answers its rows and
+   * whether it wrote. PostgreSQL gives a transaction an ID when it first writes to the database
+   * (https://www.postgresql.org/docs/current/transaction-id.html), and `pg_current_xact_id_if_assigned()`, PostgreSQL
+   * 13's, answers NULL until then, so a SELECT that calls a function that writes, or makes a table with `INTO`, answers
+   * `wrote: true`. What it wrote commits, as it would outside the cache.
+   */
+  private async readAndCheck(
+    pool: Pool,
+    statement: string,
+    parameters?: StorageParameters
+  ): Promise<{ rows: unknown[]; wrote: boolean }> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(...prepare(statement, parameters));
+      const check = await client.query<{ wrote: boolean }>(
+        'SELECT pg_current_xact_id_if_assigned() IS NOT NULL AS wrote'
+      );
+      await client.query('COMMIT');
+      return { rows: result.rows, wrote: check.rows[0]?.wrote !== false };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Runs a statement for `get` or `all`: a SELECT the cache may keep through `readAndCheck`, and any other statement,
+   * or any with the cache off, as it is, taken as a write.
+   */
+  private async answer(
+    pool: Pool,
+    cacheKey: string | undefined,
+    statement: string,
+    parameters?: StorageParameters
+  ): Promise<{ rows: unknown[]; wrote: boolean }> {
+    if (cacheKey !== undefined) return this.readAndCheck(pool, statement, parameters);
+    const result = await pool.query(...prepare(statement, parameters));
+    return { rows: result.rows, wrote: true };
   }
 
   /** The cached answer under the key, counted as a hit; `undefined` when the cache holds none. */
@@ -239,7 +301,7 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     return undefined;
   }
 
-  /** Keeps a plain read's answer under its key, unless a write or `clearCache()` came while it was read. */
+  /** Keeps a SELECT's answer under its key, unless a write or `clearCache()` came while it was read. */
   private keep(cacheKey: string | undefined, generation: number, value: unknown): void {
     if (cacheKey === undefined || !this.cacheEnabled || generation !== this.cacheGeneration) return;
     this.queryCache.set(cacheKey, value);
@@ -254,48 +316,49 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
   async get<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T | null> {
     if (!this.pool) throw new Error('Storage adapter not opened');
 
-    const read = isPlainRead(statement);
-    const cacheKey = this.cacheKeyOf(read, statement, parameters);
+    const cacheKey = this.cacheKeyOf('get', statement, parameters);
     const cached = this.cached<T | null>(cacheKey);
     if (cached !== undefined) return cached ?? null;
 
     const generation = this.cacheGeneration;
     const startTime = Date.now();
+    let wrote = true;
     try {
-      const result = await this.pool.query(...prepare(statement, parameters));
+      const outcome = await this.answer(this.pool, cacheKey, statement, parameters);
+      wrote = outcome.wrote;
       this.trackQuery(statement, startTime);
 
-      const value = result.rows[0] || null;
-      if (value !== null) this.keep(cacheKey, generation, value);
+      const value = outcome.rows[0] || null;
+      if (!wrote && value !== null) this.keep(cacheKey, generation, value);
       return value as T;
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
     } finally {
-      if (!read) this.clearCache();
+      if (wrote) this.clearCache();
     }
   }
 
   async all<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T[]> {
     if (!this.pool) throw new Error('Storage adapter not opened');
 
-    const read = isPlainRead(statement);
-    const cacheKey = this.cacheKeyOf(read, statement, parameters);
+    const cacheKey = this.cacheKeyOf('all', statement, parameters);
     const cached = this.cached<T[]>(cacheKey);
     if (cached !== undefined) return cached;
 
     const generation = this.cacheGeneration;
     const startTime = Date.now();
+    let wrote = true;
     try {
-      const result = await this.pool.query(...prepare(statement, parameters));
+      const outcome = await this.answer(this.pool, cacheKey, statement, parameters);
+      wrote = outcome.wrote;
       this.trackQuery(statement, startTime);
 
-      const rows = result.rows;
-      this.keep(cacheKey, generation, rows);
-      return rows as T[];
+      if (!wrote) this.keep(cacheKey, generation, outcome.rows);
+      return outcome.rows as T[];
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
     } finally {
-      if (!read) this.clearCache();
+      if (wrote) this.clearCache();
     }
   }
 
@@ -513,13 +576,17 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
   }
 
   /**
-   * Keeps the answers of plain reads through `get` and `all`, at most `maxSize` of them, and answers the same statement
-   * with the same parameters from them. A plain read is a statement whose first word, past white space and comments, is
-   * SELECT, and which names no INTO. Every other statement, through `run`, `exec`, `get` or `all`, and every
-   * `transaction`, `batchWrite` and `migrate`, clears the cache when it ends, and a read that was in flight across one
-   * keeps nothing, so the cache never answers a row as it stood before this adapter's own write. It cannot see a write
-   * through another adapter, pool or process, nor a SELECT whose answer changes with no write at all, such as one that
-   * calls `nextval()` or `now()`: those answer from the cache until `clearCache()`.
+   * Keeps the answers of SELECTs through `get` and `all`, at most `maxSize` of them, and answers the same statement with
+   * the same parameters from them. A SELECT is a statement whose first word, past white space and comments, is SELECT.
+   * One the cache does not hold runs once, in a transaction of its own, and its answer is kept only when PostgreSQL gave
+   * that transaction no ID, which it gives a transaction when it first writes to the database: a SELECT that calls a
+   * function that writes, or makes a table with INTO, runs each time it is asked. That check reads
+   * `pg_current_xact_id_if_assigned()`, so the cache needs PostgreSQL 13 or later. Every statement that writes, through
+   * `run`, `exec`, `get` or `all`, and every `transaction`, `batchWrite` and `migrate`, clears the cache when it ends,
+   * and a read that was in flight across one keeps nothing, so the cache never answers a row as it stood before this
+   * adapter's own write. It cannot see a write through another adapter, pool or process, nor a SELECT whose answer
+   * changes from one call to the next by itself, such as one that calls `random()`, `now()` or `nextval()`: those can
+   * answer from the cache until `clearCache()`.
    */
   enableCache(maxSize: number = 100): void {
     this.cacheEnabled = true;
