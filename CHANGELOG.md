@@ -1,4 +1,4 @@
-## [0.7.14] - 2026-10-17
+## [0.7.15] - 2026-10-17
 
 ### Added
 - `PostgresExporterOptions`, the second argument of `new PostgresExporter(connectionString, { schema })`: `schema` exports one schema alone, by its exact name (`pg_dump --schema`). It is exported from the root and `./core`.
@@ -17,6 +17,11 @@
 - `resolveStorageAdapter()` and `createDatabase()` refuse a segment name in `postgres`, `indexedDb` or `capacitor` that cannot be a segment before any adapter is tried, as they refuse their own. A candidate whose options name no segment, tried after a candidate whose options named one, opens in that segment: without `strict`, an unreachable PostgreSQL with `postgres.segment` fell through to better-sqlite3 on the shared file, outside the segment.
 - IndexedDB adapter: a PRAGMA through `all()` or `get()` that sets `user_version`, `application_id`, `schema_version`, `page_size`, `auto_vacuum` or `encoding`, or runs `incremental_vacuum` or `optimize`, is saved. SQLite's `total_changes()` counts no PRAGMA, so `get('PRAGMA user_version = 3')` was stored neither with `durability: 'commit'` nor by `flush()` or `close()`. PRAGMA reads and connection settings still write nothing.
 - `createSqlKeyValueStore()` refuses a `Proxy` with a `DataCloneError`, as the structured clone and IndexedDB's put do. A proxy reads as the object it wraps to every check but the runtime's own `structuredClone`, which now runs first, so `set()` stored `new Proxy({ x: 1 }, {})` as `{ x: 1 }`.
+
+## [0.7.14] - 2026-10-17
+
+### Fixed
+- `PostgresFts.createIndex`: of two first opens that both find no GIN index, the later one no longer rejects. Its `CREATE INDEX` shares the earlier one's SHARE lock, builds an index of its own and fails on `pg_class`'s unique name (`23505`) once the earlier one commits; the index block now takes that failure, or `duplicate_table`, as the index made.
 
 ## [0.7.13] - 2026-10-17
 

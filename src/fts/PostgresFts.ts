@@ -49,8 +49,13 @@ export class PostgresFts implements IFullTextSearch {
    * search path, a schema prefix, quoted names) and locks nothing. An open
    * that finds the column and the index takes no lock on the table beyond the
    * `UPDATE`'s ROW EXCLUSIVE, which no read or write of the table waits for.
-   * The statements keep `IF NOT EXISTS` for two first opens that pass the
-   * check together.
+   *
+   * Two first opens can both pass a check. The later `ALTER TABLE` waits for
+   * the earlier one's lock and then finds the column, which its
+   * `IF NOT EXISTS` passes. The later `CREATE INDEX` shares the earlier one's
+   * lock, builds an index of its own, and fails on the catalog's unique name
+   * (`unique_violation`) once the earlier one commits: its block takes that
+   * failure as the index made.
    */
   createIndex(config: {
     table: string;
@@ -135,10 +140,13 @@ const addColumnBlock = (table: string): string =>
 /**
  * A `DO` block that creates the GIN index `name` on `table` when the table's
  * schema has no relation of that name (the test `IF NOT EXISTS` makes), and
- * takes no lock on a table whose index exists.
+ * takes no lock on a table whose index exists. A `CREATE INDEX` that loses
+ * the race to another session's fails on the catalog's unique name when that
+ * session commits (`unique_violation`, or `duplicate_table`), and the block
+ * takes the failure as the index made.
  */
 const createIndexBlock = (table: string, name: string): string =>
-  doBlock(`IF to_regclass((SELECT relnamespace::regnamespace::text FROM pg_class WHERE oid = to_regclass(${literal(table)})) || ${literal(`.${name}`)}) IS NULL THEN CREATE INDEX IF NOT EXISTS ${name} ON ${table} USING GIN(_tsv); END IF;`);
+  doBlock(`IF to_regclass((SELECT relnamespace::regnamespace::text FROM pg_class WHERE oid = to_regclass(${literal(table)})) || ${literal(`.${name}`)}) IS NULL THEN BEGIN CREATE INDEX IF NOT EXISTS ${name} ON ${table} USING GIN(_tsv); EXCEPTION WHEN unique_violation OR duplicate_table THEN NULL; END; END IF;`);
 
 /** `text` as an SQL string literal. */
 const literal = (text: string): string => `'${text.replace(/'/g, "''")}'`;

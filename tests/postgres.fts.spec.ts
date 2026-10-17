@@ -1,5 +1,6 @@
 import { describe, expect, it, afterAll, beforeAll } from 'vitest';
 import { PostgresAdapter, PostgresFts, type StorageAdapter } from '../src/index.js';
+import { splitSqlStatements } from '../src/shared/splitSqlStatements.js';
 
 // PostgresFts.createIndex runs on every open of a store. ALTER TABLE takes its
 // ACCESS EXCLUSIVE lock, and CREATE INDEX its SHARE lock, before either reads
@@ -8,14 +9,25 @@ import { PostgresAdapter, PostgresFts, type StorageAdapter } from '../src/index.
 // later read and write of it until the read ended. These specs prove that an
 // open which finds the _tsv column and the GIN index takes no lock on the table
 // beyond the backfill's ROW EXCLUSIVE, that it completes while another
-// connection holds a long read, and that the first open still adds the column
-// and the index and fills the column. They run when POSTGRES_TEST_URL names a
-// server (CI starts a PostgreSQL 16 service for them).
+// connection holds a long read, that the first open still adds the column and
+// the index and fills the column, and that of two first opens which both find
+// no index, the later one takes the catalog's refusal of its CREATE INDEX as
+// the index made. They run when POSTGRES_TEST_URL names a server (CI starts a
+// PostgreSQL 16 service for them).
 
 const POSTGRES_TEST_URL = process.env.POSTGRES_TEST_URL;
 
 /** A name no other run of this suite uses: lower-case letters, digits and underscores. */
 const unique = (prefix: string): string => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
+
+/** Waits until `ready` resolves true, for a bounded time. */
+const until = async (ready: () => Promise<boolean>, timeoutMs = 5_000): Promise<void> => {
+  const started = Date.now();
+  while (!(await ready())) {
+    if (Date.now() - started > timeoutMs) throw new Error(`Not ready after ${timeoutMs} ms.`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+};
 
 /** The modes of the locks the transaction `trx` holds on `table`, each once. */
 const lockModes = async (trx: StorageAdapter, table: string): Promise<string[]> =>
@@ -119,24 +131,54 @@ describe.skipIf(!POSTGRES_TEST_URL)('PostgresFts.createIndex on an open', () => 
     expect(await db.get(`SELECT count(*)::int AS missing FROM ${table} WHERE _tsv IS NULL`)).toEqual({ missing: 0 });
   });
 
-  it('checks the table a schema-qualified name names, apart from a table of the same name in another schema', async () => {
+  it('checks the table a schema-qualified name names, apart from a table and an index of the same names in another schema', async () => {
     const [first, second] = [unique('fts_a'), unique('fts_b')];
     schemas.push(first, second);
     await db.exec(`CREATE SCHEMA ${first}; CREATE SCHEMA ${second}`);
     const [firstTable, secondTable] = [await contentTable(`${first}.notes`), await contentTable(`${second}.notes`)];
-    await db.exec(indexScript(`${first}_notes_index`, firstTable));
+    // One index name for both tables, as the segments of a store each name their index the same.
+    const index = unique('notes_index');
+    await db.exec(indexScript(index, firstTable));
 
     // The other schema's notes has neither the column nor the index: its first open adds them there.
-    expect(await locksTakenBy(db, indexScript(`${second}_notes_index`, secondTable), secondTable)).toEqual(
-      expect.arrayContaining(['AccessExclusiveLock', 'ShareLock']),
-    );
-    expect(await db.get('SELECT tablename FROM pg_indexes WHERE schemaname = ? AND indexname = ?', [second, `idx_${second}_notes_index_tsv`])).toEqual({
-      tablename: 'notes',
-    });
+    expect(await locksTakenBy(db, indexScript(index, secondTable), secondTable)).toEqual(expect.arrayContaining(['AccessExclusiveLock', 'ShareLock']));
+    expect(await db.all('SELECT schemaname, tablename FROM pg_indexes WHERE indexname = ? ORDER BY schemaname', [`idx_${index}_tsv`])).toEqual([
+      { schemaname: first, tablename: 'notes' },
+      { schemaname: second, tablename: 'notes' },
+    ]);
     expect(await db.get(`SELECT count(*)::int AS missing FROM ${secondTable} WHERE _tsv IS NULL`)).toEqual({ missing: 0 });
 
-    expect(await locksTakenBy(db, indexScript(`${first}_notes_index`, firstTable), firstTable)).toEqual(['RowExclusiveLock']);
-    expect(await locksTakenBy(db, indexScript(`${second}_notes_index`, secondTable), secondTable)).toEqual(['RowExclusiveLock']);
+    expect(await locksTakenBy(db, indexScript(index, firstTable), firstTable)).toEqual(['RowExclusiveLock']);
+    expect(await locksTakenBy(db, indexScript(index, secondTable), secondTable)).toEqual(['RowExclusiveLock']);
+  });
+
+  it('opens while another open, which found no index either, creates it: the later one takes the catalog\'s refusal as the index made', async () => {
+    const table = await contentTable();
+    const index = `${table}_index`;
+    const indexName = `idx_${index}_tsv`;
+    // The column without the index, so the two opens meet at CREATE INDEX alone.
+    await db.exec(indexScript(index, table));
+    await db.exec(`DROP INDEX ${indexName}`);
+    const createIndexBlock = splitSqlStatements(indexScript(index, table))[1];
+
+    let second: Promise<unknown> = Promise.resolve();
+    await db.transaction(async (first) => {
+      // The earlier open's CREATE INDEX, not yet committed: the later open's check cannot see it.
+      await first.exec(createIndexBlock);
+      second = db.exec(indexScript(index, table)).then(
+        () => 'opened',
+        (error: unknown) => error,
+      );
+      // The later open's CREATE INDEX shares the table's SHARE lock and waits on the catalog row of the same name.
+      await until(
+        async () => Boolean(await db.get("SELECT 1 AS waiting FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE ?", [`%${indexName}%`])),
+        3_000,
+      );
+    });
+
+    // The earlier open committed; the later one's CREATE INDEX failed on the unique name, which its block takes as made.
+    expect(await second).toBe('opened');
+    expect(await db.all('SELECT tablename FROM pg_indexes WHERE indexname = ?', [indexName])).toEqual([{ tablename: table }]);
   });
 
   it('finds an unqualified table through the search path, past a first schema that does not hold it', async () => {
