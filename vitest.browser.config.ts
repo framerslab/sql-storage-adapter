@@ -1,8 +1,9 @@
 import { defineConfig } from 'vitest/config';
 
-// The specs under tests/browser run in Chromium and WebKit through Playwright,
-// on the browsers' own IndexedDB, Web Locks and structured clone. CI installs
-// the two browsers first: npx playwright install --with-deps chromium webkit.
+// The specs under tests/browser run in Chromium, WebKit and Firefox through
+// Playwright, on the browsers' own IndexedDB, Web Locks and structured clone.
+// CI installs the three browsers first:
+// npx playwright install --with-deps chromium webkit firefox.
 export default defineConfig({
   optimizeDeps: {
     // Bundled before the first spec runs, so no spec reloads the page mid-run.
@@ -16,7 +17,7 @@ export default defineConfig({
       provider: 'playwright',
       headless: true,
       screenshotFailures: false,
-      instances: [{ browser: 'chromium' }, { browser: 'webkit' }],
+      instances: [{ browser: 'chromium' }, { browser: 'webkit' }, { browser: 'firefox' }],
     },
   },
 });
