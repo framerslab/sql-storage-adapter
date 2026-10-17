@@ -4,10 +4,10 @@ import wasmUrl from 'sql.js/dist/sql-wasm.wasm?url';
 import browserWasmUrl from 'sql.js/dist/sql-wasm-browser.wasm?url';
 import { IndexedDbAdapter } from '../../src/adapters/indexedDbAdapter';
 
-// The IndexedDB adapter in the browsers themselves, Chromium and WebKit, run by
-// Playwright. Two adapters on one database in one page stand for two tabs: each
-// holds a database image of its own, and they share the page's IndexedDB and
-// Web Locks, which two tabs of one site share too.
+// The IndexedDB adapter in the browsers themselves, Chromium, WebKit and
+// Firefox, run by Playwright. Two adapters on one database in one page stand for
+// two tabs: each holds a database image of its own, and they share the page's
+// IndexedDB and Web Locks, which two tabs of one site share too.
 
 const sqlJsConfig = {
   locateFile: (file: string): string => (file.includes('browser') ? browserWasmUrl : wasmUrl),
