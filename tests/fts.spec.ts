@@ -91,7 +91,10 @@ describe('PostgresFts', () => {
     const create = 'CREATE INDEX IF NOT EXISTS idx_notes_fts_tsv ON app.notes USING GIN(_tsv);';
     expect(index.indexOf(indexCheck)).toBeGreaterThan(-1);
     expect(index.indexOf(create)).toBeGreaterThan(index.indexOf(indexCheck));
-    expect(index.indexOf('END IF;')).toBeGreaterThan(index.indexOf(create));
+    // A CREATE INDEX that loses the race to another session's takes the catalog's refusal as the index made.
+    const lostRace = 'EXCEPTION WHEN unique_violation OR duplicate_table THEN NULL; END;';
+    expect(index.indexOf(lostRace)).toBeGreaterThan(index.indexOf(create));
+    expect(index.indexOf('END IF;')).toBeGreaterThan(index.indexOf(lostRace));
 
     expect(backfill).toBe(
       "UPDATE app.notes SET _tsv = to_tsvector('english', COALESCE(title, '') || ' ' || COALESCE(body, '')) WHERE _tsv IS NULL",
