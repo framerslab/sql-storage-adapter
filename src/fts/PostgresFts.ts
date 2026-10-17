@@ -130,11 +130,7 @@ const checkWeights = (columns: string[], weights?: Record<string, Weight>): Reco
 
 /** A `DO` block that adds the `_tsv` column to `table` when the table has none, and takes no lock on a table that has it. */
 const addColumnBlock = (table: string): string =>
-  doBlock(
-    `IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass(${literal(table)}) AND attname = '_tsv' AND NOT attisdropped) THEN\n` +
-      `    ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS _tsv tsvector;\n` +
-      `  END IF;`,
-  );
+  doBlock(`IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass(${literal(table)}) AND attname = '_tsv' AND NOT attisdropped) THEN ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS _tsv tsvector; END IF;`);
 
 /**
  * A `DO` block that creates the GIN index `name` on `table` when the table's
@@ -142,11 +138,7 @@ const addColumnBlock = (table: string): string =>
  * takes no lock on a table whose index exists.
  */
 const createIndexBlock = (table: string, name: string): string =>
-  doBlock(
-    `IF to_regclass((SELECT relnamespace::regnamespace::text FROM pg_class WHERE oid = to_regclass(${literal(table)})) || ${literal(`.${name}`)}) IS NULL THEN\n` +
-      `    CREATE INDEX IF NOT EXISTS ${name} ON ${table} USING GIN(_tsv);\n` +
-      `  END IF;`,
-  );
+  doBlock(`IF to_regclass((SELECT relnamespace::regnamespace::text FROM pg_class WHERE oid = to_regclass(${literal(table)})) || ${literal(`.${name}`)}) IS NULL THEN CREATE INDEX IF NOT EXISTS ${name} ON ${table} USING GIN(_tsv); END IF;`);
 
 /** `text` as an SQL string literal. */
 const literal = (text: string): string => `'${text.replace(/'/g, "''")}'`;
