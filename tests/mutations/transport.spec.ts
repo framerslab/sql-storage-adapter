@@ -100,4 +100,24 @@ describe('the fetch transport', () => {
     });
     await expect(transport.pull(pull)).rejects.toBeInstanceOf(SyncUnavailable);
   });
+
+  it('waits until the HTTP date a rate refusal names, and two seconds for a date already past or a value it cannot read', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-10-17T12:00:00.000Z') });
+    try {
+      const answers: Array<() => Promise<Response>> = [];
+      const transport = createFetchMutationTransport({
+        pushUrl: 'https://sync.test/push',
+        pullUrl: 'https://sync.test/pull',
+        fetch: (() => (answers.shift() as () => Promise<Response>)()) as unknown as typeof fetch,
+      });
+      answers.push(reply(429, '', { 'retry-after': 'Sat, 17 Oct 2026 12:00:30 GMT' }));
+      expect(await transport.push(push)).toEqual({ kind: 'rate_limited', retryAfterMs: 30_000 });
+      answers.push(reply(429, '', { 'retry-after': 'Sat, 17 Oct 2026 11:59:00 GMT' }));
+      expect(await transport.pull(pull)).toEqual({ kind: 'rate_limited', retryAfterMs: 2000 });
+      answers.push(reply(429, '', { 'retry-after': 'soon' }));
+      expect(await transport.push(push)).toEqual({ kind: 'rate_limited', retryAfterMs: 2000 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

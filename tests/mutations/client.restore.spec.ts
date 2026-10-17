@@ -108,4 +108,26 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('rest
     await settle(a);
     expect(await a.values()).toEqual(['one', 'three', 'two']);
   });
+
+  it('keeps a value the account refused before the dump when the recovery pull acknowledges the refusal', async () => {
+    const narrow = await world(backend, { policy: { maxRows: 1 } });
+    try {
+      const a = await browser(narrow);
+      await a.save([{ id: hex(1), value: 'one' }]);
+      await a.join();
+      await settle(a);
+      // the full account refuses the second row; the dump holds the refusal, and the restore lands before a's next pull
+      await a.save([{ id: hex(1), value: 'one' }, { id: hex(2), value: 'two' }]);
+      expect(await a.client.push()).toEqual({ kind: 'sent' });
+      await restore(narrow, await dump(narrow));
+      await settle(a);
+      expect(await a.values()).toEqual(['one', 'two']);
+      const snapshot = await a.client.snapshot();
+      expect(snapshot.kept).toMatchObject([{ id: hex(2), value: 'two', reason: 'full' }]);
+      expect(snapshot.membership).toMatchObject({ state: 'joined', recovering: false });
+      expect(snapshot.pending).toBe(0);
+    } finally {
+      await narrow.close();
+    }
+  });
 });

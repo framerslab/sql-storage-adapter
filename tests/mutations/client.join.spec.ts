@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createSqlGroup, dropSqlGroup } from '../../src/features/sync/mutations/sqlStore';
+import { SyncUnavailable } from '../../src/features/sync/mutations/transport';
 import { backends } from './backends';
 import { browser, hex, settle, world, type World } from './harness';
 
@@ -97,5 +98,18 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('join
     const now = await a.client.snapshot();
     expect(now.membership).toMatchObject({ state: 'joined', group: w.group });
     expect(now.pending).toBeGreaterThan(0);
+  });
+
+  it("leaves no joining state behind when the join's snapshot never comes, and the next join merges the browser's rows", async () => {
+    const a = await browser(w);
+    await a.save([{ id: null, value: 'mine' }]);
+    a.transport.offline = true;
+    await expect(a.join()).rejects.toBeInstanceOf(SyncUnavailable);
+    expect((await a.client.snapshot()).membership).toMatchObject({ state: 'off', group: null, clientId: null, epoch: null });
+    a.transport.offline = false;
+    expect(await a.join()).toEqual({ kind: 'applied' });
+    await settle(a);
+    expect(await a.values()).toEqual(['mine']);
+    expect(await w.opened.adapter.all(`SELECT id FROM ${w.opened.prefix}rows WHERE state = 'live'`)).toHaveLength(1);
   });
 });

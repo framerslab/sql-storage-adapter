@@ -2,11 +2,12 @@ import 'fake-indexeddb/auto';
 import { IDBFactory, IDBObjectStore } from 'fake-indexeddb';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { IndexedDbAdapter } from '../../src/adapters/indexedDbAdapter';
+import { MutationClient } from '../../src/features/sync/mutations/client';
 import { packMutations, requestBytes } from '../../src/features/sync/mutations/packing';
 import { memoryTabLock } from '../../src/features/sync/mutations/tabLock';
 import { SyncUnavailable } from '../../src/features/sync/mutations/transport';
 import { backends } from './backends';
-import { browser, hex, settle, world, type Browser, type World } from './harness';
+import { browser, hex, loopback, POLICY, settle, world, type Browser, type World } from './harness';
 
 const BACKENDS = await backends();
 
@@ -141,6 +142,96 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('the 
       expect(await c.values()).toEqual(['one', 'two']);
     } finally {
       await narrowServer.close();
+    }
+  });
+
+  it("keeps an edit too long for the account under its row's id, at the revision it was made against, and a save that fits edits the row", async () => {
+    const a = await browser(w, { clientPolicy: { maxUnits: 40 } });
+    await a.save([{ id: hex(1), value: 'short' }]);
+    await a.join();
+    await settle(a);
+    const long = 'x'.repeat(41);
+    expect((await a.save([{ id: hex(1), value: long }])).tooLong).toEqual([hex(1)]);
+    expect(await a.blocks()).toEqual([{ id: hex(1), value: long }]);
+    // the same row edited again, still too long, stays under its id: no other row appears
+    expect((await a.save([{ id: hex(1), value: `${long}y` }])).tooLong).toEqual([hex(1)]);
+    expect(await a.blocks()).toEqual([{ id: hex(1), value: `${long}y` }]);
+    expect((await a.client.snapshot()).kept).toMatchObject([{ id: hex(1), value: `${long}y`, reason: 'too_long' }]);
+    await settle(a);
+    expect(await a.blocks()).toEqual([{ id: hex(1), value: `${long}y` }]);
+    // once the text fits, the save edits the account's row at the revision the long text was made against
+    await a.save([{ id: hex(1), value: 'short, edited' }]);
+    await settle(a);
+    expect(await a.blocks()).toEqual([{ id: hex(1), value: 'short, edited' }]);
+    expect((await a.client.snapshot()).kept).toEqual([]);
+    expect(await w.opened.adapter.all(`SELECT id FROM ${w.opened.prefix}rows`)).toEqual([{ id: hex(1) }]);
+  });
+
+  it('keeps a value the full account refused under the id the browser showed it at while the refusal was pending', async () => {
+    const narrow = await world(backend, { policy: { maxRows: 1 } });
+    try {
+      const a = await browser(narrow);
+      const b = await browser(narrow, { clientPolicy: { maxRows: 1 } });
+      await a.save([{ id: hex(1), value: 'shared' }]);
+      await a.join();
+      await settle(a);
+      await b.join();
+      // b edits the row offline while a's edit reaches the account
+      b.transport.offline = true;
+      await b.save([{ id: hex(1), value: 'from b' }]);
+      await a.save([{ id: hex(1), value: 'from a' }]);
+      await settle(a);
+      b.transport.offline = false;
+      // b's pull brings a's edit first: b's own edit now replays as a copy the full account cannot take, shown under the copy's id
+      expect(await b.client.pull()).toEqual({ kind: 'applied' });
+      const shown = await b.blocks();
+      const copy = shown.find((block) => block.value === 'from b');
+      expect(copy?.id).toMatch(/^[0-9a-f]{32}$/);
+      expect(copy?.id).not.toBe(hex(1));
+      await settle(b);
+      expect(await b.blocks()).toEqual(shown);
+      expect((await b.client.snapshot()).kept).toMatchObject([{ id: copy?.id, value: 'from b', reason: 'full' }]);
+    } finally {
+      await narrow.close();
+    }
+  });
+
+  it('keeps a cookie, mutation ids and versions above the 32-bit range in its own tables on this database', async () => {
+    const own = await backend.open();
+    try {
+      const big = 3_000_000_000;
+      await w.opened.adapter.run(`UPDATE ${w.opened.prefix}groups SET version = ? WHERE scope = ?`, [big, w.scope]);
+      const client = new MutationClient({
+        adapter: own.adapter,
+        scope: w.scope,
+        lock: memoryTabLock(),
+        transport: loopback(w),
+        policy: POLICY,
+        tablePrefix: own.prefix,
+        materialize: async () => undefined,
+      });
+      await client.open();
+      const save = (rows: Array<{ id: string; value: string }>) => client.save({ rows, write: async () => undefined });
+      expect(await client.join({ group: w.group, epoch: w.epoch.current, readBlocks: async () => [] })).toEqual({ kind: 'applied' });
+      await save([{ id: hex(1), value: 'one' }]);
+      expect(await client.push()).toEqual({ kind: 'sent' });
+      const clientId = (await client.context())?.clientId;
+      // the server has taken this client's mutations up to an id past the 32-bit range, as a long-lived client's would be
+      await w.opened.adapter.run(`UPDATE ${w.opened.prefix}clients SET last_mutation_id = ? WHERE client_id = ?`, [big, clientId]);
+      expect(await client.pull()).toEqual({ kind: 'applied' });
+      await save([{ id: hex(1), value: 'one' }, { id: hex(2), value: 'two' }]);
+      expect(await client.push()).toEqual({ kind: 'sent' });
+      expect(await client.pull()).toEqual({ kind: 'applied' });
+      const snapshot = await client.snapshot();
+      expect(snapshot.pending).toBe(0);
+      expect(snapshot.membership.nextMutationId).toBe(big + 2);
+      expect(snapshot.membership.cookie).toBeGreaterThan(big);
+      expect(snapshot.visible.map((row) => [row.id, row.value, row.revision])).toEqual([
+        [hex(1), 'one', { client: clientId, mutation: '1' }],
+        [hex(2), 'two', { client: clientId, mutation: String(big + 1) }],
+      ]);
+    } finally {
+      await own.close();
     }
   });
 

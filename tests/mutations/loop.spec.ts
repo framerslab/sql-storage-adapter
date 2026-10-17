@@ -152,6 +152,51 @@ describe('the sync loop', () => {
     for (const error of errors) expect(error).toBeInstanceOf(SyncUnavailable);
     loop.stop();
   });
+
+  it('schedules nothing from a cycle a stop overtook: the loop started again runs its own cycle at once', async () => {
+    let answer: (outcome: SyncOutcome) => void = () => undefined;
+    const calls: string[] = [];
+    const client = {
+      push(): Promise<SyncOutcome> {
+        calls.push('push');
+        if (calls.length > 1) return Promise.resolve<SyncOutcome>({ kind: 'idle' });
+        // the first push is answered when the test says, after the loop has stopped and started again
+        return new Promise<SyncOutcome>((resolve) => {
+          answer = resolve;
+        });
+      },
+      async pull(): Promise<SyncOutcome> {
+        calls.push('pull');
+        return { kind: 'applied' };
+      },
+    };
+    const loop = new SyncLoop({ client, visible: () => true });
+    loop.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toEqual(['push']);
+    loop.stop();
+    loop.start();
+    answer({ kind: 'wait', ms: 9000 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toEqual(['push', 'push', 'pull']);
+    loop.stop();
+  });
+
+  it('starts its retries from 2 seconds again when it starts after a stop', async () => {
+    const client = fakeClient();
+    client.fail = true;
+    const loop = new SyncLoop({ client, visible: () => true });
+    loop.start();
+    await vi.advanceTimersByTimeAsync(2000 + 4000 + 8000);
+    expect(client.calls).toEqual(['push', 'push', 'push', 'push']);
+    loop.stop();
+    loop.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.calls).toHaveLength(5);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(client.calls).toHaveLength(6);
+    loop.stop();
+  });
 });
 
 describe('attaching the loop to a page', () => {
