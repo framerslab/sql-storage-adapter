@@ -3,6 +3,7 @@
 ### Added
 - `PostgresExporterOptions`, the second argument of `new PostgresExporter(connectionString, { schema })`: `schema` exports one schema alone, by its exact name (`pg_dump --schema`). It is exported from the root and `./core`.
 - `new PostgresExporter(connectionString)` also takes a function that gives the connection string when an export runs.
+- `migrateIndexedDbKeyValue({ source, adapter, into })` in `./kv` (#63) moves one namespace of an old IndexedDB key-value store, the one `openIndexedDbStore` opens, into a `KeyValueStore` over an adapter, behind a marker (`MIGRATION_MARKER`), with the old store's writers locked out by the database's version. It answers `migrated`, `already`, `none` or `blocked`, resumes from the committed side after a reload, copies once when two moves run at once, and refuses a store that keeps nothing past the page.
 
 ### Changed
 - `PostgresExporter` reads a `postgres://` or `postgresql://` connection string as libpq reads it, so the password reaches `pg_dump` through `PGPASSWORD`, off its command line, in every form libpq takes: an empty host (`postgresql://app:pw@/app?host=/var/run/postgresql`), several hosts, a `#` or `?` in the password, and a `password` parameter, which libpq takes over the user part's password. 0.7.12 read the string with the WHATWG URL parser, which refuses the first three, so the export threw, and it left a `password` parameter on the command line. The scheme is read in any case, as pg reads it, and handed to `pg_dump` in lower case, the only case libpq reads.
