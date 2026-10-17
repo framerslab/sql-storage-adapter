@@ -416,6 +416,29 @@ describe('a segment through createDatabase and the resolver', () => {
     expect(adapter.kind).toBe('postgres');
   });
 
+  // A postgres candidate takes no segment another backend's options named,
+  // tried after it or before: the Postgres adapter refuses a segment on a pool
+  // of the caller's, so the resolution threw.
+  it('opens a pool of the caller tried after an IndexedDB candidate that asked for a segment, without that segment', async () => {
+    // Node has no indexedDB, so the IndexedDB candidate fails.
+    const pool = {
+      query: async () => ({ rows: [] }),
+      connect: async () => {
+        throw new Error('not used: the adapter takes up a pool of the caller without connecting');
+      },
+      end: async () => undefined,
+    };
+    const adapter = await resolveStorageAdapter({
+      priority: ['indexeddb', 'postgres'],
+      postgres: { pool },
+      indexedDb: { segment: 'agentos' },
+      quiet: true,
+    });
+    adapters.push(adapter);
+
+    expect(adapter.kind).toBe('postgres');
+  });
+
   // The Postgres adapter refuses a segment on a pool its caller made. Without
   // strict, the resolver falls through from a postgres candidate that fails,
   // so the pair would open a local SQLite file in the segment instead.

@@ -1,6 +1,13 @@
 import { describe, expect, it, afterAll, afterEach, beforeAll, vi } from 'vitest';
 import pg from 'pg';
-import { PostgresAdapter, createDatabase, createPostgresAdapter, exportData, type StorageAdapter } from '../src/index.js';
+import {
+  PostgresAdapter,
+  createDatabase,
+  createPostgresAdapter,
+  exportData,
+  resolveStorageAdapter,
+  type StorageAdapter,
+} from '../src/index.js';
 
 // A segment on PostgreSQL is a schema of its own: every connection of the
 // adapter's pool starts with search_path set to the segment, then public, so the
@@ -435,6 +442,26 @@ describe.skipIf(!POSTGRES_TEST_URL)('PostgreSQL segments', () => {
 
     expect(adapter.kind).toBe('postgres');
     expect(await currentSchema(adapter)).toBe(segment);
+  });
+
+  // The segment an IndexedDB candidate's options name is the browser's: a
+  // server tried after it keeps the schemas its own options choose.
+  it('opens a postgres candidate tried after an IndexedDB candidate that asked for a segment outside it, and makes no schema', async () => {
+    const segment = unique('seg');
+    schemas.push(segment);
+    // Node has no indexedDB, so the IndexedDB candidate fails.
+    const adapter = await resolveStorageAdapter({
+      priority: ['indexeddb', 'postgres'],
+      indexedDb: { segment },
+      postgres: { connectionString: url },
+      quiet: true,
+    });
+    opened.push(adapter);
+
+    expect(adapter.kind).toBe('postgres');
+    expect(await currentSchema(adapter)).not.toBe(segment);
+    const found = await admin.get<{ name: string }>('SELECT nspname AS name FROM pg_namespace WHERE nspname = ?', [segment]);
+    expect(found ?? null).toBeNull();
   });
 
   it('refuses a segment with a pool of the caller, whose connections it cannot start', async () => {
