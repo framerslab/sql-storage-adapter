@@ -271,6 +271,12 @@ interface StoredImage {
   stamp: string | null;
 }
 
+/** A call waiting for its writes to be stored: the generation it waits for, and whether reload() put them back. */
+interface SaveWaiter {
+  generation: number;
+  discarded: boolean;
+}
+
 /** The first keyword of a statement, past its leading comments and whitespace. */
 const firstKeyword = (statement: string): string => {
   const rest = statement.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/, '');
@@ -334,6 +340,13 @@ export class IndexedDbAdapter implements StorageAdapter {
   private savedGeneration = 0;
   /** The save in progress, if any. */
   private saving: Promise<void> | null = null;
+  /**
+   * Without `crossTab`, the calls waiting for their writes to be stored: a
+   * `durability: 'commit'` write and `flush()`. reload() marks the ones whose
+   * writes it puts the stored image in place of, and they reject instead of
+   * resolving as stored.
+   */
+  private readonly saveWaiters = new Set<SaveWaiter>();
   /** The generation the save in progress exported. */
   private savingGeneration = 0;
   /** Whether a failed auto-save has been reported since the last one that succeeded. */
@@ -757,9 +770,10 @@ export class IndexedDbAdapter implements StorageAdapter {
    * image already is the stored one, and in memory-only mode. A caller whose commit was refused runs it before its next
    * statement: the next save, under `crossTab` the next coordinated statement, would store the refused writes with its
    * own. A statement already waiting on the lock when the refusal reaches the caller runs first, so under `crossTab`
-   * set `rollbackRefusedSaves`, which gives the refused writes up before the lock is let go. It waits for an open
-   * `transaction()` to end, holds statements while it runs, and refuses while a transaction begun with `BEGIN` is open,
-   * which replacing the database would end.
+   * set `rollbackRefusedSaves`, which gives the refused writes up before the lock is let go. Without `crossTab`, a
+   * `durability: 'commit'` write or a `flush()` still waiting for the save of a write it puts back rejects instead of
+   * resolving as stored. It waits for an open `transaction()` to end, holds statements while it runs, and refuses while
+   * a transaction begun with `BEGIN` is open, which replacing the database would end.
    */
   public async reload(): Promise<boolean> {
     this.ensureOpen();
@@ -780,6 +794,11 @@ export class IndexedDbAdapter implements StorageAdapter {
       if (stored.stamp === this.loadedStamp && !this.hasUnsavedWrites() && !this.holdsRefusedWrites) return false;
       this.replaceDatabase(stored.image ? new this.SQL!.Database(stored.image) : new this.SQL!.Database());
       this.loadedStamp = stored.stamp;
+      // The writes after the last save are gone: a call still waiting for
+      // their save rejects instead of reading them as stored.
+      for (const waiter of this.saveWaiters) {
+        if (waiter.generation > this.savedGeneration) waiter.discarded = true;
+      }
       this.savedGeneration = this.writeGeneration;
       this.holdsRefusedWrites = false;
       return true;
@@ -804,7 +823,9 @@ export class IndexedDbAdapter implements StorageAdapter {
    * Stores every write made so far in IndexedDB. A `transaction()` that is
    * open is waited for and stored with the rest; a transaction a caller began
    * with `BEGIN` cannot be stored without ending it, so flush() rejects while
-   * one is open. Resolves at once when nothing is waiting to be saved.
+   * one is open. Resolves at once when nothing is waiting to be saved, and
+   * rejects when reload() puts the stored image in place of writes it was
+   * waiting to store.
    */
   public async flush(): Promise<void> {
     this.ensureOpen();
@@ -816,6 +837,11 @@ export class IndexedDbAdapter implements StorageAdapter {
       return;
     }
     const target = this.writeGeneration;
+    await this.waitForSave(target, () => this.flushThrough(target));
+  }
+
+  /** flush() without `crossTab`: stores the writes up to `target`, and rejects while a `BEGIN` is open. */
+  private async flushThrough(target: number): Promise<void> {
     while (this.savedGeneration < target && this.db && this.idb) {
       if (this.saving) {
         const covering = this.savingGeneration >= target;
@@ -1392,9 +1418,15 @@ export class IndexedDbAdapter implements StorageAdapter {
    * progress that holds them is waited for; an open transaction() is waited
    * for, since its own save holds them; while a transaction a caller began
    * with BEGIN is open, nothing can be stored, and its COMMIT stores them.
-   * Rejects when the save that held them failed.
+   * Rejects when the save that held them failed, and when reload() put the
+   * stored image in their place before they were stored.
    */
   private async saveThrough(generation: number): Promise<void> {
+    await this.waitForSave(generation, () => this.storeThrough(generation));
+  }
+
+  /** saveThrough()'s loop: settles once the writes up to `generation` are stored, or while a `BEGIN` is open. */
+  private async storeThrough(generation: number): Promise<void> {
     while (this.savedGeneration < generation && this.db && this.idb) {
       if (this.saving) {
         const covering = this.savingGeneration >= generation;
@@ -1413,6 +1445,27 @@ export class IndexedDbAdapter implements StorageAdapter {
         return;
       }
       await this.startSave();
+    }
+  }
+
+  /**
+   * Runs `wait`, which settles once the writes up to `generation` are stored,
+   * with the call among the save waiters, and rejects when reload() put the
+   * stored image in place of those writes before they were stored: the loop
+   * would otherwise read reload()'s generation as theirs and resolve.
+   */
+  private async waitForSave(generation: number, wait: () => Promise<void>): Promise<void> {
+    const waiter: SaveWaiter = { generation, discarded: false };
+    this.saveWaiters.add(waiter);
+    try {
+      await wait();
+    } finally {
+      this.saveWaiters.delete(waiter);
+    }
+    if (waiter.discarded) {
+      throw new Error(
+        `IndexedDbAdapter: reload() put the stored image of "${this.dbName}" in place of writes that were waiting to be stored; they are gone.`,
+      );
     }
   }
 
