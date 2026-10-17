@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DrainGate } from '../../src/features/sync/mutations/gate';
+import { PullCancelled } from '../../src/features/sync/mutations/handOver';
+import { MutationServer } from '../../src/features/sync/mutations/server';
 import { parsePullResponse } from '../../src/features/sync/mutations/wire';
 import { backends } from './backends';
 import { A, B, hex, pullOf, pulled, pushOf, world, type World } from './harness';
@@ -64,6 +66,24 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('the 
     await chunks.next();
     controller.abort(new Error('the request went away'));
     await expect(chunks.next()).rejects.toThrow('the request went away');
+    await expect(w.server.push(w.context(), pushOf(w, B, [{ name: 'create', args: { id: hex(6), value: 'row 6' } }], 6))).resolves.toEqual({ kind: 'ok', processed: 1 });
+  });
+
+  it('cancels a stream whose reader stops reading once maxPullMs has passed, and its transaction ends', async () => {
+    await rows(w, 5);
+    const server = new MutationServer({ ...w.options, maxPullMs: 50 });
+    const opening = await server.pull(w.context(), pullOf(w, A));
+    if (opening.kind !== 'stream') throw new Error('no stream');
+    const chunks = opening.chunks[Symbol.asyncIterator]();
+    try {
+      await chunks.next();
+      // the reader stops reading: the deadline cancels the stream, and its transaction ends without the reader
+      const ended = await Promise.race([opening.done.then(() => 'ended'), new Promise<string>((resolve) => setTimeout(() => resolve('still open'), 2000))]);
+      expect(ended).toBe('ended');
+      await expect(chunks.next()).rejects.toBeInstanceOf(PullCancelled);
+    } finally {
+      await chunks.return?.();
+    }
     await expect(w.server.push(w.context(), pushOf(w, B, [{ name: 'create', args: { id: hex(6), value: 'row 6' } }], 6))).resolves.toEqual({ kind: 'ok', processed: 1 });
   });
 
