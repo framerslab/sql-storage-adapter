@@ -2,17 +2,17 @@ name: Review comments
 
 # Posts ESLint's findings on the lines a pull request adds as review comments,
 # through reviewdog. It never fails: the build job's lint step in ci.yml is
-# unchanged, and this workflow is not a required check. The path filter skips
-# pull requests that change nothing ESLint reads, so it has to stay optional.
+# unchanged, and this workflow is not a required check.
+#
+# There is no path filter. reviewdog deletes its earlier comments whose finding
+# is gone, but only in a run, so a push that drops a pull request's last change
+# under src/ still needs one.
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
-    paths:
-      - 'src/**'
-      - 'eslint.config.js'
-      - 'package.json'
-      - '.github/workflows/review-comments.yml'
+    # edited runs the job only when the base branch changed (see the job's if),
+    # so the comments follow the new diff; a title or body edit runs nothing.
+    types: [opened, synchronize, reopened, edited]
 
 # reviewdog's github-pr-review reporter creates, lists and deletes review
 # comments; pull-requests is the one scope it writes.
@@ -20,16 +20,26 @@ permissions:
   contents: read
   pull-requests: write
 
+# A title or body edit takes a group of its own (its run id), so it cancels no
+# lint run; any other run replaces the one before it on the same pull request.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}-${{ github.event.action == 'edited' && !github.event.changes.base && github.run_id || 'eslint' }}
   cancel-in-progress: true
 
 jobs:
   eslint:
-    # A fork's token, and Dependabot's, can read the repository but cannot post a review.
-    # The head's packages and ESLint config run with this token; that gives a branch's
-    # author nothing new, since they can already change any workflow on the branch.
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+    # Forks are skipped: their token is read-only, so reviewdog could not post.
+    # Runs that Dependabot triggers are skipped: Dependabot changes manifests,
+    # never a line under src/, and skipping them keeps a newly bumped ESLint
+    # package from running with this token. A maintainer's push to a Dependabot
+    # branch still runs.
+    # A branch of this repository runs its own packages and ESLint config with
+    # this token; that gives its author nothing new, since they can already
+    # change any workflow on the branch.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]' &&
+      (github.event.action != 'edited' || github.event.changes.base)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
