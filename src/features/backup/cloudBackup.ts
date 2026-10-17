@@ -63,7 +63,7 @@ export interface CloudStorageProvider {
   download(key: string): Promise<string | Buffer>;
   
   /**
-   * List available backups in cloud storage
+   * Lists every key under a prefix, page after page
    * @param prefix - Optional prefix to filter backups
    * @returns Array of backup keys
    */
@@ -158,14 +158,23 @@ export class S3StorageProvider implements CloudStorageProvider {
     return response.Body.toString('utf-8');
   }
 
+  /**
+   * Lists every key under a prefix, page after page: each ListObjectsV2
+   * request after the first carries the NextContinuationToken of the one
+   * before, until a page is not truncated or names no token.
+   */
   async list(prefix?: string): Promise<string[]> {
     const { ListObjectsV2Command } = await import('@aws-sdk/client-s3');
-    const response = await this.client.send(new ListObjectsV2Command({
-      Bucket: this.bucket,
-      Prefix: prefix,
-    })) as { Contents?: Array<{ Key?: string }> };
-    
-    return response.Contents?.map((obj) => obj.Key).filter((key): key is string => !!key) ?? [];
+    const keys: string[] = [];
+    let token: string | undefined;
+    do {
+      const response = (await this.client.send(
+        new ListObjectsV2Command({ Bucket: this.bucket, Prefix: prefix, ContinuationToken: token }),
+      )) as { Contents?: Array<{ Key?: string }>; IsTruncated?: boolean; NextContinuationToken?: string };
+      for (const object of response.Contents ?? []) if (object.Key) keys.push(object.Key);
+      token = response.IsTruncated === true ? response.NextContinuationToken : undefined;
+    } while (token !== undefined);
+    return keys;
   }
 
   async delete(key: string): Promise<void> {
