@@ -1,3 +1,9 @@
+## [0.7.16] - 2026-10-17
+
+### Fixed
+- `SupabaseAdapter` with `enableCache()` on never answers a row as it stood before one of its own writes. `get` and `all` kept each answer by statement and parameters, and no write cleared them, so a row read, then changed through `run`, `exec`, `transaction` or `batchWrite`, came back from the cache unchanged. They also kept the answer of a statement that writes: `get('INSERT ... RETURNING id', params)` ran once, and the second call answered the first row without inserting. The cache now keeps plain reads alone (a statement whose first word, past white space and comments, is `SELECT`, and which names no `INTO`); every other statement and every transaction clears it when it ends, and a read that a write or `clearCache()` overtook keeps nothing. A write through another adapter, pool or process, and a `SELECT` whose answer changes with no write, such as one that calls `nextval()` or `now()`, still answer from the cache until `clearCache()`.
+- `S3StorageProvider.list` (#64) answers every key under the prefix: it sends `ListObjectsV2` again with each page's `NextContinuationToken` until a page is not truncated. It answered the first page alone.
+
 ## [0.7.15] - 2026-10-17
 
 ### Added

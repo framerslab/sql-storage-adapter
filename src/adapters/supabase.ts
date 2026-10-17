@@ -56,6 +56,41 @@ const failure = (message: string, error: unknown): Error => {
   return wrapped;
 };
 
+/**
+ * Whether the query cache may keep a statement's answer: a plain read, whose first word past white space and comments
+ * is SELECT and which names no INTO, so it makes no table. Block comments nest, as PostgreSQL reads them. Any other
+ * statement can write, such as `UPDATE ... RETURNING` through `get`, and runs each time it is asked.
+ */
+const isPlainRead = (statement: unknown): boolean => {
+  if (typeof statement !== 'string') return false;
+  let at = 0;
+  for (;;) {
+    while (at < statement.length && /\s/.test(statement.charAt(at))) at += 1;
+    if (statement.startsWith('--', at)) {
+      const end = statement.indexOf('\n', at);
+      if (end < 0) return false;
+      at = end + 1;
+    } else if (statement.startsWith('/*', at)) {
+      let depth = 1;
+      at += 2;
+      while (depth > 0) {
+        if (at >= statement.length) return false;
+        if (statement.startsWith('/*', at)) {
+          depth += 1;
+          at += 2;
+        } else if (statement.startsWith('*/', at)) {
+          depth -= 1;
+          at += 2;
+        } else {
+          at += 1;
+        }
+      }
+    } else {
+      return /^select\b/i.test(statement.slice(at, at + 7)) && !/\binto\b/i.test(statement);
+    }
+  }
+};
+
 /** @deprecated Use `createPostgresAdapter` from `@framers/sql-storage-adapter/postgres` with the Supabase connection string. */
 export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions {
   readonly kind = 'supabase-postgres';
@@ -81,6 +116,8 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
   private queryCache = new Map<string, unknown>();
   private cacheEnabled = false;
   private maxCacheSize = 100;
+  /** Moves with every `clearCache()`, so a read that was in flight across one keeps nothing. */
+  private cacheGeneration = 0;
 
   async open(options?: SupabaseAdapterOptions): Promise<void> {
     this.options = options;
@@ -177,98 +214,88 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       };
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
+    } finally {
+      this.clearCache();
+    }
+  }
+
+  /** The key a plain read is cached under while the cache is on; `undefined` for any other statement or with it off. */
+  private cacheKeyOf(read: boolean, statement: string, parameters?: StorageParameters): string | undefined {
+    return this.cacheEnabled && read ? this.getCacheKey(statement, parameters) : undefined;
+  }
+
+  /** The cached answer under the key, counted as a hit; `undefined` when the cache holds none. */
+  private cached<T>(cacheKey: string | undefined): T | undefined {
+    if (cacheKey === undefined) return undefined;
+    if (this.queryCache.has(cacheKey)) {
+      if (this.metrics.cacheHits !== undefined) {
+        this.metrics.cacheHits++;
+      }
+      return this.queryCache.get(cacheKey) as T;
+    }
+    if (this.metrics.cacheMisses !== undefined) {
+      this.metrics.cacheMisses++;
+    }
+    return undefined;
+  }
+
+  /** Keeps a plain read's answer under its key, unless a write or `clearCache()` came while it was read. */
+  private keep(cacheKey: string | undefined, generation: number, value: unknown): void {
+    if (cacheKey === undefined || !this.cacheEnabled || generation !== this.cacheGeneration) return;
+    this.queryCache.set(cacheKey, value);
+    if (this.queryCache.size > this.maxCacheSize) {
+      const firstKey = this.queryCache.keys().next().value;
+      if (firstKey !== undefined) {
+        this.queryCache.delete(firstKey);
+      }
     }
   }
 
   async get<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T | null> {
     if (!this.pool) throw new Error('Storage adapter not opened');
 
-    // Check cache
-    if (this.cacheEnabled) {
-      const cacheKey = this.getCacheKey(statement, parameters);
-      if (this.queryCache.has(cacheKey)) {
-        if (this.metrics.cacheHits !== undefined) {
-          this.metrics.cacheHits++;
-        }
-        const cached = this.queryCache.get(cacheKey) as T | null | undefined;
-        return cached ?? null;
-      }
-      if (this.metrics.cacheMisses !== undefined) {
-        this.metrics.cacheMisses++;
-      }
-    }
+    const read = isPlainRead(statement);
+    const cacheKey = this.cacheKeyOf(read, statement, parameters);
+    const cached = this.cached<T | null>(cacheKey);
+    if (cached !== undefined) return cached ?? null;
 
+    const generation = this.cacheGeneration;
     const startTime = Date.now();
     try {
       const result = await this.pool.query(...prepare(statement, parameters));
       this.trackQuery(statement, startTime);
 
       const value = result.rows[0] || null;
-
-      // Update cache
-      if (this.cacheEnabled && value !== null) {
-        const cacheKey = this.getCacheKey(statement, parameters);
-        this.queryCache.set(cacheKey, value);
-
-        // Enforce cache size limit
-        if (this.queryCache.size > this.maxCacheSize) {
-          const firstKey = this.queryCache.keys().next().value;
-          if (firstKey !== undefined) {
-            this.queryCache.delete(firstKey);
-          }
-        }
-      }
-
+      if (value !== null) this.keep(cacheKey, generation, value);
       return value as T;
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
+    } finally {
+      if (!read) this.clearCache();
     }
   }
 
   async all<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T[]> {
     if (!this.pool) throw new Error('Storage adapter not opened');
 
-    // Check cache
-    if (this.cacheEnabled) {
-      const cacheKey = this.getCacheKey(statement, parameters);
-      if (this.queryCache.has(cacheKey)) {
-        if (this.metrics.cacheHits !== undefined) {
-          this.metrics.cacheHits++;
-        }
-        const cached = this.queryCache.get(cacheKey) as T[] | undefined;
-        if (cached) {
-          return cached;
-        }
-      }
-      if (this.metrics.cacheMisses !== undefined) {
-        this.metrics.cacheMisses++;
-      }
-    }
+    const read = isPlainRead(statement);
+    const cacheKey = this.cacheKeyOf(read, statement, parameters);
+    const cached = this.cached<T[]>(cacheKey);
+    if (cached !== undefined) return cached;
 
+    const generation = this.cacheGeneration;
     const startTime = Date.now();
     try {
       const result = await this.pool.query(...prepare(statement, parameters));
       this.trackQuery(statement, startTime);
 
       const rows = result.rows;
-
-      // Update cache
-      if (this.cacheEnabled) {
-        const cacheKey = this.getCacheKey(statement, parameters);
-        this.queryCache.set(cacheKey, rows);
-
-        // Enforce cache size limit
-        if (this.queryCache.size > this.maxCacheSize) {
-          const firstKey = this.queryCache.keys().next().value;
-          if (firstKey !== undefined) {
-            this.queryCache.delete(firstKey);
-          }
-        }
-      }
-
+      this.keep(cacheKey, generation, rows);
       return rows as T[];
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
+    } finally {
+      if (!read) this.clearCache();
     }
   }
 
@@ -281,6 +308,8 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       this.trackQuery(script, startTime);
     } catch (error) {
       throw failure(`Script execution failed: ${error}`, error);
+    } finally {
+      this.clearCache();
     }
   }
 
@@ -323,6 +352,8 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       throw error;
     } finally {
       client.release();
+      // What the transaction wrote is visible from here, so nothing read before it may answer again.
+      this.clearCache();
     }
   }
 
@@ -481,6 +512,15 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     };
   }
 
+  /**
+   * Keeps the answers of plain reads through `get` and `all`, at most `maxSize` of them, and answers the same statement
+   * with the same parameters from them. A plain read is a statement whose first word, past white space and comments, is
+   * SELECT, and which names no INTO. Every other statement, through `run`, `exec`, `get` or `all`, and every
+   * `transaction`, `batchWrite` and `migrate`, clears the cache when it ends, and a read that was in flight across one
+   * keeps nothing, so the cache never answers a row as it stood before this adapter's own write. It cannot see a write
+   * through another adapter, pool or process, nor a SELECT whose answer changes with no write at all, such as one that
+   * calls `nextval()` or `now()`: those answer from the cache until `clearCache()`.
+   */
   enableCache(maxSize: number = 100): void {
     this.cacheEnabled = true;
     this.maxCacheSize = maxSize;
@@ -491,7 +531,9 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     this.clearCache();
   }
 
+  /** Empties the cache; a read in flight when it is called keeps nothing. */
   clearCache(): void {
+    this.cacheGeneration += 1;
     this.queryCache.clear();
   }
 
