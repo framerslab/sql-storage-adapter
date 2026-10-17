@@ -41,9 +41,16 @@ export interface FetchTransportOptions {
   refusal?: (status: number, text: string, headers: Headers) => TransportRefusal | null;
 }
 
+/**
+ * How long a rate refusal asks to wait: Retry-After's delay in seconds, or the time until its HTTP date (RFC 9110,
+ * section 10.2.3); two seconds for a value it cannot read, a delay of zero or a date already past.
+ */
 function retryAfterMs(headers: Headers): number {
-  const seconds = Number(headers.get('retry-after') ?? '');
-  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 2000;
+  const value = (headers.get('retry-after') ?? '').trim();
+  if (value === '') return 2000;
+  const seconds = Number(value);
+  const ms = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - Date.now();
+  return Number.isFinite(ms) && ms > 0 ? ms : 2000;
 }
 
 function parseJson(text: string): unknown {

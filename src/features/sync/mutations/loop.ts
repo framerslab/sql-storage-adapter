@@ -3,7 +3,8 @@
  * becomes visible, on reconnecting and on sign-in, and every `pullEveryMs` while the page is visible. A failed cycle is
  * tried again after `firstRetryMs`, doubling to `maxRetryMs`; a rate refusal waits as long as it asks, and a kick during
  * that wait, or during the cycle the refusal ended, runs nothing before the wait is over. One cycle runs at a time; a
- * kick during a cycle runs one more after it.
+ * kick during a cycle runs one more after it. A stop ends the run: a cycle still running when it came schedules
+ * nothing, even when the loop starts again before that cycle ends.
  */
 import type { SyncOutcome } from './client';
 
@@ -39,21 +40,28 @@ export class SyncLoop {
   private stopped = true;
   /** A rate refusal's wait is running: a kick runs nothing until its timer does. */
   private holding = false;
+  /** Counts the stops, so a cycle a stop overtook sees another count when it ends. */
+  private stops = 0;
   private retryMs: number;
 
   constructor(private readonly options: SyncLoopOptions) {
     this.retryMs = options.firstRetryMs ?? 2000;
   }
 
-  /** Starts with a cycle at once. */
+  /** Starts with a cycle at once; its retries begin from `firstRetryMs` again. */
   start(): void {
     this.stopped = false;
+    this.retryMs = this.options.firstRetryMs ?? 2000;
     this.kick('load');
   }
 
-  /** Stops; a running cycle ends and schedules nothing, and a rate refusal's wait is dropped. */
+  /**
+   * Stops; a running cycle ends and schedules nothing, even when the loop starts again before it ends, and a rate
+   * refusal's wait is dropped.
+   */
   stop(): void {
     this.stopped = true;
+    this.stops += 1;
     this.again = false;
     this.holding = false;
     if (this.timer !== null) clearTimeout(this.timer);
@@ -71,44 +79,58 @@ export class SyncLoop {
   }
 
   private async cycle(): Promise<void> {
+    const stops = this.stops;
     this.running = true;
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;
-    let next: number | null = null;
-    let refused = false;
+    let wait: number | null = null;
+    let hidden = false;
+    let failed = false;
     try {
       for (let round = 0; round < 5; round += 1) {
         const pushed = await this.options.client.push();
         if (pushed.kind === 'wait') {
-          next = pushed.ms;
-          refused = true;
+          wait = pushed.ms;
           break;
         }
         if (pushed.kind === 'resend') continue;
         const pulled = await this.options.client.pull();
         if (pulled.kind === 'wait') {
-          next = pulled.ms;
-          refused = true;
+          wait = pulled.ms;
           break;
         }
         // after a recovery the rebuilt mutations go again at once
         if (pushed.kind === 'recovering' || pulled.kind === 'recovering') continue;
         break;
       }
-      this.retryMs = this.options.firstRetryMs ?? 2000;
-      if (next === null && (this.options.visible?.() ?? true)) next = this.options.pullEveryMs ?? 60_000;
+      hidden = wait === null && !(this.options.visible?.() ?? true);
     } catch (error) {
+      failed = true;
       try {
         this.options.onError?.(error);
       } catch {
         // the listener's own failure is dropped: the retry below still stands
       }
-      next = this.retryMs;
-      this.retryMs = Math.min(this.retryMs * 2, this.options.maxRetryMs ?? 300_000);
     } finally {
       this.running = false;
     }
     if (this.stopped) return;
+    if (stops !== this.stops) {
+      // the loop stopped and started again while this cycle ran: its outcome was the stopped run's, and the new run's
+      // first kick, held while this cycle ran, runs now
+      this.again = false;
+      void this.cycle();
+      return;
+    }
+    let next: number | null;
+    if (failed) {
+      next = this.retryMs;
+      this.retryMs = Math.min(this.retryMs * 2, this.options.maxRetryMs ?? 300_000);
+    } else {
+      this.retryMs = this.options.firstRetryMs ?? 2000;
+      next = wait ?? (hidden ? null : (this.options.pullEveryMs ?? 60_000));
+    }
+    const refused = !failed && wait !== null;
     if (this.again) {
       this.again = false;
       // a kick during a refused cycle is served by the cycle its wait's timer runs

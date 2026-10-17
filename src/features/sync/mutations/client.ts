@@ -200,16 +200,16 @@ function randomHexId(): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-/** The client's tables. */
+/** The client's tables; every counter column is BIGINT, as wide as the protocol's counters, on every database. */
 export function clientDdl(p: string): string[] {
   return [
-    `CREATE TABLE IF NOT EXISTS ${p}membership (scope TEXT PRIMARY KEY, state TEXT NOT NULL, grp TEXT, client_id TEXT, activation TEXT NOT NULL, epoch TEXT, cookie INTEGER, next_mutation_id INTEGER NOT NULL, sends TEXT NOT NULL, recovering INTEGER NOT NULL, declined_group TEXT, removing INTEGER NOT NULL, synced_at TEXT)`,
-    `CREATE TABLE IF NOT EXISTS ${p}rows (scope TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, value TEXT, rev_client TEXT NOT NULL, rev_mutation INTEGER NOT NULL, version INTEGER NOT NULL, PRIMARY KEY (scope, id))`,
+    `CREATE TABLE IF NOT EXISTS ${p}membership (scope TEXT PRIMARY KEY, state TEXT NOT NULL, grp TEXT, client_id TEXT, activation TEXT NOT NULL, epoch TEXT, cookie BIGINT, next_mutation_id BIGINT NOT NULL, sends TEXT NOT NULL, recovering INTEGER NOT NULL, declined_group TEXT, removing INTEGER NOT NULL, synced_at TEXT)`,
+    `CREATE TABLE IF NOT EXISTS ${p}rows (scope TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, value TEXT, rev_client TEXT NOT NULL, rev_mutation BIGINT NOT NULL, version BIGINT NOT NULL, PRIMARY KEY (scope, id))`,
     `CREATE TABLE IF NOT EXISTS ${p}base (scope TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (scope, id))`,
-    `CREATE TABLE IF NOT EXISTS ${p}pending (scope TEXT NOT NULL, mutation_id INTEGER NOT NULL, name TEXT NOT NULL, args TEXT NOT NULL, size_error INTEGER NOT NULL, PRIMARY KEY (scope, mutation_id))`,
-    `CREATE TABLE IF NOT EXISTS ${p}journal (scope TEXT NOT NULL, grp TEXT NOT NULL, client_id TEXT NOT NULL, mutation_id INTEGER NOT NULL, name TEXT NOT NULL, args TEXT NOT NULL, PRIMARY KEY (scope, grp, client_id, mutation_id))`,
-    `CREATE TABLE IF NOT EXISTS ${p}results (scope TEXT NOT NULL, client_id TEXT NOT NULL, mutation_id INTEGER NOT NULL, outcome TEXT NOT NULL, reason TEXT, target_id TEXT NOT NULL, rev_client TEXT, rev_mutation INTEGER, PRIMARY KEY (scope, client_id, mutation_id))`,
-    `CREATE TABLE IF NOT EXISTS ${p}kept (scope TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, reason TEXT NOT NULL, grp TEXT, rev_client TEXT, rev_mutation INTEGER, PRIMARY KEY (scope, id))`,
+    `CREATE TABLE IF NOT EXISTS ${p}pending (scope TEXT NOT NULL, mutation_id BIGINT NOT NULL, name TEXT NOT NULL, args TEXT NOT NULL, size_error INTEGER NOT NULL, PRIMARY KEY (scope, mutation_id))`,
+    `CREATE TABLE IF NOT EXISTS ${p}journal (scope TEXT NOT NULL, grp TEXT NOT NULL, client_id TEXT NOT NULL, mutation_id BIGINT NOT NULL, name TEXT NOT NULL, args TEXT NOT NULL, PRIMARY KEY (scope, grp, client_id, mutation_id))`,
+    `CREATE TABLE IF NOT EXISTS ${p}results (scope TEXT NOT NULL, client_id TEXT NOT NULL, mutation_id BIGINT NOT NULL, outcome TEXT NOT NULL, reason TEXT, target_id TEXT NOT NULL, rev_client TEXT, rev_mutation BIGINT, PRIMARY KEY (scope, client_id, mutation_id))`,
+    `CREATE TABLE IF NOT EXISTS ${p}kept (scope TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, reason TEXT NOT NULL, grp TEXT, rev_client TEXT, rev_mutation BIGINT, PRIMARY KEY (scope, id))`,
   ];
 }
 
@@ -243,8 +243,13 @@ function holds(m: Membership, context: RequestContext): boolean {
   return m.state === 'joined' && m.group === context.group && m.clientId === context.clientId && m.activation === context.activation && m.epoch === context.epoch;
 }
 
+/**
+ * A visible row as a save plans against it. A kept row is held here alone and a save creates it again, but for an
+ * unreadable one and one kept too long at the revision of the edit it holds: a save edits each at its revision.
+ */
 function plannedOf(row: VisibleRow): PlannedRow {
-  return { id: row.id, value: row.value, revision: row.revision, local: row.source === 'kept' && row.reason !== 'unreadable' };
+  const edited = row.reason === 'unreadable' || (row.reason === 'too_long' && row.revision !== null);
+  return { id: row.id, value: row.value, revision: row.revision, local: row.source === 'kept' && !edited };
 }
 
 function changeOf(before: ReadonlyMap<string, { value: string }>, after: ReadonlyMap<string, { value: string }>): VisibleChange {
@@ -320,8 +325,9 @@ export class MutationClient {
 
   /**
    * Saves: the caller's data written by `write` and, while joined, the mutations that take the visible rows to `rows`,
-   * each with its journal record, in one transaction. A value too long for the account is kept in this browser and
-   * gets no mutation id; a save that would send more deletes than `allowDeletes` throws `DeletesChanged`.
+   * each with its journal record, in one transaction. A value too long for the account is kept in this browser under
+   * its row's id and gets no mutation id (an edit's keeps the revision it was made against); a save that would send
+   * more deletes than `allowDeletes` throws `DeletesChanged`.
    */
   async save(input: { rows: ReadonlyArray<{ id: string; value: string }>; write(trx: StorageAdapter): Promise<void>; allowDeletes?: number }): Promise<SaveResult> {
     return this.locked(async (trx, m) => {
@@ -339,9 +345,10 @@ export class MutationClient {
       const tooLong: string[] = [];
       for (const mutation of planned) {
         if (mutation.name !== 'delete' && mutation.args.value.length > this.options.policy.maxUnits) {
-          const id = mutation.name === 'create' ? mutation.args.id : this.randomId();
-          await this.keep(trx, { id, value: mutation.args.value, reason: 'too_long', group: null, revision: null });
-          tooLong.push(id);
+          // kept under its own id; an edit keeps the revision it was made against, so a save that fits edits the row
+          const revision = mutation.name === 'edit' ? mutation.args.expected : null;
+          await this.keep(trx, { id: mutation.args.id, value: mutation.args.value, reason: 'too_long', group: revision === null ? null : state.group, revision });
+          tooLong.push(mutation.args.id);
           continue;
         }
         state = await this.issue(trx, state, mutation);
@@ -407,7 +414,8 @@ export class MutationClient {
   /**
    * Joins `group` with the blocks `readBlocks` reads inside the merge's transaction: a new client and activation, a full
    * snapshot staged first, then the merge (see the module's comment), the creates issued, and what became visible handed
-   * to the caller, ids for unmarked blocks among it.
+   * to the caller, ids for unmarked blocks among it. A join whose snapshot does not come, refused or failed, turns the
+   * membership off again, and the caller joins once more.
    */
   async join(input: { group: string; epoch: string; readBlocks(trx: StorageAdapter): Promise<LocalBlock[]> }): Promise<SyncOutcome> {
     const intent = await this.locked(async (trx, m) => {
@@ -434,11 +442,14 @@ export class MutationClient {
     });
     if (intent === null || intent.clientId === null) return { kind: 'idle' };
     const clientId = intent.clientId;
-    const answer = await this.options.transport.pull({ group: input.group, epoch: input.epoch, clientId, cookie: null });
+    const answer = await this.options.transport.pull({ group: input.group, epoch: input.epoch, clientId, cookie: null }).catch(async (error: unknown) => {
+      // no snapshot came: the joining state goes, since no push or pull could finish it; a revert that fails leaves it
+      // to the next join, which replaces it, and the caller hears the request's own error
+      await this.abandonJoin(intent.activation).catch(() => undefined);
+      throw error;
+    });
     if (answer.kind !== 'pull') {
-      await this.locked(async (trx, m) => {
-        if (m.state === 'joining' && m.activation === intent.activation) await this.saveMembership(trx, { ...m, state: 'off', group: null, clientId: null, epoch: null, activation: this.randomId() });
-      });
+      await this.abandonJoin(intent.activation);
       if (answer.kind === 'rate_limited') return { kind: 'wait', ms: answer.retryAfterMs };
       return { kind: answer.kind === 'group_gone' ? 'off' : 'stale' };
     }
@@ -649,6 +660,13 @@ export class MutationClient {
     });
   }
 
+  /** Turns a join that got no snapshot off again, only while the joining state is still the one it made. */
+  private async abandonJoin(activation: string): Promise<void> {
+    await this.locked(async (trx, m) => {
+      if (m.state === 'joining' && m.activation === activation) await this.saveMembership(trx, { ...m, state: 'off', group: null, clientId: null, epoch: null, activation: this.randomId() });
+    });
+  }
+
   /**
    * The removal's stamp: the state, the activation, the group, the epoch, the cookie, the counters and the kept rows, the
    * client's own records alone; a write of the caller's data that issues no mutation does not move it.
@@ -724,8 +742,9 @@ export class MutationClient {
       for (const result of answer.results) if (result.clientId === context.clientId) await this.writeResult(trx, result);
       const acknowledged = readCounter(answer.lastMutationIds[context.clientId] ?? '0');
       let state: Membership = { ...m, cookie: readCounter(answer.cookie), syncedAt: this.now().toISOString(), nextMutationId: Math.max(m.nextMutationId, acknowledged + 1) };
+      // a refused mutation's value is kept before its pending record goes, in a recovery as in any pull
+      await this.dropAcknowledged(trx, state, acknowledged);
       if (m.recovering) state = { ...(await this.rebuildPending(trx, state, acknowledged, before)), recovering: false };
-      else await this.dropAcknowledged(trx, state, acknowledged);
       await this.reconcileKept(trx);
       await this.saveMembership(trx, state);
       const change = changeOf(before, await this.visible(trx, state));
@@ -734,16 +753,31 @@ export class MutationClient {
     });
   }
 
-  /** Drops the pending mutations the server processed; a refused one's value is kept first. */
+  /**
+   * Drops the pending mutations the server processed; a refused one's value is kept first, under the id `visible`
+   * showed it at while the refusal was pending: beside a live row, the copy's id the mutation would have taken; at a
+   * deleted or missing row, that row's id; beside an unreadable row, that row's id, unless this browser keeps that
+   * row's text already, when a different value goes under the copy's id and the same value adds nothing.
+   */
   private async dropAcknowledged(trx: StorageAdapter, m: Membership, acknowledged: number): Promise<void> {
     const canonical = await this.canonical(trx);
+    const kept = await this.keptRows(trx);
     for (const pending of await this.pendingRows(trx)) {
       if (pending.mutationId > acknowledged) break;
       const result = await this.resultOf(trx, m.clientId as string, String(pending.mutationId));
       if (result !== null && result.outcome === 'refused' && result.reason !== null && result.reason !== 'stale' && pending.mutation.name !== 'delete') {
-        const live = canonical.get(result.targetId);
-        const id = live !== undefined && live.state !== 'tombstone' ? this.randomId() : result.targetId;
-        await this.keep(trx, { id, value: pending.mutation.args.value, reason: result.reason, group: m.group, revision: null });
+        const value = pending.mutation.args.value;
+        const held = canonical.get(result.targetId);
+        const there = kept.get(result.targetId);
+        const copyId = (): Promise<string> => copyIdOf({ group: m.group as string, clientId: m.clientId as string, mutationId: String(pending.mutationId) });
+        let id: string | null = result.targetId;
+        if (held !== undefined && held.state === 'live') id = await copyId();
+        else if (held !== undefined && held.state === 'unreadable' && there !== undefined) id = there.value === value ? null : await copyId();
+        if (id !== null) {
+          const row: KeptRow = { id, value, reason: result.reason, group: m.group, revision: null };
+          await this.keep(trx, row);
+          kept.set(id, row);
+        }
       }
       await trx.run(`DELETE FROM ${this.p}pending WHERE scope = ? AND mutation_id = ?`, [this.scope, pending.mutationId]);
     }
