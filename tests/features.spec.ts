@@ -40,7 +40,7 @@ describe('createStorageFeatures', () => {
     expect(features.fts).toBeInstanceOf(SqliteFts4);
   });
 
-  it('returns PostgresDialect + PostgresFts for postgres adapter', () => {
+  it('returns PostgresDialect + PostgresFts for postgres adapter', async () => {
     const features = createStorageFeatures(
       mockAdapter('postgres', {
         options: { connectionString: 'postgresql://user:pass@localhost:5432/testdb' },
@@ -49,10 +49,10 @@ describe('createStorageFeatures', () => {
     expect(features.dialect).toBeInstanceOf(PostgresDialect);
     expect(features.fts).toBeInstanceOf(PostgresFts);
     expect(features.exporter).toBeInstanceOf(PostgresExporter);
-    // The exporter may name the adapter's database when an export runs.
-    const target = (features.exporter as unknown as { connectionString?: string | (() => string | undefined) })[
-      'connectionString'
-    ];
-    expect(typeof target === 'function' ? target() : target).toBe('postgresql://user:pass@localhost:5432/testdb');
+    // The exporter names the adapter's database when an export runs, as pg reads it.
+    const target = (
+      features.exporter as unknown as { connectionString?: string | (() => Promise<string | undefined>) }
+    )['connectionString'];
+    expect(typeof target === 'function' ? await target() : target).toBe('postgresql://user:pass@localhost:5432/testdb');
   });
 });

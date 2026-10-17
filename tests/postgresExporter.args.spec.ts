@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, vi } from 'vitest';
+import { describe, expect, it, afterEach, beforeEach, vi } from 'vitest';
 
 // PostgresExporter runs pg_dump. These specs read what it hands pg_dump: the
 // arguments, each passed as it is with no shell between, and the environment.
@@ -45,6 +45,16 @@ const postgresAdapter = (options: Record<string, unknown>): StorageAdapter =>
 /** The one --dbname argument of the last pg_dump run. */
 const dbnameOf = (args: string[]): string | undefined =>
   args.find((arg) => arg.startsWith('--dbname='))?.slice('--dbname='.length);
+
+/** What an export refused with, or null when it ran. */
+const refusal = (run: Promise<unknown>): Promise<Error | null> =>
+  run.then(
+    () => null,
+    (error: Error) => error,
+  );
+
+/** The variable pg reads the operating system's user name from. */
+const USER_VARIABLE = process.platform === 'win32' ? 'USERNAME' : 'USER';
 
 describe('PostgresExporter', () => {
   beforeEach(() => {
@@ -121,12 +131,13 @@ describe('PostgresExporter', () => {
     expect(calls[0].env.PGPASSWORD).toBe(password);
   });
 
-  it('leaves the password to the environment when the connection string holds none, or one libpq cannot decode', async () => {
+  it('leaves the password to the environment when the connection string holds none', async () => {
     for (const connectionString of [
       'postgresql://app@db.example/app',
       'postgresql://app:@db.example/app',
-      'postgresql://app:s3cr%zz@db.example/app',
       'host=db.example dbname=app user=app',
+      // pg_dump takes a string with no = that is not a URI for a database name.
+      'app',
     ]) {
       calls.length = 0;
       await new PostgresExporter(connectionString).exportToBytes();
@@ -134,6 +145,84 @@ describe('PostgresExporter', () => {
       expect(dbnameOf(calls[0].args)).toBe(connectionString);
       expect(calls[0].env.PGPASSWORD).toBe(process.env.PGPASSWORD);
     }
+  });
+
+  // A password that cannot be decoded cannot go to PGPASSWORD, and the URI that
+  // holds it showed it in the process list for as long as pg_dump ran.
+  it.each([
+    ['a % not followed by two hex digits', 'postgresql://app:s3cr%zz@db.example/app'],
+    ['a % at the end of the password', 'postgresql://app:s3cr%@db.example/app'],
+    ['bytes that are not UTF-8', 'postgresql://app:s3cr%ff@db.example/app'],
+    ['a password parameter', 'postgresql://app@db.example/app?password=s3cr%zz'],
+  ])('refuses a password it cannot decode, with %s, before pg_dump starts', async (_name, connectionString) => {
+    const failure = await refusal(new PostgresExporter(connectionString).exportToBytes());
+
+    expect(failure?.message).toMatch(/password.*not valid percent-encoding/);
+    expect(failure?.message).not.toContain('s3cr');
+    expect(calls).toHaveLength(0);
+  });
+
+  // libpq refuses %00, and Node's own refusal of a NUL in an argument or an
+  // environment variable repeats the value, password and all.
+  it.each([
+    ['a password that decodes to a NUL', 'postgresql://app:s3cr%00t@db.example/app'],
+    ['a connection string that holds a NUL', 'host=db.example password=s3cr\u0000t'],
+  ])('refuses %s before pg_dump starts', async (_name, connectionString) => {
+    const failure = await refusal(new PostgresExporter(connectionString).exportToBytes());
+
+    expect(failure?.message).toMatch(/NUL/);
+    expect(failure?.message).not.toContain('s3cr');
+    expect(calls).toHaveLength(0);
+  });
+
+  // libpq takes everything before the first @ that comes before any / as the
+  // user part, a ? included (fe-connect.c, conninfo_uri_parse_options): pg_dump
+  // reaches other.example as the user db.example?application_name=x, from the
+  // string as given and from the string with its password taken out alike.
+  it('reads a ? before the @ as libpq does, so the password libpq reads stays off the command line', async () => {
+    await new PostgresExporter('postgresql://db.example?application_name=x:s3cret@other.example').exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://db.example?application_name=x@other.example');
+    expect(calls[0].env.PGPASSWORD).toBe('s3cret');
+  });
+
+  // libpq reads keyword=value settings too: a value runs to whitespace, or sits
+  // in single quotes, and a backslash takes the character after it as it is.
+  it.each([
+    ['a bare value', 'host=db.example dbname=app user=app password=s3cret', 'host=db.example dbname=app user=app', 's3cret'],
+    [
+      'a quoted value with a space, a quote and a backslash',
+      "host=db.example password='s3 cr\\'e\\\\t' dbname=app",
+      'host=db.example  dbname=app',
+      "s3 cr'e\\t",
+    ],
+    ['a backslash before a space in a bare value', 'password=s3cr\\ et host=db.example', 'host=db.example', 's3cr et'],
+    ['spaces around the equals sign', 'password = s3cret host=db.example', 'host=db.example', 's3cret'],
+    ['two passwords, of which libpq takes the later', 'password=s3cr-first host=db.example password=s3cret', 'host=db.example', 's3cret'],
+  ])('keeps the password of keyword=value settings off the command line, with %s', async (_name, connectionString, dbname, password) => {
+    await new PostgresExporter(connectionString).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe(dbname);
+    expect(calls[0].args.join(' ')).not.toContain('s3cr');
+    expect(calls[0].env.PGPASSWORD).toBe(password);
+  });
+
+  it.each([
+    ['an unterminated quoted value', "host=db.example password='s3cret", /unterminated/],
+    ['a setting with no =', 'host=db.example password=s3cr et', /no "="/],
+  ])('refuses keyword=value settings libpq refuses, %s, before pg_dump starts', async (_name, connectionString, said) => {
+    const failure = await refusal(new PostgresExporter(connectionString).exportToBytes());
+
+    expect(failure?.message).toMatch(said);
+    expect(failure?.message).not.toContain('s3cr');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('takes the connection string from a function that resolves it when the export runs', async () => {
+    await new PostgresExporter(async () => 'postgresql://app:s3cret@db.example/app').exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example/app');
+    expect(calls[0].env.PGPASSWORD).toBe('s3cret');
   });
 
   it('writes a scheme in upper case in lower case, which libpq alone reads, when the string holds no password', async () => {
@@ -147,10 +236,7 @@ describe('PostgresExporter', () => {
     outcome.error = Object.assign(new Error('Command failed: pg_dump --dbname=postgresql://app:hunter2@db/app'), { code: 1 });
     outcome.stderr = 'pg_dump: error: connection to server failed: password authentication failed';
 
-    const failure = await new PostgresExporter('postgresql://app:hunter2@db/app').exportToBytes().then(
-      () => null,
-      (error: Error) => error,
-    );
+    const failure = await refusal(new PostgresExporter('postgresql://app:hunter2@db/app').exportToBytes());
 
     expect(failure?.message).toMatch(/password authentication failed/);
     expect(failure?.message).not.toContain('hunter2');
@@ -168,7 +254,20 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     calls.length = 0;
     outcome.error = null;
     outcome.stderr = '';
+    // pg reads these where the settings leave a value out, and takes the user
+    // name from the operating system's; each spec that needs one sets it.
+    for (const name of ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGSSLMODE', 'USER', 'USERNAME']) {
+      vi.stubEnv(name, '');
+    }
   });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /** The features exporter of an adapter on a pool of the caller made with these settings. */
+  const poolExporter = (settings: Record<string, unknown>) =>
+    createStorageFeatures(postgresAdapter({ pool: { options: settings } })).exporter;
 
   it("exports a segmented adapter's segment alone", async () => {
     const { exporter } = createStorageFeatures(
@@ -200,11 +299,271 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     expect(calls[0].env.PGPASSWORD).toBe('pool-secret');
   });
 
-  it('says what the pool lacks when a pool of the caller names no database', async () => {
-    const { exporter } = createStorageFeatures(postgresAdapter({ pool: { options: {} } }));
+  it('says what the pool lacks when a pool of the caller keeps no settings', async () => {
+    const { exporter } = createStorageFeatures(postgresAdapter({ pool: {} }));
 
     await expect(exporter.exportToBytes()).rejects.toThrow(/pool its caller made/);
     expect(calls).toHaveLength(0);
+  });
+
+  // pg reads PGHOST, PGPORT, PGUSER and PGDATABASE where the settings leave
+  // them out, then takes localhost, 5432, the operating system's user name and
+  // the user's name for the database (pg lib/connection-parameters.js). The
+  // export reaches the server pg reaches.
+  it('reaches the server the environment names for a pool of the caller made without a host or a port', async () => {
+    vi.stubEnv('PGHOST', 'env-host.example');
+    vi.stubEnv('PGPORT', '6543');
+
+    await poolExporter({ database: 'app', user: 'app' }).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@env-host.example:6543/app');
+  });
+
+  it('takes the user and the database the environment names, and the user name for the database, as pg does', async () => {
+    vi.stubEnv('PGUSER', 'env-user');
+    vi.stubEnv('PGDATABASE', 'env-db');
+    await poolExporter({ host: 'db.example' }).exportToBytes();
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://env-user@db.example:5432/env-db');
+
+    calls.length = 0;
+    vi.stubEnv('PGUSER', '');
+    vi.stubEnv('PGDATABASE', '');
+    vi.stubEnv(USER_VARIABLE, 'os-user');
+    await poolExporter({ host: 'db.example' }).exportToBytes();
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://os-user@db.example:5432/os-user');
+  });
+
+  it('reaches the database pg reaches for a pool of the caller made with no settings', async () => {
+    vi.stubEnv(USER_VARIABLE, 'os-user');
+
+    await poolExporter({}).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://os-user@localhost:5432/os-user');
+  });
+
+  it("keeps the adapter's own localhost and 5432 over PGHOST and PGPORT, as the pool it makes does", async () => {
+    vi.stubEnv('PGHOST', 'env-host.example');
+    vi.stubEnv('PGPORT', '6543');
+
+    await createStorageFeatures(postgresAdapter({ database: 'app', user: 'app' })).exporter.exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@localhost:5432/app');
+  });
+
+  // pg calls a password function for each connection it makes. The export
+  // calls it when it runs, and hands its answer to pg_dump in PGPASSWORD.
+  it('hands pg_dump the answer of the password function of a pool of the caller, asked when each export runs', async () => {
+    let asked = 0;
+    const seen: unknown[] = [];
+    const exporter = poolExporter({
+      host: 'db.example',
+      database: 'app',
+      user: 'app',
+      password: async (parameters: unknown) => {
+        seen.push(parameters);
+        asked += 1;
+        return `s3cret-token-${asked}`;
+      },
+    });
+
+    await exporter.exportToBytes();
+    await exporter.exportToBytes();
+
+    expect(calls.map((call) => call.env.PGPASSWORD)).toEqual(['s3cret-token-1', 's3cret-token-2']);
+    expect(calls.map((call) => call.args.join(' ')).join(' ')).not.toContain('s3cr');
+    expect(seen[0]).toMatchObject({ host: 'db.example', port: 5432, user: 'app', database: 'app' });
+  });
+
+  // pg itself connects with no password then; pg_dump, given none, reads
+  // PGPASSWORD and ~/.pgpass as libpq does.
+  it('gives pg_dump no password when the password function answers undefined', async () => {
+    await poolExporter({ host: 'db.example', database: 'app', password: () => undefined }).exportToBytes();
+
+    expect(calls[0].env.PGPASSWORD).toBe(process.env.PGPASSWORD);
+  });
+
+  it('refuses when the password function fails or answers with no string, before pg_dump starts', async () => {
+    for (const password of [
+      async () => {
+        throw new Error('token service down');
+      },
+      async () => 42,
+    ]) {
+      const failure = await refusal(poolExporter({ host: 'db.example', database: 'app', password }).exportToBytes());
+
+      expect(failure?.message).toMatch(/password function/);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  // pg reads a connection string over the pool's other connection settings,
+  // and the password it reads from one that holds none is empty, so a
+  // password function beside it is never called.
+  it('calls no password function beside a connection string, as pg calls none', async () => {
+    const password = vi.fn(async () => 's3cret-token');
+
+    await poolExporter({ connectionString: 'postgresql://app@db.example/app', password }).exportToBytes();
+
+    expect(password).not.toHaveBeenCalled();
+    expect(calls[0].env.PGPASSWORD).toBe(process.env.PGPASSWORD);
+  });
+
+  it.each([
+    ['ssl: true', true],
+    ['rejectUnauthorized: false', { rejectUnauthorized: false }],
+    ['an empty ssl object', {}],
+  ])('asks pg_dump for TLS where the pool uses it, with %s', async (_name, ssl) => {
+    await poolExporter({ host: 'db.example', database: 'app', user: 'app', ssl }).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=require');
+  });
+
+  it('keeps a PGSSLMODE that checks the server, where the pool asks for TLS', async () => {
+    vi.stubEnv('PGSSLMODE', 'verify-full');
+
+    await poolExporter({ host: 'db.example', database: 'app', user: 'app', ssl: true }).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app');
+    expect(calls[0].env.PGSSLMODE).toBe('verify-full');
+  });
+
+  // pg_dump reads TLS material from files alone, and sslmode=require in their
+  // place connected without the client certificate or checked no CA.
+  it.each([
+    ['a CA', { ca: ['CA ONE', Buffer.from('CA TWO')] }, /ssl settings ca cannot reach pg_dump/],
+    ['a CA beside rejectUnauthorized: false', { ca: 'CA PEM', rejectUnauthorized: false }, /ssl settings ca cannot/],
+    ['a client certificate and a key', { cert: Buffer.from('CERT PEM'), key: 'KEY PEM' }, /ssl settings cert, key cannot/],
+    [
+      'a pfx, its passphrase and a server name',
+      { pfx: Buffer.from('x'), passphrase: 's3cret', servername: 'db.internal' },
+      /ssl settings pfx, passphrase, servername cannot/,
+    ],
+  ])("refuses a pool's ssl with %s, naming the settings, before pg_dump starts", async (_name, ssl, said) => {
+    const failure = await refusal(poolExporter({ host: 'db.example', database: 'app', ssl }).exportToBytes());
+
+    expect(failure?.message).toMatch(said);
+    expect(failure?.message).toMatch(/sslrootcert/);
+    expect(failure?.message).not.toContain('s3cr');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('sees a key that pg-pool hides from enumeration', async () => {
+    const ssl: Record<string, unknown> = { key: 'KEY PEM' };
+    Object.defineProperty(ssl, 'key', { enumerable: false });
+
+    const failure = await refusal(poolExporter({ host: 'db.example', database: 'app', ssl }).exportToBytes());
+
+    expect(failure?.message).toMatch(/ssl settings key cannot/);
+  });
+
+  // pg makes no TLS connection when its ssl is false, or PGSSLMODE is a value
+  // it does not know; libpq would read PGSSLMODE, refuse pg's no-verify and an
+  // unknown value, and insist on TLS for require.
+  it.each([
+    ["pg's no-verify beside ssl: false", 'no-verify', false],
+    ['require beside ssl: false', 'require', false],
+    ['a value neither knows, with no ssl', 'sometimes', undefined],
+  ])('connects without TLS where pg does, with %s', async (_name, sslmode, ssl) => {
+    vi.stubEnv('PGSSLMODE', sslmode);
+
+    await poolExporter({ host: 'db.example', database: 'app', user: 'app', ssl }).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=disable');
+  });
+
+  it("reads PGSSLMODE as pg does where the pool sets no ssl: pg's no-verify is libpq's require", async () => {
+    vi.stubEnv('PGSSLMODE', 'no-verify');
+
+    await poolExporter({ host: 'db.example', database: 'app', user: 'app' }).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=require');
+  });
+
+  it("applies the pool's ssl beside a connection string that sets no TLS of its own, as pg does", async () => {
+    await poolExporter({ connectionString: 'postgresql://app@db.example/app', ssl: { rejectUnauthorized: false } }).exportToBytes();
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=require');
+
+    calls.length = 0;
+    await poolExporter({
+      connectionString: 'postgresql://app@db.example/app?sslmode=verify-full',
+      ssl: { ca: 'CA PEM' },
+    }).exportToBytes();
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=verify-full');
+  });
+
+  // pg reads a pool's connection string as a WHATWG URL (pg-connection-string),
+  // and libpq by its own grammar. The export hands pg_dump the string written
+  // so that libpq reads the parts pg reads.
+  it.each([
+    ['an @ in the password, where pg reads to the last @ of the authority', 'postgresql://app:p@ss@db.example/app', 'postgresql://app@db.example:5432/app', 'p@ss'],
+    [
+      'an @ in a parameter of a string with no path, where libpq would read the host after it',
+      'postgresql://db.example?application_name=x@y',
+      'postgresql://app@db.example:5432/app?application_name=x%40y',
+      undefined,
+    ],
+    ['no host, where pg takes localhost', 'postgresql:///app', 'postgresql://app@localhost:5432/app', undefined],
+    ['credentials and no host', 'postgresql://app:s3cret@/app', 'postgresql://app@localhost:5432/app', 's3cret'],
+    [
+      'a host parameter and no host',
+      'postgresql:///app?host=/var/run/postgresql',
+      'postgresql://app@%2Fvar%2Frun%2Fpostgresql:5432/app',
+      undefined,
+    ],
+    ['a fragment, which pg drops', 'postgresql://app@db.example/app#note', 'postgresql://app@db.example:5432/app', undefined],
+    ['a % that starts no escape, which pg reads as itself', 'postgresql://app:50%off@db.example/app', 'postgresql://app@db.example:5432/app', '50%off'],
+    ["pg's sslmode=no-verify, libpq's require", 'postgresql://app@db.example/app?sslmode=no-verify', 'postgresql://app@db.example:5432/app?sslmode=require', undefined],
+    ["pg's ssl=1", 'postgresql://app@db.example/app?ssl=1', 'postgresql://app@db.example:5432/app?sslmode=require', undefined],
+    ["pg's ssl=0", 'postgresql://app@db.example/app?ssl=0', 'postgresql://app@db.example:5432/app?sslmode=disable', undefined],
+    [
+      "pg's uselibpqcompat and statement_timeout, which libpq does not know",
+      'postgresql://app@db.example/app?uselibpqcompat=true&statement_timeout=5000&application_name=reports',
+      'postgresql://app@db.example:5432/app?application_name=reports',
+      undefined,
+    ],
+    [
+      'a certificate file, which turns pg\'s TLS on',
+      'postgresql://app@db.example/app?sslrootcert=/etc/ssl/ca.pem',
+      'postgresql://app@db.example:5432/app?sslrootcert=%2Fetc%2Fssl%2Fca.pem&sslmode=require',
+      undefined,
+    ],
+    // pg decodes the URL's user name only where no user parameter is given.
+    [
+      'a user parameter beside a user name that is not valid UTF-8, which pg never decodes',
+      'postgresql://ba%ffd@db.example/app?user=app',
+      'postgresql://app@db.example:5432/app',
+      undefined,
+    ],
+    // libpq reads these from the connection string alone, pg_dump's command
+    // line, and pg reads none of them.
+    [
+      'secrets pg does not read',
+      'postgresql://app@db.example/app?sslpassword=s3cr1&oauth_client_secret=s3cr2&scram_client_key=s3cr3&application_name=reports',
+      'postgresql://app@db.example:5432/app?application_name=reports',
+      undefined,
+    ],
+  ])('reads the connection string of a pool as pg does, with %s', async (_name, connectionString, dbname, password) => {
+    vi.stubEnv('PGUSER', 'app');
+
+    await poolExporter({ connectionString }).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe(dbname);
+    expect(calls[0].env.PGPASSWORD).toBe(password ?? process.env.PGPASSWORD);
+  });
+
+  it('reaches the host PGHOST names for a connection string with no host, as pg does', async () => {
+    vi.stubEnv('PGHOST', 'env-host.example');
+
+    await poolExporter({ connectionString: 'postgresql://app@/app' }).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@env-host.example:5432/app');
+  });
+
+  it('passes keyword=value settings of a pool as they are, for libpq to read', async () => {
+    await poolExporter({ connectionString: 'host=db.example dbname=app user=app password=s3cret' }).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe('host=db.example dbname=app user=app');
+    expect(calls[0].env.PGPASSWORD).toBe('s3cret');
   });
 
   it('writes a Unix-socket directory as libpq reads a host in a URI', async () => {
@@ -236,7 +595,7 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
 
     await exporter.exportToBytes();
 
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example/app');
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app');
     expect(calls[0].env.PGPASSWORD).toBe('s3cret');
     expect(calls[0].args).toContain('--schema="agentos"');
   });
@@ -248,7 +607,7 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
 
     await createStorageFeatures(adapter).exporter.exportToBytes();
 
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@opened.example/app');
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@opened.example:5432/app');
   });
 
   it('says what the adapter lacks when nothing names its database', async () => {

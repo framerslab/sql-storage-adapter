@@ -1,4 +1,4 @@
-import { describe, expect, it, afterAll, afterEach, beforeAll } from 'vitest';
+import { describe, expect, it, afterAll, afterEach, beforeAll, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -50,10 +50,19 @@ describe.skipIf(!POSTGRES_TEST_URL)('the PostgreSQL exporter, through pg_dump', 
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     for (const adapter of opened.splice(0)) {
       await adapter.close().catch(() => undefined);
     }
   });
+
+  /** A database of its own for one spec, dropped after the suite. */
+  const newDatabase = async (): Promise<string> => {
+    const database = unique('export');
+    databases.push(database);
+    await admin.exec(`CREATE DATABASE ${database}`);
+    return database;
+  };
 
   afterAll(async () => {
     for (const schema of schemas) {
@@ -105,6 +114,64 @@ describe.skipIf(!POSTGRES_TEST_URL)('the PostgreSQL exporter, through pg_dump', 
       await createStorageFeatures(adapter).exporter.exportToFile(file);
 
       expect(dumpedTables(file)).toEqual(['public.pooled_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg calls a pool's password function for each connection it makes; the
+  // export asks it too, and pg_dump logs in with its answer. CI's server asks
+  // a TCP connection for its password (scram-sha-256), and PGPASSWORD is empty.
+  it('exports through a pool of the caller whose password is a function, which it asks when the export runs', async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGPASSWORD', '');
+    let asked = 0;
+    const pool = new pg.Pool({
+      host: server.hostname,
+      port: Number(server.port || 5432),
+      database,
+      user: decodeURIComponent(server.username),
+      password: async () => {
+        asked += 1;
+        return decodeURIComponent(server.password);
+      },
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE function_items (id INTEGER PRIMARY KEY)');
+      const before = asked;
+
+      const file = path.join(dir, `${database}-function.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.function_items']);
+      expect(asked).toBe(before + 1);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg reads a pool's connection string as a WHATWG URL, libpq by its own
+  // grammar: given this string as it was, pg_dump read the user part up to the
+  // @ in the query and the host y.
+  it('exports through a pool whose connection string libpq reads apart from pg, where pg reaches', async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGUSER', decodeURIComponent(server.username));
+    vi.stubEnv('PGPASSWORD', decodeURIComponent(server.password));
+    vi.stubEnv('PGDATABASE', database);
+    const pool = new pg.Pool({ connectionString: `postgresql://${server.host}?application_name=x@y` });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE parsed_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-parsed.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.parsed_items']);
     } finally {
       await adapter.close();
       await pool.end();
