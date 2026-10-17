@@ -10,6 +10,10 @@ export interface IFullTextSearch {
   /**
    * Generate DDL to create the full-text search index.
    *
+   * Run it with `exec()`, which runs a script of several statements. On
+   * PostgreSQL the script holds `DO` blocks with semicolons inside them, so a
+   * caller that splits it on `;` itself would cut them.
+   *
    * @param config.table - Name for the FTS index/virtual table.
    * @param config.columns - Columns to index.
    * @param config.contentTable - Source table (for external-content FTS5).
