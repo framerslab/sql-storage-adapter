@@ -1,3 +1,4 @@
+import { runInNewContext } from 'node:vm';
 import { describe, expect, it, afterAll, beforeAll } from 'vitest';
 import { SupabaseAdapter, isUniqueViolation, setStorageLogger, type StorageLogger } from '../src/index.js';
 
@@ -239,6 +240,63 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
       expect(rows).toEqual([stored]);
       rows.pop();
       expect(await db.all(read, [18])).toEqual([stored]);
+    });
+
+    it('keeps no answer it cannot copy, such as an interval, which pg parses to an object of its own', async () => {
+      const span = "SELECT '1 hour'::interval AS span";
+      const first = await db.get<{ span: { hours?: number } }>(span);
+      expect(first?.span.hours).toBe(1);
+      if (!first) return;
+      first.span.hours = 5;
+
+      const hits = hitsSoFar();
+      expect((await db.get<{ span: { hours?: number } }>(span))?.span.hours).toBe(1);
+      expect((await db.all<{ span: { hours?: number } }>(span))[0]?.span.hours).toBe(1);
+      expect(hitsSoFar()).toBe(hits);
+    });
+
+    it('takes a string of statements for a write, whatever it commits before it ends', async () => {
+      const read = `SELECT label FROM ${table} WHERE id = ?`;
+      await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [20, 'one']);
+      expect(await db.get(read, [20])).toEqual({ label: 'one' });
+
+      // With no parameters pg sends the text as one simple query, and PostgreSQL runs each statement in it: the
+      // COMMIT ends the transaction the SELECT began in, and the UPDATE commits in one of its own.
+      await db.all(`SELECT 1 AS one; COMMIT; UPDATE ${table} SET label = 'two' WHERE id = 20`);
+      expect(await db.get(read, [20])).toEqual({ label: 'two' });
+    });
+
+    it('keys a read bound to bytes apart from one bound to an object that JSON writes alike', async () => {
+      // pg binds bytes as they are and any other object as its JSON text.
+      const size = 'SELECT length(?::bytea) AS n';
+      expect(await db.get(size, [Buffer.from([1])])).toEqual({ n: 1 });
+      expect(await db.get(size, [{ type: 'Buffer', data: [1] }])).toEqual({ n: 28 });
+      expect(await db.get(size, [Uint8Array.of(1, 2)])).toEqual({ n: 2 });
+      expect(await db.get(size, [{ 0: 1, 1: 2 }])).toEqual({ n: 13 });
+    });
+
+    it('runs a read bound to an object that pg binds through its own toPostgres each time it is asked', async () => {
+      const cents = 'SELECT ?::int AS cents';
+      expect(await db.get(cents, [{ toPostgres: () => '1' }])).toEqual({ cents: 1 });
+      expect(await db.get(cents, [{ toPostgres: () => '2' }])).toEqual({ cents: 2 });
+    });
+
+    it('keys a read bound to a Date made in another realm as a Date', async () => {
+      const shown = 'SELECT ?::text AS shown';
+      const foreign = runInNewContext('new Date(0)') as Date;
+      expect(foreign instanceof Date).toBe(false);
+      const iso = foreign.toISOString();
+      expect(await db.get(shown, [iso])).toEqual({ shown: iso });
+
+      const fromDate = await db.get<{ shown: string }>(shown, [foreign]);
+      expect(fromDate?.shown).not.toBe(iso);
+      expect(new Date(String(fromDate?.shown)).getTime()).toBe(0);
+    });
+
+    it('answers no read bound to text holding U+0000 from the cache, as PostgreSQL refuses that text', async () => {
+      const at = 'SELECT ?::timestamptz AS at';
+      expect(await db.get(at, [new Date(0)])).toEqual({ at: new Date(0) });
+      await expect(db.get(at, ['\u0000date:0'])).rejects.toThrow(/^Query failed: /);
     });
 
     it("keeps PostgreSQL's error code on a SELECT that fails, keeps nothing of it, and answers the next read", async () => {
