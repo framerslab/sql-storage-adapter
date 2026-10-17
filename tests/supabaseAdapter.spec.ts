@@ -208,6 +208,39 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
       expect(await db.get(shown, [at])).toEqual(fromDate);
     });
 
+    it('answers a copy, so a caller that changes the row or list it was given changes nothing the cache answers next', async () => {
+      await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [18, 'as stored']);
+      const read =
+        `SELECT label, ARRAY[id] AS ids, json_build_object('label', label) AS doc, ` +
+        `'2026-10-17T22:04:37Z'::timestamptz AS at, decode('ff', 'hex') AS bytes FROM ${table} WHERE id = ?`;
+      const stored = {
+        label: 'as stored',
+        ids: [18],
+        doc: { label: 'as stored' },
+        at: new Date(Date.UTC(2026, 9, 17, 22, 4, 37)),
+        bytes: Buffer.from([0xff]),
+      };
+
+      // The first caller's row, which the cache kept, then the row of a hit.
+      for (let pass = 0; pass < 2; pass += 1) {
+        const row = await db.get<typeof stored>(read, [18]);
+        expect(row).toEqual(stored);
+        expect(Buffer.isBuffer(row?.bytes)).toBe(true);
+        if (!row) return;
+        row.label = 'changed';
+        row.ids.push(19);
+        row.doc.label = 'changed';
+        row.at.setTime(0);
+        row.bytes[0] = 0;
+      }
+      expect(await db.get(read, [18])).toEqual(stored);
+
+      const rows = await db.all<typeof stored>(read, [18]);
+      expect(rows).toEqual([stored]);
+      rows.pop();
+      expect(await db.all(read, [18])).toEqual([stored]);
+    });
+
     it("keeps PostgreSQL's error code on a SELECT that fails, keeps nothing of it, and answers the next read", async () => {
       // More failed SELECTs than the pool holds clients: each one gives its client back.
       for (let attempt = 0; attempt < 25; attempt += 1) {
