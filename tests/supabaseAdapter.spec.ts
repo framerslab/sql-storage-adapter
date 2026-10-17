@@ -180,12 +180,16 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
       expect(await db.get(list, [16, 'one'])).toEqual({ id: 16 });
     });
 
-    it('keys a read by a bigint, and by NaN and the infinities apart from null, as it binds them', async () => {
+    it('keys a read bound to a bigint, which JSON cannot write', async () => {
       await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [17, 'big']);
       const byId = `SELECT label FROM ${table} WHERE id = ?::bigint`;
       expect(await db.get(byId, [17n])).toEqual({ label: 'big' });
       expect(await db.get(byId, [17n])).toEqual({ label: 'big' });
+      expect(await db.all(byId, [17n])).toEqual([{ label: 'big' }]);
+    });
 
+    it('keys a read bound to NaN or an infinity apart from one bound to null, which JSON writes alike', async () => {
+      await db.run(`UPDATE ${table} SET label = label WHERE id = ?`, [17]);
       const shown = 'SELECT ?::float8::text AS shown';
       expect(await db.get(shown, [null])).toEqual({ shown: null });
       expect(await db.get(shown, [Number.NaN])).toEqual({ shown: 'NaN' });
