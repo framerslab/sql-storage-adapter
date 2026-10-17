@@ -5,4 +5,5 @@ export * from './rows';
 export * from './handOver';
 export * from './server';
 export * from './sqlStore';
+export * from './gate';
 export * from './tabLock';
