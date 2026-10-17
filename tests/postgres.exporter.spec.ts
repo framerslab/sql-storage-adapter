@@ -230,6 +230,10 @@ describe.skipIf(!POSTGRES_TEST_URL)('the PostgreSQL exporter, through pg_dump', 
   // pg_dump gets an empty PGPASSWORD and is refused alike: with PGPASSWORD
   // left as it was, it logged in with the environment's password, which the
   // pool never sends. With no password and --no-password it fails at once.
+  // The pool itself never connects here: pg-pool keeps no client whose
+  // connection failed and never ends it, so the server would hold that
+  // half-done login until authentication_timeout, and DROP DATABASE waits on
+  // it (ProcSignalBarrier).
   it("logs pg_dump in with no password where the pool's password function answers none, as the pool does", async () => {
     const database = await newDatabase();
     const server = new URL(url);
@@ -243,8 +247,6 @@ describe.skipIf(!POSTGRES_TEST_URL)('the PostgreSQL exporter, through pg_dump', 
     });
     const adapter = createPostgresAdapter({ pool });
     try {
-      await expect(pool.query('SELECT 1')).rejects.toThrow();
-
       const file = path.join(dir, `${database}-no-password.dump`);
       await expect(createStorageFeatures(adapter).exporter.exportToFile(file)).rejects.toThrow(/pg_dump failed.*password/s);
     } finally {
