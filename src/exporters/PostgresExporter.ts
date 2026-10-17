@@ -48,24 +48,42 @@ const decodePart = (part: string): string | undefined => {
   }
 };
 
+/** An export refused before pg_dump starts. It never holds the connection string, which can hold a password. */
+const refusal = (why: string): Error => new Error(`PostgresExporter: ${why}`);
+
 /**
- * The database pg_dump connects to, with the password taken out of the
- * command line, where the process list shows it. A `postgres://` or
- * `postgresql://` URI is read as libpq reads one: the password of its user
- * part, or of its `password` parameter, which libpq takes over the user
- * part's, goes to PGPASSWORD, which pg_dump reads. A connection string of
- * another form, one that holds no password, or one whose password is not valid
- * percent-encoding is passed as it is, its scheme in lower case.
+ * The password of a URI, decoded for PGPASSWORD. libpq refuses `%00`, and a password that is not valid
+ * percent-encoded UTF-8 cannot become an environment variable: either would otherwise stay in the URI on pg_dump's
+ * command line, where the process list shows it.
  */
-const connectionOf = (connectionString: string): { dbname: string; env: Record<string, string> } => {
-  const found = URI_SCHEME.exec(connectionString)?.[0];
-  if (found === undefined) return { dbname: connectionString, env: {} };
+const uriPassword = (encoded: string): string => {
+  const password = decodePart(encoded);
+  if (password === undefined) {
+    throw refusal(
+      'the password in the connection string is not valid percent-encoding, so it cannot reach pg_dump through ' +
+        'PGPASSWORD. Percent-encode it, as encodeURIComponent does.',
+    );
+  }
+  if (password.includes('\u0000')) {
+    throw refusal('the password in the connection string decodes to a NUL character, which libpq refuses.');
+  }
+  return password;
+};
+
+/**
+ * The database pg_dump connects to, with the password of a `postgres://` or `postgresql://` URI taken out of the
+ * command line, where the process list shows it. The URI is read as libpq reads one: the password of its user part,
+ * or of its `password` parameter, which libpq takes over the user part's, goes to PGPASSWORD, which pg_dump reads.
+ */
+const uriConnectionOf = (connectionString: string, found: string): { dbname: string; env: Record<string, string> } => {
   const scheme = found.toLowerCase();
   const uri = scheme + connectionString.slice(found.length);
 
   let rest = uri.slice(scheme.length);
   let user = '';
   let encoded: string | undefined;
+  // libpq looks for the user part's @ up to the first / alone, so a ? before the @ belongs to the user part
+  // (fe-connect.c, conninfo_uri_parse_options), and it is read so here.
   const userPart = URI_USER_PART.exec(rest);
   if (userPart) {
     const colon = userPart[1].indexOf(':');
@@ -90,9 +108,100 @@ const connectionOf = (connectionString: string): { dbname: string; env: Record<s
     rest = rest.slice(0, query) + (kept.length > 0 ? `?${kept.join('&')}` : '');
   }
 
-  const password = encoded === undefined ? undefined : decodePart(encoded);
-  if (password === undefined) return { dbname: uri, env: {} };
-  return { dbname: `${scheme}${user ? `${user}@` : ''}${rest}`, env: { PGPASSWORD: password } };
+  if (encoded === undefined) return { dbname: uri, env: {} };
+  return { dbname: `${scheme}${user ? `${user}@` : ''}${rest}`, env: { PGPASSWORD: uriPassword(encoded) } };
+};
+
+/** Whitespace as libpq's conninfo parser reads it (C's isspace). */
+const isSpace = (char: string | undefined): boolean => char !== undefined && /[ \t\n\v\f\r]/.test(char);
+
+/**
+ * The settings of a keyword=value connection string, with each `password` setting taken out for PGPASSWORD, read as
+ * libpq reads them (fe-connect.c, conninfo_parse): a keyword runs to `=` or whitespace, a value runs to whitespace
+ * or sits in single quotes, a backslash takes the character after it as it is, and the later of two passwords wins.
+ */
+const keywordConnectionOf = (connectionString: string): { dbname: string; env: Record<string, string> } => {
+  const text = connectionString;
+  const passwordSpans: Array<[number, number]> = [];
+  let password: string | undefined;
+  let at = 0;
+  while (at < text.length) {
+    if (isSpace(text[at])) {
+      at += 1;
+      continue;
+    }
+    const start = at;
+    while (at < text.length && text[at] !== '=' && !isSpace(text[at])) at += 1;
+    const keyword = text.slice(start, at);
+    while (isSpace(text[at])) at += 1;
+    if (text[at] !== '=') {
+      throw refusal('the connection string is not keyword=value settings libpq reads: a setting has no "=".');
+    }
+    at += 1;
+    while (isSpace(text[at])) at += 1;
+    let value = '';
+    if (text[at] === "'") {
+      at += 1;
+      let closed = false;
+      while (at < text.length) {
+        const char = text[at];
+        at += 1;
+        if (char === '\\') {
+          if (at < text.length) value += text[at];
+          at += 1;
+        } else if (char === "'") {
+          closed = true;
+          break;
+        } else {
+          value += char;
+        }
+      }
+      if (!closed) throw refusal('the connection string holds an unterminated quoted value, which libpq refuses.');
+    } else {
+      while (at < text.length && !isSpace(text[at])) {
+        const char = text[at];
+        at += 1;
+        if (char === '\\') {
+          if (at < text.length) value += text[at];
+          at += 1;
+        } else {
+          value += char;
+        }
+      }
+    }
+    if (keyword === 'password') {
+      password = value;
+      passwordSpans.push([start, Math.min(at, text.length)]);
+    }
+  }
+  if (passwordSpans.length === 0) return { dbname: connectionString, env: {} };
+  let kept = '';
+  let from = 0;
+  for (const [start, end] of passwordSpans) {
+    kept += text.slice(from, start);
+    from = end;
+  }
+  kept += text.slice(from);
+  return { dbname: kept.trim(), env: password ? { PGPASSWORD: password } : {} };
+};
+
+/**
+ * The database pg_dump connects to, with the password taken out of the command line, where the process list shows
+ * it, for PGPASSWORD. A `postgres://` or `postgresql://` URI is read as libpq reads one, and so are keyword=value
+ * settings (`host=... password=...`). Any other string (a database name) is passed as it is.
+ *
+ * @throws {Error} When the string holds a NUL character, which neither libpq nor a process argument takes, or a
+ *   password pg_dump could not be given through PGPASSWORD, or settings libpq refuses.
+ */
+const connectionOf = (connectionString: string): { dbname: string; env: Record<string, string> } => {
+  if (connectionString.includes('\u0000')) {
+    throw refusal('the connection string holds a NUL character, which pg_dump cannot take.');
+  }
+  const found = URI_SCHEME.exec(connectionString)?.[0];
+  if (found !== undefined) return uriConnectionOf(connectionString, found);
+  // libpq reads a string with an = as keyword=value settings, and any other as a database name.
+  if (connectionString.includes('=')) return keywordConnectionOf(connectionString);
+  return { dbname: connectionString, env: {} };
 };
 
 /**
@@ -101,13 +210,17 @@ const connectionOf = (connectionString: string): { dbname: string; env: Record<s
  * argument array that no shell parses, so a quote, a `$(...)` or a `;` in the
  * connection string or the path is a character of that argument and never a
  * command. The password of a `postgres://` or `postgresql://` URI, in its user
- * part or its `password` parameter, is taken out before the URI becomes
+ * part or its `password` parameter, and of keyword=value settings
+ * (`host=... password=...`), is taken out before the string becomes
  * `--dbname` and travels in `PGPASSWORD`, so it never shows in the process
- * list; the URI is read as libpq reads one, so an empty host, several hosts,
- * or a `#` or `?` in the password keep it off the command line too. A keyword
- * and value connection string (`host=... password=...`) is passed whole as
- * `--dbname`; give a URI to keep its password out of the process list. With
- * `schema`, the dump holds that schema alone.
+ * list; the string is read as libpq reads it, so an empty host, several hosts,
+ * a `#` or `?` in a URI's password, or a quoted value with spaces keep it off
+ * the command line too. With `schema`, the dump holds that schema alone.
+ *
+ * @throws {Error} Before pg_dump starts, when the connection string holds a
+ *   NUL character, a password that is not valid percent-encoding or decodes
+ *   to a NUL, or keyword=value settings libpq refuses; the error never holds
+ *   the connection string.
  */
 export function pgDumpInvocation(
   connectionString: string,
@@ -129,9 +242,9 @@ export function pgDumpInvocation(
  *
  * Requires a connection string and `pg_dump` on the system PATH. pg_dump is
  * started without a shell (`execFile` with an argument array): each argument
- * reaches it as it is, and the password of a `postgres://` or `postgresql://`
- * connection string, in its user part or its `password` parameter, reaches it
- * through PGPASSWORD, not the command line (see {@link pgDumpInvocation}).
+ * reaches it as it is, and the password of the connection string, a URI's or
+ * keyword=value settings', reaches it through PGPASSWORD, not the command line
+ * (see {@link pgDumpInvocation}).
  * With `schema`, the export holds that schema alone. Supports both file-based
  * and byte-array exports.
  */
@@ -140,13 +253,14 @@ export class PostgresExporter implements IDatabaseExporter {
 
   /**
    * @param connectionString The database to dump: a connection string, or a
-   *   function that gives one when an export runs. The exporter of an adapter
-   *   reads the pool the adapter runs on then.
+   *   function that gives one, or a promise of one, when an export runs. The
+   *   exporter of an adapter reads the pool the adapter runs on then, and asks
+   *   a password function of the pool for its password.
    * @param options The one schema to export, and what an export with no
    *   connection string says.
    */
   constructor(
-    private readonly connectionString?: string | (() => string | undefined),
+    private readonly connectionString?: string | (() => string | undefined | Promise<string | undefined>),
     options: PostgresExporterOptions = {},
   ) {
     this.options = options;
@@ -164,7 +278,7 @@ export class PostgresExporter implements IDatabaseExporter {
   /** Runs pg_dump, into the file at `outputPath` when one is given and to its output otherwise. */
   private async dump(outputPath?: string): Promise<Buffer> {
     const connectionString =
-      typeof this.connectionString === 'function' ? this.connectionString() : this.connectionString;
+      typeof this.connectionString === 'function' ? await this.connectionString() : this.connectionString;
     if (!connectionString) {
       throw new Error(this.options.missingConnection ?? 'PostgresExporter requires a connection string for pg_dump.');
     }

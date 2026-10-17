@@ -12,57 +12,47 @@ import { NodeBlobCodec } from '../../codecs/NodeBlobCodec.js';
 import { BrowserBlobCodec } from '../../codecs/BrowserBlobCodec.js';
 import { SqliteFileExporter } from '../../exporters/SqliteFileExporter.js';
 import { PostgresExporter, type PostgresExporterOptions } from '../../exporters/PostgresExporter.js';
+import { libpqConnectionStringOf, type PgConnectionSettings } from '../../exporters/pgConnection.js';
 
-/** Connection settings, as the Postgres adapter's options and a pg Pool's `options` hold them. */
-interface PostgresConnectionLike {
-  connectionString?: string;
-  host?: string;
-  port?: number | string;
-  database?: string;
-  user?: string;
-  /** pg also takes a function here, which a connection string cannot hold. */
-  password?: unknown;
-  ssl?: boolean | object;
-}
-
-interface PostgresAdapterOptionsLike extends PostgresConnectionLike {
+interface PostgresAdapterOptionsLike extends PgConnectionSettings {
   segment?: string;
   /** A pool of the caller's; a pg Pool keeps the settings it was made with as `options`. */
-  pool?: { options?: PostgresConnectionLike } | null;
+  pool?: { options?: PgConnectionSettings } | null;
 }
 
 /** What the exporter reads of a Postgres adapter. */
 interface PostgresAdapterLike {
   options?: PostgresAdapterOptionsLike;
   /** The pool the adapter runs on: the pool it made when it opened, or its caller's; null while it is closed. */
-  getPool?: () => { options?: PostgresConnectionLike } | null;
-}
-
-/** A connection string pg_dump reaches the database of these settings with. */
-function connectionStringOf(settings: PostgresConnectionLike | undefined): string | undefined {
-  if (!settings) return undefined;
-  if (settings.connectionString) return settings.connectionString;
-  if (!settings.database) return undefined;
-
-  // libpq percent-decodes each part of a URI, so a host that is a Unix-socket
-  // directory goes in encoded: postgresql://%2Fvar%2Frun%2Fpostgresql:5432/app.
-  const host = encodeURIComponent(settings.host ?? 'localhost');
-  const port = settings.port ?? 5432;
-  const user = settings.user ? encodeURIComponent(settings.user) : '';
-  // A password pg reads from a function is left to PGPASSWORD or ~/.pgpass.
-  const password = typeof settings.password === 'string' && settings.password ? `:${encodeURIComponent(settings.password)}` : '';
-  // A password with no user name goes in too: libpq takes the user name from PGUSER or the operating system.
-  const auth = user || password ? `${user}${password}@` : '';
-  const sslQuery = settings.ssl ? '?sslmode=require' : '';
-  return `postgresql://${auth}${host}:${port}/${encodeURIComponent(settings.database)}${sslQuery}`;
+  getPool?: () => { options?: PgConnectionSettings } | null;
 }
 
 /**
- * The exporter of a Postgres adapter. It names the adapter's database when an
- * export runs: the pool the adapter runs on names the database it reaches,
- * the connection string `open()` was given included; before the adapter
- * opens, its own settings name it, or those of the pool its caller gave it.
- * A segmented adapter exports its segment's schema alone.
+ * The settings of the pool a Postgres adapter makes when it opens, as its `poolConfig` makes them: the connection
+ * string, or the host and port (localhost and 5432 when left out), database, user and password. Undefined when the
+ * options name no server, so an adapter waiting for `open({ connectionString })` exports nothing before it opens.
+ */
+const ownPoolSettings = (options: PostgresAdapterOptionsLike | undefined): PgConnectionSettings | undefined => {
+  if (!options) return undefined;
+  if (options.connectionString) return { connectionString: options.connectionString, ssl: options.ssl };
+  if (!options.host && !options.database && !options.user) return undefined;
+  return {
+    host: options.host ?? 'localhost',
+    port: options.port ?? 5432,
+    database: options.database,
+    user: options.user,
+    password: options.password,
+    ssl: options.ssl,
+  };
+};
+
+/**
+ * The exporter of a Postgres adapter. When an export runs it reads the
+ * connection of the pool the adapter runs on, as pg reads it (the connection
+ * string `open()` was given included, and a password function of the pool's,
+ * which it calls), and hands pg_dump a libpq URI of it; before the adapter
+ * opens, the settings of the pool it will make, or of the pool its caller gave
+ * it. A segmented adapter exports its segment's schema alone.
  */
 function postgresExporterOf(adapter: StorageAdapter): PostgresExporter {
   const postgres = adapter as StorageAdapter & PostgresAdapterLike;
@@ -70,14 +60,15 @@ function postgresExporterOf(adapter: StorageAdapter): PostgresExporter {
   const exportOptions: PostgresExporterOptions = {
     ...(options?.segment ? { schema: options.segment } : {}),
     missingConnection: options?.pool
-      ? 'PostgresExporter: the adapter runs on a pool its caller made, and the pool names no connection string or ' +
-        'database for pg_dump to reach. Make the pool with a connectionString, or with host, database, user and password.'
+      ? 'PostgresExporter: the adapter runs on a pool its caller made, and the pool keeps no connection settings ' +
+        'for pg_dump to reach. Make the pool with a connectionString, or with host, database, user and password.'
       : 'PostgresExporter: the adapter names no database for pg_dump to reach. Make it with a connectionString, or ' +
         'with host, database and user, or export once open() has been given a connection string.',
   };
-  const connectionString = (): string | undefined => {
+  const connectionString = async (): Promise<string | undefined> => {
     const pool = typeof postgres.getPool === 'function' ? postgres.getPool() : null;
-    return connectionStringOf(pool?.options) ?? connectionStringOf(options) ?? connectionStringOf(options?.pool?.options);
+    const settings = pool?.options ?? ownPoolSettings(options) ?? options?.pool?.options;
+    return settings ? libpqConnectionStringOf(settings) : undefined;
   };
   return new PostgresExporter(connectionString, exportOptions);
 }
