@@ -1,3 +1,8 @@
+## [0.7.14] - 2026-10-17
+
+### Fixed
+- `PostgresFts.createIndex`: of two first opens that both find no GIN index, the later one no longer rejects. Its `CREATE INDEX` shares the earlier one's SHARE lock, builds an index of its own and fails on `pg_class`'s unique name (`23505`) once the earlier one commits; the index block now takes that failure, or `duplicate_table`, as the index made.
+
 ## [0.7.13] - 2026-10-17
 
 ### Added
