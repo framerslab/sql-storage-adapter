@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { SqliteFts5 } from '../src/fts/SqliteFts5.js';
 import { PostgresFts } from '../src/fts/PostgresFts.js';
+import { splitSqlStatements } from '../src/shared/splitSqlStatements.js';
 
 describe('SqliteFts5', () => {
   const fts = new SqliteFts5();
@@ -66,6 +67,48 @@ describe('PostgresFts', () => {
     expect(ddl).toContain('ADD COLUMN IF NOT EXISTS _tsv tsvector');
     expect(ddl).toContain('USING GIN');
     expect(ddl).toContain("to_tsvector('simple'");
+  });
+
+  it('createIndex reads the catalog before it alters the table or creates the index, and backfills only the rows without a vector', () => {
+    // Split as exec() splits it: each DO block keeps the semicolons inside it.
+    const statements = splitSqlStatements(
+      fts.createIndex({ table: 'notes_fts', columns: ['title', 'body'], contentTable: 'app.notes', tokenizer: 'porter' }),
+    );
+    expect(statements).toHaveLength(3);
+    const [column, index, backfill] = statements;
+
+    expect(column).toMatch(/^DO \$fts\$\nBEGIN\n[\s\S]*\nEND\n\$fts\$$/);
+    const columnCheck =
+      "IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('app.notes') AND attname = '_tsv' AND NOT attisdropped) THEN";
+    const alter = 'ALTER TABLE app.notes ADD COLUMN IF NOT EXISTS _tsv tsvector;';
+    expect(column.indexOf(columnCheck)).toBeGreaterThan(-1);
+    expect(column.indexOf(alter)).toBeGreaterThan(column.indexOf(columnCheck));
+    expect(column.indexOf('END IF;')).toBeGreaterThan(column.indexOf(alter));
+
+    expect(index).toMatch(/^DO \$fts\$\nBEGIN\n[\s\S]*\nEND\n\$fts\$$/);
+    const indexCheck =
+      "IF to_regclass((SELECT relnamespace::regnamespace::text FROM pg_class WHERE oid = to_regclass('app.notes')) || '.idx_notes_fts_tsv') IS NULL THEN";
+    const create = 'CREATE INDEX IF NOT EXISTS idx_notes_fts_tsv ON app.notes USING GIN(_tsv);';
+    expect(index.indexOf(indexCheck)).toBeGreaterThan(-1);
+    expect(index.indexOf(create)).toBeGreaterThan(index.indexOf(indexCheck));
+    expect(index.indexOf('END IF;')).toBeGreaterThan(index.indexOf(create));
+
+    expect(backfill).toBe(
+      "UPDATE app.notes SET _tsv = to_tsvector('english', COALESCE(title, '') || ' ' || COALESCE(body, '')) WHERE _tsv IS NULL",
+    );
+  });
+
+  it('createIndex doubles the quotes of the content table in its catalog reads, and picks a block tag the name does not hold', () => {
+    const statements = splitSqlStatements(fts.createIndex({ table: 'odd_fts', columns: ['body'], contentTable: `"it's$fts$odd"` }));
+    expect(statements).toHaveLength(3);
+    const [column, index, backfill] = statements;
+
+    expect(column).toMatch(/^DO \$fts1\$\nBEGIN\n[\s\S]*\nEND\n\$fts1\$$/);
+    expect(column).toContain(`attrelid = to_regclass('"it''s$fts$odd"')`);
+    expect(column).toContain(`ALTER TABLE "it's$fts$odd" ADD COLUMN IF NOT EXISTS _tsv tsvector;`);
+    expect(index).toMatch(/^DO \$fts1\$\nBEGIN\n[\s\S]*\nEND\n\$fts1\$$/);
+    expect(index).toContain(`oid = to_regclass('"it''s$fts$odd"')`);
+    expect(backfill).toMatch(/^UPDATE "it's\$fts\$odd" SET _tsv = .* WHERE _tsv IS NULL$/);
   });
 
   it('matchClause generates @@ expression', () => {

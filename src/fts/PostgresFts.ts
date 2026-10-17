@@ -25,12 +25,33 @@ const WEIGHTS = new Set<string>(['A', 'B', 'C', 'D']);
  *
  * Unlike FTS5 (separate virtual table), Postgres stores the tsvector as a
  * column `_tsv` on the content table itself. The `createIndex()` call adds the
- * column, creates the GIN index, and backfills existing rows. Queries go
- * through `websearch_to_tsquery`, which reads raw user text without syntax
- * errors: words are ANDed, and `or`, `-word` and quoted phrases work as in a
- * web search box.
+ * column and creates the GIN index when they are missing, and backfills
+ * existing rows. Queries go through `websearch_to_tsquery`, which reads raw
+ * user text without syntax errors: words are ANDed, and `or`, `-word` and
+ * quoted phrases work as in a web search box.
  */
 export class PostgresFts implements IFullTextSearch {
+  /**
+   * The script that makes the index, three statements for `exec()` to run on
+   * each open:
+   *
+   * 1. A `DO` block that adds the `_tsv` column when the content table has none.
+   * 2. A `DO` block that creates the GIN index `idx_<table>_tsv` when the
+   *    content table's schema has no relation of that name.
+   * 3. An `UPDATE` that fills `_tsv` on the rows where it is null.
+   *
+   * `ALTER TABLE` takes its ACCESS EXCLUSIVE lock, and `CREATE INDEX` its
+   * SHARE lock, before either reads its `IF NOT EXISTS`, and a lock request
+   * waits behind every queued request it conflicts with: an open behind a
+   * long read of the table would hold up each later read and write of it
+   * until that read ended. So each block reads the catalog first, through
+   * `to_regclass`, which finds the content table as the statement does (the
+   * search path, a schema prefix, quoted names) and locks nothing. An open
+   * that finds the column and the index takes no lock on the table beyond the
+   * `UPDATE`'s ROW EXCLUSIVE, which no read or write of the table waits for.
+   * The statements keep `IF NOT EXISTS` for two first opens that pass the
+   * check together.
+   */
   createIndex(config: {
     table: string;
     columns: string[];
@@ -47,8 +68,8 @@ export class PostgresFts implements IFullTextSearch {
     INDEXES.set(config.table, index);
     const ct = index.contentTable;
     return [
-      `ALTER TABLE ${ct} ADD COLUMN IF NOT EXISTS _tsv tsvector`,
-      `CREATE INDEX IF NOT EXISTS idx_${config.table}_tsv ON ${ct} USING GIN(_tsv)`,
+      addColumnBlock(ct),
+      createIndexBlock(ct, `idx_${config.table}_tsv`),
       `UPDATE ${ct} SET _tsv = ${tsvector(index, index.columns.map((column) => `COALESCE(${column}, '')`))} WHERE _tsv IS NULL`,
     ].join(';\n');
   }
@@ -106,6 +127,32 @@ const checkWeights = (columns: string[], weights?: Record<string, Weight>): Reco
   }
   return weights;
 };
+
+/** A `DO` block that adds the `_tsv` column to `table` when the table has none, and takes no lock on a table that has it. */
+const addColumnBlock = (table: string): string =>
+  doBlock(`IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass(${literal(table)}) AND attname = '_tsv' AND NOT attisdropped) THEN ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS _tsv tsvector; END IF;`);
+
+/**
+ * A `DO` block that creates the GIN index `name` on `table` when the table's
+ * schema has no relation of that name (the test `IF NOT EXISTS` makes), and
+ * takes no lock on a table whose index exists.
+ */
+const createIndexBlock = (table: string, name: string): string =>
+  doBlock(`IF to_regclass((SELECT relnamespace::regnamespace::text FROM pg_class WHERE oid = to_regclass(${literal(table)})) || ${literal(`.${name}`)}) IS NULL THEN CREATE INDEX IF NOT EXISTS ${name} ON ${table} USING GIN(_tsv); END IF;`);
+
+/** `text` as an SQL string literal. */
+const literal = (text: string): string => `'${text.replace(/'/g, "''")}'`;
+
+/**
+ * `body` as a PL/pgSQL `DO` block, dollar-quoted with the first tag of
+ * `$fts$`, `$fts1$`, `$fts2$`, ... (from the `n`th) that the body does not
+ * hold: a table name can hold `$`, so a fixed tag could end the block early.
+ */
+const doBlock = (body: string, n = 0): string =>
+  body.includes(dollarTag(n)) ? doBlock(body, n + 1) : `DO ${dollarTag(n)}\nBEGIN\n  ${body}\nEND\n${dollarTag(n)}`;
+
+/** The `n`th dollar-quote tag of `doBlock`: `$fts$`, then `$fts1$`, `$fts2$`, ... */
+const dollarTag = (n: number): string => (n === 0 ? '$fts$' : `$fts${n}$`);
 
 /** The tsvector expression over `values`, one per indexed column, weighted when the index has weights. */
 const tsvector = (index: PostgresIndex, values: string[]): string => {

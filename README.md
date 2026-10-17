@@ -912,6 +912,7 @@ const rows = await db.all(
 - **Ordering.** `relevanceOrder` orders best first everywhere. `rankExpression` keeps each engine's own direction: FTS5's `rank` is lower-better, FTS4's `length(offsets())` and PostgreSQL's `ts_rank` are higher-better.
 - **Queries.** `sanitizeQuery` turns text into its words, quoted and joined with OR, on every engine. PostgreSQL reads queries with `websearch_to_tsquery`: words are ANDed, and `or`, `-word` and quoted phrases work as in a search box.
 - **One index, many features objects.** On PostgreSQL, `createIndex` records each index's table, columns, language and weights for the whole process, so a features object made later syncs, rebuilds and queries an index another one created, and each index keeps its own language. Run `createIndex` (it is idempotent) in each process before `syncInsert` or `rebuildCommand`.
+- **Opening an existing index.** On PostgreSQL, `createIndex` reads the catalog before it alters the table or creates the index, so an open that finds the `_tsv` column and the index takes no lock on the table beyond the backfill's ROW EXCLUSIVE, and does not queue behind a long read of the table such as an export. Run its script with `exec()`: it holds `DO` blocks, which a split on `;` would cut.
 - **Aliases.** On SQLite, alias the index as itself in `joinClause` (or pass the alias as `indexName` to `matchClause`), since a MATCH names the table as the query writes it.
 
 

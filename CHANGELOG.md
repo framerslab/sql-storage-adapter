@@ -1,3 +1,14 @@
+## [0.7.13] - 2026-10-17
+
+### Added
+- `memoryOnly: true` on the IndexedDB adapter keeps the database in memory alone, for a browser that refuses IndexedDB (a private window, a blocked storage setting): IndexedDB is never opened, nothing is stored, and `capabilities` carries no `persistence`.
+- `reload()` on the IndexedDB adapter puts the stored image in place of the one in memory, whatever the version stamp says, and resolves with whether anything changed. A caller whose durable commit IndexedDB refused runs it before its next statement; a connection without `crossTab` runs it to read what another connection stored.
+- `crossTab: { rollbackRefusedSaves: true }` on the IndexedDB adapter reads the stored image back inside the lock when IndexedDB refuses a save made under the coordination, so a statement already waiting on the lock does not store the refused writes with its own. The call still rejects.
+
+### Fixed
+- `PostgresFts.createIndex` reads the catalog before it alters the table or creates the index, so an open that finds the `_tsv` column and the GIN index takes no lock on the table beyond the backfill's ROW EXCLUSIVE. `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` took ACCESS EXCLUSIVE, and `CREATE INDEX IF NOT EXISTS` took SHARE, before reading `IF NOT EXISTS`: an open behind a long read of the table (an export, `pg_dump`, a report) queued, and every later read and write of the table queued behind it until the read ended. The two statements run in `DO` blocks that check `pg_attribute` and `to_regclass` first. The script keeps its three statements; run it with `exec()`, since a split on `;` would cut the blocks.
+- Without `crossTab`, a `durability: 'commit'` write or a `flush()` on the IndexedDB adapter still waiting for the save of a write that `reload()` puts back rejects instead of resolving as stored.
+
 ## [0.7.12] - 2026-10-16
 
 ### Security
