@@ -169,6 +169,42 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
       expect(hitsSoFar()).toBe(hits + 2);
     });
 
+    it('answers get with a row and all with a list for one statement, whichever was asked first', async () => {
+      await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [16, 'one']);
+      const read = `SELECT label FROM ${table} WHERE id = ? AND label = ?`;
+      expect(await db.get(read, [16, 'one'])).toEqual({ label: 'one' });
+      expect(await db.all(read, [16, 'one'])).toEqual([{ label: 'one' }]);
+
+      const list = `SELECT id FROM ${table} WHERE id = ? AND label = ?`;
+      expect(await db.all(list, [16, 'one'])).toEqual([{ id: 16 }]);
+      expect(await db.get(list, [16, 'one'])).toEqual({ id: 16 });
+    });
+
+    it('keys a read by a bigint, and by NaN and the infinities apart from null, as it binds them', async () => {
+      await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [17, 'big']);
+      const byId = `SELECT label FROM ${table} WHERE id = ?::bigint`;
+      expect(await db.get(byId, [17n])).toEqual({ label: 'big' });
+      expect(await db.get(byId, [17n])).toEqual({ label: 'big' });
+
+      const shown = 'SELECT ?::float8::text AS shown';
+      expect(await db.get(shown, [null])).toEqual({ shown: null });
+      expect(await db.get(shown, [Number.NaN])).toEqual({ shown: 'NaN' });
+      expect(await db.get(shown, [Number.POSITIVE_INFINITY])).toEqual({ shown: 'Infinity' });
+      expect(await db.all(shown, [Number.NEGATIVE_INFINITY])).toEqual([{ shown: '-Infinity' }]);
+    });
+
+    it("keeps PostgreSQL's error code on a SELECT that fails, keeps nothing of it, and answers the next read", async () => {
+      // More failed SELECTs than the pool holds clients: each one gives its client back.
+      for (let attempt = 0; attempt < 25; attempt += 1) {
+        const failed = await db.get('SELECT 1 / 0 AS quotient').catch((caught: unknown) => caught);
+        expect((failed as { code?: string }).code).toBe('22012');
+        expect(String((failed as Error).message)).toMatch(/^Query failed: /);
+      }
+      expect(await db.all(`SELECT label AS after_failures FROM ${table} WHERE id = ?`, [15])).toEqual([
+        { after_failures: 'kept' },
+      ]);
+    });
+
     it('keeps nothing of a read that was in flight across a write', async () => {
       await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [13, 'before']);
       // A statement reads the rows as they stood when it began; the write commits while this one sleeps.
