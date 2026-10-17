@@ -67,18 +67,9 @@ export class PostgresFts implements IFullTextSearch {
     };
     INDEXES.set(config.table, index);
     const ct = index.contentTable;
-    const indexName = `idx_${config.table}_tsv`;
     return [
-      doBlock(
-        `IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass(${literal(ct)}) AND attname = '_tsv' AND NOT attisdropped) THEN\n` +
-          `    ALTER TABLE ${ct} ADD COLUMN IF NOT EXISTS _tsv tsvector;\n` +
-          `  END IF;`,
-      ),
-      doBlock(
-        `IF to_regclass((SELECT relnamespace::regnamespace::text FROM pg_class WHERE oid = to_regclass(${literal(ct)})) || ${literal(`.${indexName}`)}) IS NULL THEN\n` +
-          `    CREATE INDEX IF NOT EXISTS ${indexName} ON ${ct} USING GIN(_tsv);\n` +
-          `  END IF;`,
-      ),
+      addColumnBlock(ct),
+      createIndexBlock(ct, `idx_${config.table}_tsv`),
       `UPDATE ${ct} SET _tsv = ${tsvector(index, index.columns.map((column) => `COALESCE(${column}, '')`))} WHERE _tsv IS NULL`,
     ].join(';\n');
   }
@@ -137,18 +128,39 @@ const checkWeights = (columns: string[], weights?: Record<string, Weight>): Reco
   return weights;
 };
 
+/** A `DO` block that adds the `_tsv` column to `table` when the table has none, and takes no lock on a table that has it. */
+const addColumnBlock = (table: string): string =>
+  doBlock(
+    `IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass(${literal(table)}) AND attname = '_tsv' AND NOT attisdropped) THEN\n` +
+      `    ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS _tsv tsvector;\n` +
+      `  END IF;`,
+  );
+
+/**
+ * A `DO` block that creates the GIN index `name` on `table` when the table's
+ * schema has no relation of that name (the test `IF NOT EXISTS` makes), and
+ * takes no lock on a table whose index exists.
+ */
+const createIndexBlock = (table: string, name: string): string =>
+  doBlock(
+    `IF to_regclass((SELECT relnamespace::regnamespace::text FROM pg_class WHERE oid = to_regclass(${literal(table)})) || ${literal(`.${name}`)}) IS NULL THEN\n` +
+      `    CREATE INDEX IF NOT EXISTS ${name} ON ${table} USING GIN(_tsv);\n` +
+      `  END IF;`,
+  );
+
 /** `text` as an SQL string literal. */
 const literal = (text: string): string => `'${text.replace(/'/g, "''")}'`;
 
 /**
- * `body` as a PL/pgSQL `DO` block, dollar-quoted with a tag the body does not
+ * `body` as a PL/pgSQL `DO` block, dollar-quoted with the first tag of
+ * `$fts$`, `$fts1$`, `$fts2$`, ... (from the `n`th) that the body does not
  * hold: a table name can hold `$`, so a fixed tag could end the block early.
  */
-const doBlock = (body: string): string => {
-  let tag = '$fts$';
-  for (let n = 1; body.includes(tag); n += 1) tag = `$fts${n}$`;
-  return `DO ${tag}\nBEGIN\n  ${body}\nEND\n${tag}`;
-};
+const doBlock = (body: string, n = 0): string =>
+  body.includes(dollarTag(n)) ? doBlock(body, n + 1) : `DO ${dollarTag(n)}\nBEGIN\n  ${body}\nEND\n${dollarTag(n)}`;
+
+/** The `n`th dollar-quote tag of `doBlock`: `$fts$`, then `$fts1$`, `$fts2$`, ... */
+const dollarTag = (n: number): string => (n === 0 ? '$fts$' : `$fts${n}$`);
 
 /** The tsvector expression over `values`, one per indexed column, weighted when the index has weights. */
 const tsvector = (index: PostgresIndex, values: string[]): string => {
