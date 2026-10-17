@@ -1,0 +1,123 @@
+/**
+ * The cadence of a client's sync: a cycle pushes then pulls; it runs at start, on a save (at once), when the page
+ * becomes visible, on reconnecting and on sign-in, and every `pullEveryMs` while the page is visible. A failed cycle is
+ * tried again after `firstRetryMs`, doubling to `maxRetryMs`; a rate refusal waits as long as it asks. One cycle runs
+ * at a time; a kick during a cycle runs one more after it.
+ */
+import type { SyncOutcome } from './client';
+
+/** The part of a client the loop drives. */
+export interface LoopClient {
+  push(): Promise<SyncOutcome>;
+  pull(): Promise<SyncOutcome>;
+}
+
+/** The loop's settings. */
+export interface SyncLoopOptions {
+  client: LoopClient;
+  /** Default 60,000. */
+  pullEveryMs?: number;
+  /** Default 2,000. */
+  firstRetryMs?: number;
+  /** Default 300,000. */
+  maxRetryMs?: number;
+  /** Whether the page is visible; true when left out. */
+  visible?: () => boolean;
+  /** Told of every failed cycle. */
+  onError?: (error: unknown) => void;
+}
+
+/** Why the loop was kicked. */
+export type KickReason = 'load' | 'save' | 'visible' | 'online' | 'sign_in' | 'timer';
+
+/** The loop. */
+export class SyncLoop {
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private running = false;
+  private again = false;
+  private stopped = true;
+  private retryMs: number;
+
+  constructor(private readonly options: SyncLoopOptions) {
+    this.retryMs = options.firstRetryMs ?? 2000;
+  }
+
+  /** Starts with a cycle at once. */
+  start(): void {
+    this.stopped = false;
+    this.kick('load');
+  }
+
+  /** Stops; a running cycle ends and schedules nothing. */
+  stop(): void {
+    this.stopped = true;
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  /** Runs a cycle now, or one more after the running one. */
+  kick(_reason: KickReason): void {
+    if (this.stopped) return;
+    if (this.running) {
+      this.again = true;
+      return;
+    }
+    void this.cycle();
+  }
+
+  private async cycle(): Promise<void> {
+    this.running = true;
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
+    let next: number | null = null;
+    try {
+      for (let round = 0; round < 5; round += 1) {
+        const pushed = await this.options.client.push();
+        if (pushed.kind === 'wait') {
+          next = pushed.ms;
+          break;
+        }
+        if (pushed.kind === 'resend') continue;
+        const pulled = await this.options.client.pull();
+        if (pulled.kind === 'wait') {
+          next = pulled.ms;
+          break;
+        }
+        // after a recovery the rebuilt mutations go again at once
+        if (pushed.kind === 'recovering' || pulled.kind === 'recovering') continue;
+        break;
+      }
+      this.retryMs = this.options.firstRetryMs ?? 2000;
+      if (next === null && (this.options.visible?.() ?? true)) next = this.options.pullEveryMs ?? 60_000;
+    } catch (error) {
+      this.options.onError?.(error);
+      next = this.retryMs;
+      this.retryMs = Math.min(this.retryMs * 2, this.options.maxRetryMs ?? 300_000);
+    } finally {
+      this.running = false;
+    }
+    if (this.stopped) return;
+    if (this.again) {
+      this.again = false;
+      void this.cycle();
+      return;
+    }
+    if (next !== null) this.timer = setTimeout(() => this.kick('timer'), next);
+  }
+}
+
+/** Kicks the loop when the page becomes visible, regains focus or comes back online; answers the detach. */
+export function attachSyncLoop(loop: SyncLoop, page: { window: Window; document: Document }): () => void {
+  const onVisible = (): void => {
+    if (page.document.visibilityState === 'visible') loop.kick('visible');
+  };
+  const onOnline = (): void => loop.kick('online');
+  page.document.addEventListener('visibilitychange', onVisible);
+  page.window.addEventListener('online', onOnline);
+  page.window.addEventListener('focus', onVisible);
+  return () => {
+    page.document.removeEventListener('visibilitychange', onVisible);
+    page.window.removeEventListener('online', onOnline);
+    page.window.removeEventListener('focus', onVisible);
+  };
+}

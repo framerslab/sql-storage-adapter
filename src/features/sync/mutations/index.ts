@@ -10,3 +10,5 @@ export * from './tabLock';
 export * from './packing';
 export * from './transport';
 export * from './client';
+export * from './loop';
+export * from './channel';
