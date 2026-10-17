@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SyncOutcome } from '../../src/features/sync/mutations/client';
-import { SyncLoop } from '../../src/features/sync/mutations/loop';
+import { changeChannel } from '../../src/features/sync/mutations/channel';
+import { attachSyncLoop, SyncLoop, type KickReason } from '../../src/features/sync/mutations/loop';
 import { SyncUnavailable } from '../../src/features/sync/mutations/transport';
 
 /** A client that records its calls and answers what the test sets. */
@@ -101,5 +102,121 @@ describe('the sync loop', () => {
     await vi.advanceTimersByTimeAsync(7000);
     expect(client.calls).toEqual(['push', 'push', 'pull']);
     loop.stop();
+  });
+
+  it('holds every kick while a rate refusal is waited, a kick during the refused cycle too, and a stop drops the wait', async () => {
+    const client = fakeClient();
+    const loop = new SyncLoop({ client, visible: () => true });
+    client.pullAnswer = { kind: 'wait', ms: 5000 };
+    loop.start();
+    loop.kick('save');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.calls).toEqual(['push', 'pull']);
+    client.pullAnswer = { kind: 'applied' };
+    loop.kick('save');
+    loop.kick('visible');
+    loop.kick('online');
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(client.calls).toEqual(['push', 'pull']);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(client.calls).toEqual(['push', 'pull', 'push', 'pull']);
+    client.calls.length = 0;
+    client.pushAnswer = { kind: 'wait', ms: 9000 };
+    loop.kick('save');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.calls).toEqual(['push']);
+    loop.stop();
+    client.pushAnswer = { kind: 'idle' };
+    loop.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.calls).toEqual(['push', 'push', 'pull']);
+    loop.stop();
+  });
+
+  it('keeps trying again when its error listener throws', async () => {
+    const client = fakeClient();
+    client.fail = true;
+    const errors: unknown[] = [];
+    const loop = new SyncLoop({
+      client,
+      visible: () => true,
+      onError: (error) => {
+        errors.push(error);
+        throw new Error('the listener failed');
+      },
+    });
+    loop.start();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(client.calls).toEqual(['push', 'push']);
+    expect(errors).toHaveLength(2);
+    for (const error of errors) expect(error).toBeInstanceOf(SyncUnavailable);
+    loop.stop();
+  });
+});
+
+describe('attaching the loop to a page', () => {
+  it('kicks on becoming visible, on focus while visible and on coming online, and never after the detach', () => {
+    const loop = new SyncLoop({ client: fakeClient() });
+    const kicks: KickReason[] = [];
+    vi.spyOn(loop, 'kick').mockImplementation((reason) => {
+      kicks.push(reason);
+    });
+    const page = { window: new EventTarget(), document: Object.assign(new EventTarget(), { visibilityState: 'hidden' }) };
+    const detach = attachSyncLoop(loop, page as unknown as { window: Window; document: Document });
+    const fire = (): void => {
+      page.document.dispatchEvent(new Event('visibilitychange'));
+      page.window.dispatchEvent(new Event('focus'));
+      page.window.dispatchEvent(new Event('online'));
+    };
+    fire();
+    expect(kicks).toEqual(['online']);
+    page.document.visibilityState = 'visible';
+    fire();
+    expect(kicks).toEqual(['online', 'visible', 'visible', 'online']);
+    detach();
+    fire();
+    expect(kicks).toEqual(['online', 'visible', 'visible', 'online']);
+  });
+});
+
+describe('the change channel', () => {
+  it('tells the other channels of its name, a detached listener hears nothing more, and with no BroadcastChannel it is silent', async () => {
+    const sender = changeChannel('sync-loop-spec');
+    const receiver = changeChannel('sync-loop-spec');
+    try {
+      let early = 0;
+      const first = new Promise<void>((resolve) => {
+        const detach = receiver.listen(() => {
+          early += 1;
+          detach();
+          resolve();
+        });
+      });
+      sender.post();
+      await first;
+      const second = new Promise<void>((resolve) => {
+        receiver.listen(() => resolve());
+      });
+      sender.post();
+      await second;
+      expect(early).toBe(1);
+    } finally {
+      sender.close();
+      receiver.close();
+    }
+    vi.stubGlobal('BroadcastChannel', undefined);
+    try {
+      const silent = changeChannel('sync-loop-spec');
+      const heard: string[] = [];
+      const detach = silent.listen(() => {
+        heard.push('heard');
+      });
+      silent.post();
+      detach();
+      silent.close();
+      expect(heard).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
