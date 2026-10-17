@@ -197,6 +197,17 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
       expect(await db.all(shown, [Number.NEGATIVE_INFINITY])).toEqual([{ shown: '-Infinity' }]);
     });
 
+    it('keys a read bound to a Date apart from one bound to its ISO text, which pg binds as other text', async () => {
+      // pg binds a Date as local time with its offset, and JSON writes it as its ISO text.
+      await db.run(`UPDATE ${table} SET label = label WHERE id = ?`, [17]);
+      const at = new Date(Date.UTC(2026, 9, 17, 22, 4, 37));
+      const shown = 'SELECT ?::text AS shown';
+      const fromDate = await db.get<{ shown: string }>(shown, [at]);
+      expect(new Date(String(fromDate?.shown)).getTime()).toBe(at.getTime());
+      expect(await db.get(shown, [at.toISOString()])).toEqual({ shown: at.toISOString() });
+      expect(await db.get(shown, [at])).toEqual(fromDate);
+    });
+
     it("keeps PostgreSQL's error code on a SELECT that fails, keeps nothing of it, and answers the next read", async () => {
       // More failed SELECTs than the pool holds clients: each one gives its client back.
       for (let attempt = 0; attempt < 25; attempt += 1) {
