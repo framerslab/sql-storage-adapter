@@ -220,4 +220,16 @@ describe('the move of an old IndexedDB key-value store behind the adapter', () =
       await reader.close();
     }
   });
+
+  it('refuses a store that keeps nothing past the page, and leaves the old store as it was', async () => {
+    await oldStore(RECORDS);
+    const memory = new IndexedDbAdapter({ dbName: 'new-store', memoryOnly: true });
+    adapter = memory;
+    await memory.open();
+    await expect(migrateIndexedDbKeyValue({ source: SOURCE, adapter: memory, into: intoTable })).rejects.toThrow(
+      'keeps nothing past the page',
+    );
+    expect((await oldKeys()).length).toBe(4);
+    expect(await oldVersionOpens()).toBeNull();
+  });
 });

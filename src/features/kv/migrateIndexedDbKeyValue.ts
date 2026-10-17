@@ -24,6 +24,10 @@
  * tabs stored, as the IndexedDB adapter does under `crossTab`; a transaction it refuses with `IndexedDbConflictError`
  * rejects the move, which reads the other tab's marker when it is run again.
  *
+ * A store that keeps nothing past the page (its `memoryOnly` true: an adapter without `persistence`, such as the
+ * IndexedDB adapter's `memoryOnly` mode) is refused before the old database is opened, since deleting the old records
+ * would leave their one copy in memory.
+ *
  * The old store is read by its keys: a key that is not a string is left where it is. The module's types are the
  * structural shapes of `idb.ts`, so its declarations need no DOM library.
  * @module sql-storage-adapter/kv/migrateIndexedDbKeyValue
@@ -211,8 +215,9 @@ async function storeCommitted(adapter: StorageAdapter): Promise<void> {
  * ```
  *
  * @returns What the move did; see `MigrationOutcome`.
- * @throws {Error} When `lockVersion` is not above `fromVersion`, when no `factory` is given and the page has no
- *   IndexedDB, and when IndexedDB or the adapter refuses a step; the step that failed runs again on the next call.
+ * @throws {Error} When `lockVersion` is not above `fromVersion`, when the store `into` makes keeps nothing past the
+ *   page (nothing is opened or moved then), when no `factory` is given and the page has no IndexedDB, and when
+ *   IndexedDB or the adapter refuses a step; the step that failed runs again on the next call.
  */
 export async function migrateIndexedDbKeyValue(options: MigrateOptions): Promise<MigrationOutcome> {
   const { source, adapter } = options;
@@ -220,6 +225,12 @@ export async function migrateIndexedDbKeyValue(options: MigrateOptions): Promise
     throw new Error("migrateIndexedDbKeyValue: the lock version must be above the old writers' version");
   }
   const store = await options.into(adapter);
+  if (store.memoryOnly) {
+    // The old records would be deleted while their one copy lived in memory, gone with the page.
+    throw new Error(
+      'migrateIndexedDbKeyValue: the store the records move into keeps nothing past the page; the old store is left as it is',
+    );
+  }
   const marker = await store.get<Marker>(MIGRATION_MARKER);
   if (marker?.phase === 'done') return 'already';
   const db = await openAt(options.factory ?? idb().factory, source.dbName, source.lockVersion);
