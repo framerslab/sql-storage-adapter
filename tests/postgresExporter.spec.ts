@@ -16,7 +16,12 @@ describe('pgDumpInvocation', () => {
   it('passes the path and the connection string as single arguments and the password in PGPASSWORD alone', () => {
     const { file, args, env } = pgDumpInvocation('postgresql://dump_user:p%40ss%20word@db.example:5432/app?sslmode=require', HOSTILE_PATH);
     expect(file).toBe('pg_dump');
-    expect(args).toEqual(['--dbname=postgresql://dump_user@db.example:5432/app?sslmode=require', '--format=custom', `--file=${HOSTILE_PATH}`]);
+    expect(args).toEqual([
+      '--dbname=postgresql://dump_user@db.example:5432/app?sslmode=require',
+      '--format=custom',
+      '--no-password',
+      `--file=${HOSTILE_PATH}`,
+    ]);
     expect(env.PGPASSWORD).toBe('p@ss word');
     for (const arg of args) {
       expect(arg).not.toContain('p@ss');
@@ -28,7 +33,7 @@ describe('pgDumpInvocation', () => {
     const before = process.env.PGPASSWORD;
     expect(pgDumpInvocation('postgres://reader@db.example/app').env.PGPASSWORD).toBe(before);
     const keyword = 'host=db.example dbname=app user=reader';
-    expect(pgDumpInvocation(keyword).args).toEqual([`--dbname=${keyword}`, '--format=custom']);
+    expect(pgDumpInvocation(keyword).args).toEqual([`--dbname=${keyword}`, '--format=custom', '--no-password']);
   });
 });
 

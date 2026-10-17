@@ -178,6 +178,81 @@ describe.skipIf(!POSTGRES_TEST_URL)('the PostgreSQL exporter, through pg_dump', 
     }
   });
 
+  // pg-connection-string sets the database from the URL's path alone, and
+  // drops a database parameter (index.js:66-67): pg reaches PGDATABASE. The
+  // export reaches the database pg reaches, not the one the parameter names.
+  it("exports the database pg reaches for a connection string whose query names another, which pg drops", async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGDATABASE', database);
+    const pool = new pg.Pool({
+      connectionString: `postgresql://${server.username}:${server.password}@${server.host}/?database=${server.pathname.slice(1)}`,
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE query_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-query.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.query_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg reads an empty host parameter as none and keeps the URL's host
+  // (pg-connection-string index.js:54-56), never PGHOST.
+  it('exports through a pool whose connection string has an empty host parameter, where pg reaches', async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGHOST', 'unreachable.invalid');
+    const pool = new pg.Pool({
+      connectionString: `postgresql://${server.username}:${server.password}@${server.host}/${database}?host=`,
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE host_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-host.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.host_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg connects with no password where a pool's password function answers
+  // none (lib/client.js, _getPassword), which CI's server refuses over TCP.
+  // pg_dump gets an empty PGPASSWORD and is refused alike: with PGPASSWORD
+  // left as it was, it logged in with the environment's password, which the
+  // pool never sends. With no password and --no-password it fails at once.
+  it("logs pg_dump in with no password where the pool's password function answers none, as the pool does", async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGPASSWORD', decodeURIComponent(server.password));
+    const pool = new pg.Pool({
+      host: server.hostname,
+      port: Number(server.port || 5432),
+      database,
+      user: decodeURIComponent(server.username),
+      password: async () => undefined,
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await expect(pool.query('SELECT 1')).rejects.toThrow();
+
+      const file = path.join(dir, `${database}-no-password.dump`);
+      await expect(createStorageFeatures(adapter).exporter.exportToFile(file)).rejects.toThrow(/pg_dump failed.*password/s);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
   // open({ connectionString }) gives the adapter a database its options do not
   // name: the exporter reads the pool the adapter runs on when an export runs.
   it('exports an adapter given its connection string at open(), from features made before it opened', async () => {
