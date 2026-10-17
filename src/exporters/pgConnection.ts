@@ -1,15 +1,18 @@
 /**
  * @fileoverview The connection a pg pool makes, written as a libpq connection URI, so that `pg_dump` reaches the
- * server, the database and the user the adapter's pool reaches.
+ * server, the database and the user the adapter's pool reaches, with the password and the TLS pg uses.
  *
  * pg reads a connection string with the WHATWG URL parser (pg-connection-string's `parse`), and fills what the
- * settings leave out from `PGUSER`, `PGDATABASE`, `PGPORT` and `PGHOST`, then the operating system's user, the
- * user's name, 5432 and localhost (pg `lib/connection-parameters.js`). libpq reads a URI by its own grammar
- * (`fe-connect.c`, `conninfo_uri_parse_options`): it ends the user part at the first `@` that comes before any
- * `/`, and it refuses a query parameter it does not know. So `postgresql://db.example?application_name=x@y` names
- * the host `db.example` to pg and `y` to libpq. The URI written here holds pg's reading: the user, the host, the
- * port and the database spelled out and percent-encoded, and the parameters libpq knows, pg's own spellings of
- * TLS translated.
+ * settings leave out from `PGUSER`, `PGDATABASE`, `PGPORT`, `PGHOST`, `PGPASSWORD` and `PGSSLMODE`, then the
+ * operating system's user, the user's name, 5432 and localhost (pg `lib/connection-parameters.js`). libpq reads a
+ * URI by its own grammar (`fe-connect.c`, `conninfo_uri_parse_options`): it ends the user part at the first `@`
+ * that comes before any `/`, and it refuses a query parameter it does not know. So
+ * `postgresql://db.example?application_name=x@y` names the host `db.example` to pg and `y` to libpq. The URI
+ * written here holds pg's reading: the user, the host, the port and the database spelled out and percent-encoded,
+ * the parameters libpq knows, and an `sslmode` wherever libpq, left to itself, would use TLS differently from pg.
+ *
+ * The variables pg reads are read here as pg reads them. libpq's own, which pg does not read (`PGHOSTADDR`,
+ * `PGSERVICE`, `PGREQUIRESSL`, `PGSSLROOTCERT` and the rest), configure pg_dump as they configure psql.
  * @module sql-storage-adapter/exporters/pgConnection
  */
 
@@ -46,11 +49,11 @@ const environment = (): Environment =>
 
 /**
  * The parameters libpq takes in a connection URI (PostgreSQL 18, `fe-connect.c`, `PQconninfoOptions`), less the
- * ones the URI spells out (`user`, `password`, `host`, `port`, `dbname`) and the ones pg does not read (`service`,
- * `hostaddr`). libpq refuses a URI with any other, so pg's own (`statement_timeout`, `uselibpqcompat`) and names
- * neither knows are left out. So are `sslpassword`, `oauth_client_secret`, `scram_client_key` and
- * `scram_server_key`: libpq takes them from the connection string alone, which is pg_dump's command line, and pg
- * reads none of them, so the connection pg makes needs none.
+ * ones the URI spells out (`user`, `password`, `host`, `port`, `dbname`), `sslmode`, which is written for the TLS
+ * pg uses, and the ones pg does not read (`service`, `hostaddr`). libpq refuses a URI with any other, so pg's own
+ * (`statement_timeout`, `uselibpqcompat`) and names neither knows are left out. So are `sslpassword`,
+ * `oauth_client_secret`, `scram_client_key` and `scram_server_key`: libpq takes them from the connection string
+ * alone, which is pg_dump's command line, and pg reads none of them, so the connection pg makes needs none.
  */
 const LIBPQ_PARAMETERS = new Set([
   'passfile',
@@ -65,7 +68,6 @@ const LIBPQ_PARAMETERS = new Set([
   'keepalives_interval',
   'keepalives_count',
   'tcp_user_timeout',
-  'sslmode',
   'sslnegotiation',
   'sslcompression',
   'sslcert',
@@ -94,10 +96,10 @@ const LIBPQ_PARAMETERS = new Set([
   'sslkeylogfile',
 ]);
 
-/** The connection string parameters that set TLS, after which pg reads none of the settings' `ssl`. */
-const TLS_PARAMETERS = ['ssl', 'sslmode', 'sslcert', 'sslkey', 'sslrootcert'];
-
-/** The `sslmode` values that make libpq use TLS, which a pool's `ssl` asks for. */
+/**
+ * The `sslmode` values with which libpq always uses TLS. A pool that checks the server's certificate keeps one that
+ * `PGSSLMODE` names.
+ */
 const TLS_SSLMODES = new Set(['require', 'verify-ca', 'verify-full']);
 
 /** The `sslmode` values with which libpq connects without TLS to a server that offers none, as pg does with no `ssl`. */
@@ -106,7 +108,7 @@ const PLAIN_SSLMODES = new Set(['disable', 'allow', 'prefer']);
 /** A URI scheme, which pg reads a connection string as a URL for. */
 const URL_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 
-/** pg's `ssl` from `PGSSLMODE` where the settings give none (pg `lib/connection-parameters.js`). */
+/** pg's `ssl` from `PGSSLMODE`, which pg reads where neither the settings nor the connection string set TLS. */
 const sslFromEnvironment = (sslmode: string | undefined): unknown => {
   switch (sslmode) {
     case 'prefer':
@@ -119,6 +121,70 @@ const sslFromEnvironment = (sslmode: string | undefined): unknown => {
     default:
       return false;
   }
+};
+
+/**
+ * The `ssl` pg-connection-string 2.14.1's `parse` makes of a connection string's parameters (index.js:69-158), the
+ * last value of a repeated parameter counting, or undefined where it makes none, so that pg reads the settings'
+ * `ssl`, then `PGSSLMODE`. A certificate file or an `sslmode` turns TLS on over `ssl=0`; `sslmode=disable` turns it
+ * off; `sslmode=no-verify`, and with `uselibpqcompat=true` `sslmode=prefer`, or `require` with no root certificate,
+ * check no certificate.
+ */
+const sslOfParameters = (last: (name: string) => string | undefined): unknown => {
+  let ssl: unknown = last('ssl');
+  if (ssl === 'true' || ssl === '1') ssl = true;
+  if (ssl === '0') ssl = false;
+  const sslmode = last('sslmode');
+  if (last('sslcert') || last('sslkey') || last('sslrootcert') || sslmode) ssl = {};
+  if (last('sslnegotiation') === 'direct' && ssl === undefined) ssl = true;
+  if (sslmode === 'disable') return false;
+  const compatible = last('uselibpqcompat') === 'true';
+  const checksNone = compatible
+    ? sslmode === 'prefer' || (sslmode === 'require' && !last('sslrootcert'))
+    : sslmode === 'no-verify';
+  return checksNone ? { rejectUnauthorized: false } : ssl;
+};
+
+/** How a connection pg makes uses TLS: not at all, without checking the server's certificate, or checking it. */
+type PgTls = 'none' | 'unchecked' | 'checked';
+
+/**
+ * How pg uses TLS with an `ssl`, which `lib/connection-parameters.js` reads `'true'` and `'no-verify'` in, and
+ * Node's TLS checks the certificate with unless `rejectUnauthorized` is false.
+ */
+const tlsOf = (ssl: unknown): PgTls => {
+  const value = ssl === 'true' ? true : ssl === 'no-verify' ? { rejectUnauthorized: false } : ssl;
+  if (!value) return 'none';
+  return typeof value === 'object' && (value as { rejectUnauthorized?: unknown }).rejectUnauthorized === false
+    ? 'unchecked'
+    : 'checked';
+};
+
+/**
+ * The `sslmode` pg_dump gets so that libpq uses TLS as pg does, or undefined where libpq left to itself does.
+ * - No TLS: `disable` where the pool's settings or its connection string chose it (pg reads no `PGSSLMODE` then,
+ *   and libpq's `prefer` or `allow` would use TLS with a server that offers it). Where no TLS is pg's default,
+ *   libpq's own default (`prefer`) and a `PGSSLMODE` of `disable` or `allow` connect where pg connects, and stay;
+ *   an empty `PGSSLMODE`, or one libpq does not know, which libpq refuses, gives way to `disable`.
+ * - TLS that checks no certificate: `require`, over any `PGSSLMODE`, since `verify-ca` or `verify-full` would
+ *   refuse the certificate pg accepts.
+ * - TLS that checks the certificate: the connection string's `verify-ca` or `verify-full`, else any other `sslmode`
+ *   it names as `require`, else a `PGSSLMODE` of `require`, `verify-ca` or `verify-full`, else `require`, which
+ *   encrypts and checks no certificate: libpq checks one against files alone, where Node checks against its own
+ *   certificate authorities.
+ */
+const sslmodeFor = (
+  tls: PgTls,
+  chosen: boolean,
+  ofString: string | undefined,
+  pgsslmode: string | undefined,
+): string | undefined => {
+  if (tls === 'none') {
+    return chosen || (pgsslmode !== undefined && !PLAIN_SSLMODES.has(pgsslmode)) ? 'disable' : undefined;
+  }
+  if (tls === 'unchecked') return 'require';
+  if (ofString === 'verify-ca' || ofString === 'verify-full') return ofString;
+  return ofString === undefined && TLS_SSLMODES.has(pgsslmode ?? '') ? undefined : 'require';
 };
 
 /**
@@ -243,7 +309,11 @@ const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnectio
   let port = settings.port === undefined ? undefined : String(settings.port);
   let database = settings.database;
   const parameters: Array<[string, string]> = [];
-  let ownTls = false;
+  // pg's ssl: the connection string's where its parameters make one, else the settings', else PGSSLMODE's
+  // (lib/connection-parameters.js reads PGSSLMODE only where the merged settings hold no ssl).
+  let ssl: unknown = settings.ssl;
+  let source: 'string' | 'settings' | 'environment' = settings.ssl !== undefined ? 'settings' : 'environment';
+  let sslmodeOfString: string | undefined;
 
   if (settings.connectionString) {
     const parsed = parseAsPg(settings.connectionString);
@@ -256,36 +326,36 @@ const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnectio
     if ('port' in parsed) port = parsed.port;
     const last = (name: string): string | undefined =>
       parsed.parameters.filter(([key]) => key === name).pop()?.[1];
-    const sslParameter = last('ssl');
-    const sslmode = last('sslmode');
-    // pg takes its TLS from the string, and not from the settings' ssl, when the string has an ssl
-    // parameter, a sslmode, sslcert, sslkey or sslrootcert, or sslnegotiation=direct.
-    ownTls =
-      sslParameter !== undefined ||
-      TLS_PARAMETERS.some((name) => name !== 'ssl' && Boolean(last(name))) ||
-      last('sslnegotiation') === 'direct';
-    for (const [key, value] of parsed.parameters) {
-      if (key === 'sslmode') {
-        // pg's no-verify is libpq's require; an empty sslmode is none, to pg too.
-        if (value) parameters.push([key, value === 'no-verify' ? 'require' : value]);
-      } else if (LIBPQ_PARAMETERS.has(key)) {
-        parameters.push([key, value]);
-      }
+    const fromString = sslOfParameters(last);
+    if (fromString !== undefined) {
+      ssl = fromString;
+      source = 'string';
+      // An empty sslmode is none, to pg too.
+      sslmodeOfString = last('sslmode') || undefined;
     }
-    if (!sslmode) {
-      if (sslParameter !== undefined) {
-        // pg reads ssl=0 and an empty ssl as no TLS and any other value as TLS; libpq knows only ssl=true.
-        parameters.push(['sslmode', sslParameter === '0' || sslParameter === '' ? 'disable' : 'require']);
-      } else if (ownTls && !TLS_SSLMODES.has(env.PGSSLMODE ?? '')) {
-        // A certificate file or direct negotiation turns pg's TLS on, which libpq's default sslmode leaves optional.
-        parameters.push(['sslmode', 'require']);
-      }
+    for (const [key, value] of parsed.parameters) {
+      if (LIBPQ_PARAMETERS.has(key)) parameters.push([key, value]);
     }
   }
+  if (source === 'environment') ssl = sslFromEnvironment(env.PGSSLMODE);
+
+  const tls = tlsOf(ssl);
+  if (source === 'settings' && tls !== 'none') {
+    const beyond = tlsSettingsBeyondSslmode(ssl);
+    if (beyond.length > 0) {
+      throw new Error(
+        `PostgresExporter: the pool's ssl settings ${beyond.join(', ')} cannot reach pg_dump, which reads TLS ` +
+          'material from files alone. Give the pool a connectionString whose sslrootcert, sslcert and sslkey ' +
+          'parameters name the files, or set PGSSLROOTCERT, PGSSLCERT and PGSSLKEY and give the pool ssl: true.',
+      );
+    }
+  }
+  const sslmode = sslmodeFor(tls, source !== 'environment', sslmodeOfString, env.PGSSLMODE);
+  if (sslmode !== undefined) parameters.push(['sslmode', sslmode]);
 
   const osUser = typeof process !== 'undefined' && process.platform === 'win32' ? env.USERNAME : env.USER;
   const resolvedUser = user || env.PGUSER || osUser || undefined;
-  const connection: PgConnection = {
+  return {
     user: resolvedUser,
     database: database || env.PGDATABASE || resolvedUser,
     host: host || env.PGHOST || 'localhost',
@@ -293,35 +363,11 @@ const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnectio
     password: password || undefined,
     parameters,
   };
-
-  if (!ownTls) {
-    const ssl = settings.ssl !== undefined ? settings.ssl : sslFromEnvironment(env.PGSSLMODE);
-    if (ssl) {
-      const beyond = tlsSettingsBeyondSslmode(ssl);
-      if (beyond.length > 0) {
-        throw new Error(
-          `PostgresExporter: the pool's ssl settings ${beyond.join(', ')} cannot reach pg_dump, which reads TLS ` +
-            'material from files alone. Give the pool a connectionString whose sslrootcert, sslcert and sslkey ' +
-            'parameters name the files, or set PGSSLROOTCERT, PGSSLCERT and PGSSLKEY and give the pool ssl: true.',
-        );
-      }
-      // libpq's require encrypts and checks no certificate; a PGSSLMODE that checks one is kept.
-      if (!TLS_SSLMODES.has(env.PGSSLMODE ?? '')) {
-        connection.parameters.push(['sslmode', 'require']);
-      }
-    } else if (env.PGSSLMODE && !PLAIN_SSLMODES.has(env.PGSSLMODE)) {
-      // pg connects without TLS here, its ssl being false or PGSSLMODE a value it does not know. libpq would read
-      // PGSSLMODE: it refuses pg's no-verify, and require or verify-* insist on TLS where pg makes none.
-      connection.parameters.push(['sslmode', 'disable']);
-    }
-  }
-  return connection;
 };
 
 /**
  * The password pg sends for a connection: the settings' string, or the answer of the settings' function, which pg
- * calls with the connection's parameters. Undefined gives pg_dump no password, so libpq reads `PGPASSWORD` and
- * `~/.pgpass`; pg, given undefined by a function, connects with no password and reads neither.
+ * calls with the connection's parameters. Undefined where neither gives one.
  *
  * @throws {Error} When the function fails or answers something other than a string or undefined.
  */
@@ -355,8 +401,12 @@ const passwordOf = async (connection: PgConnection): Promise<string | undefined>
 
 /**
  * A libpq connection URI that reaches what a pg pool with these settings reaches, with its password in the user
- * part, where `PostgresExporter` takes it out for `PGPASSWORD`. A connection string pg cannot read as a URL (a
- * keyword=value string) is given back as it is. Undefined when the settings name no database pg would reach.
+ * part, where `PostgresExporter` takes it out for `PGPASSWORD`. Where the pool has no password, the URI holds none
+ * and libpq reads `PGPASSWORD`, then `~/.pgpass`, as pg does. Where its password function answers none, pg connects
+ * with no password and reads no `PGPASSWORD` (`lib/client.js`, `_getPassword`): the URI holds an empty `password`
+ * parameter, which becomes an empty `PGPASSWORD`, so libpq sends the environment's no more than pg does. A
+ * connection string pg cannot read as a URL (a keyword=value string) is given back as it is. Undefined when the
+ * settings name no database pg would reach.
  *
  * @throws {Error} When the settings ask for TLS that pg_dump cannot take, or the password function fails.
  */
@@ -371,10 +421,12 @@ export const libpqConnectionStringOf = async (settings: PgConnectionSettings): P
   if (!connection.database) return undefined;
 
   const password = await passwordOf(connection);
+  const parameters = [...connection.parameters];
+  if (typeof connection.password === 'function' && !password) parameters.push(['password', '']);
   const user = connection.user ? encodeURIComponent(connection.user) : '';
   const secret = password ? `:${encodeURIComponent(password)}` : '';
   const auth = user || secret ? `${user}${secret}@` : '';
-  const query = connection.parameters.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
+  const query = parameters.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
   return (
     `postgresql://${auth}${encodeURIComponent(connection.host)}:${encodeURIComponent(connection.port)}` +
     `/${encodeURIComponent(connection.database)}${query.length > 0 ? `?${query.join('&')}` : ''}`

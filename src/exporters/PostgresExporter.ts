@@ -119,6 +119,8 @@ const isSpace = (char: string | undefined): boolean => char !== undefined && /[ 
  * The settings of a keyword=value connection string, with each `password` setting taken out for PGPASSWORD, read as
  * libpq reads them (fe-connect.c, conninfo_parse): a keyword runs to `=` or whitespace, a value runs to whitespace
  * or sits in single quotes, a backslash takes the character after it as it is, and the later of two passwords wins.
+ * An empty password goes to PGPASSWORD empty: libpq reads the environment's PGPASSWORD only for a password the
+ * settings leave out (conninfo_add_defaults), and reads an empty PGPASSWORD as it reads an empty setting.
  */
 const keywordConnectionOf = (connectionString: string): { dbname: string; env: Record<string, string> } => {
   const text = connectionString;
@@ -182,7 +184,7 @@ const keywordConnectionOf = (connectionString: string): { dbname: string; env: R
     from = end;
   }
   kept += text.slice(from);
-  return { dbname: kept.trim(), env: password ? { PGPASSWORD: password } : {} };
+  return { dbname: kept.trim(), env: password === undefined ? {} : { PGPASSWORD: password } };
 };
 
 /**
@@ -215,7 +217,11 @@ const connectionOf = (connectionString: string): { dbname: string; env: Record<s
  * `--dbname` and travels in `PGPASSWORD`, so it never shows in the process
  * list; the string is read as libpq reads it, so an empty host, several hosts,
  * a `#` or `?` in a URI's password, or a quoted value with spaces keep it off
- * the command line too. With `schema`, the dump holds that schema alone.
+ * the command line too. An empty password given in the string goes to
+ * `PGPASSWORD` empty, so libpq sends no password of the environment's. pg_dump
+ * runs with `--no-password`: it never asks for one, on a terminal or on its
+ * standard input, which `execFile` leaves open. With `schema`, the dump holds
+ * that schema alone.
  *
  * @throws {Error} Before pg_dump starts, when the connection string holds a
  *   NUL character, a password that is not valid percent-encoding or decodes
@@ -228,7 +234,9 @@ export function pgDumpInvocation(
   options: Pick<PostgresExporterOptions, 'schema'> = {},
 ): PgDumpInvocation {
   const { dbname, env } = connectionOf(connectionString);
-  const args = [`--dbname=${dbname}`, '--format=custom'];
+  // Without a password, to a server that asks for one, pg_dump would ask for it on the terminal, or with no
+  // terminal on its standard input, and wait there (pg_backup_db.c, ConnectDatabaseAhx; sprompt.c).
+  const args = [`--dbname=${dbname}`, '--format=custom', '--no-password'];
   if (options.schema !== undefined) {
     // In double quotes pg_dump reads the name exactly: no case folding, and no pattern characters.
     args.push(`--schema="${options.schema.replace(/"/g, '""')}"`);
