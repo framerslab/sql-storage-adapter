@@ -61,7 +61,8 @@ const failure = (message: string, error: unknown): Error => {
  * is SELECT and which names no INTO, so it makes no table. Block comments nest, as PostgreSQL reads them. Any other
  * statement can write, such as `UPDATE ... RETURNING` through `get`, and runs each time it is asked.
  */
-const isPlainRead = (statement: string): boolean => {
+const isPlainRead = (statement: unknown): boolean => {
+  if (typeof statement !== 'string') return false;
   let at = 0;
   for (;;) {
     while (at < statement.length && /\s/.test(statement.charAt(at))) at += 1;
@@ -218,9 +219,14 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     }
   }
 
-  /** The cached answer of a plain read, counted as a hit; `undefined` when the cache holds none. */
-  private cached<T>(read: boolean, cacheKey: string): T | undefined {
-    if (!this.cacheEnabled || !read) return undefined;
+  /** The key a plain read is cached under while the cache is on; `undefined` for any other statement or with it off. */
+  private cacheKeyOf(read: boolean, statement: string, parameters?: StorageParameters): string | undefined {
+    return this.cacheEnabled && read ? this.getCacheKey(statement, parameters) : undefined;
+  }
+
+  /** The cached answer under the key, counted as a hit; `undefined` when the cache holds none. */
+  private cached<T>(cacheKey: string | undefined): T | undefined {
+    if (cacheKey === undefined) return undefined;
     if (this.queryCache.has(cacheKey)) {
       if (this.metrics.cacheHits !== undefined) {
         this.metrics.cacheHits++;
@@ -233,9 +239,9 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     return undefined;
   }
 
-  /** Keeps a plain read's answer, unless a write or `clearCache()` came while it was read. */
-  private keep(read: boolean, cacheKey: string, generation: number, value: unknown): void {
-    if (!this.cacheEnabled || !read || generation !== this.cacheGeneration) return;
+  /** Keeps a plain read's answer under its key, unless a write or `clearCache()` came while it was read. */
+  private keep(cacheKey: string | undefined, generation: number, value: unknown): void {
+    if (cacheKey === undefined || !this.cacheEnabled || generation !== this.cacheGeneration) return;
     this.queryCache.set(cacheKey, value);
     if (this.queryCache.size > this.maxCacheSize) {
       const firstKey = this.queryCache.keys().next().value;
@@ -249,8 +255,8 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     if (!this.pool) throw new Error('Storage adapter not opened');
 
     const read = isPlainRead(statement);
-    const cacheKey = this.getCacheKey(statement, parameters);
-    const cached = this.cached<T | null>(read, cacheKey);
+    const cacheKey = this.cacheKeyOf(read, statement, parameters);
+    const cached = this.cached<T | null>(cacheKey);
     if (cached !== undefined) return cached ?? null;
 
     const generation = this.cacheGeneration;
@@ -260,7 +266,7 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       this.trackQuery(statement, startTime);
 
       const value = result.rows[0] || null;
-      if (value !== null) this.keep(read, cacheKey, generation, value);
+      if (value !== null) this.keep(cacheKey, generation, value);
       return value as T;
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
@@ -273,8 +279,8 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     if (!this.pool) throw new Error('Storage adapter not opened');
 
     const read = isPlainRead(statement);
-    const cacheKey = this.getCacheKey(statement, parameters);
-    const cached = this.cached<T[]>(read, cacheKey);
+    const cacheKey = this.cacheKeyOf(read, statement, parameters);
+    const cached = this.cached<T[]>(cacheKey);
     if (cached !== undefined) return cached;
 
     const generation = this.cacheGeneration;
@@ -284,7 +290,7 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       this.trackQuery(statement, startTime);
 
       const rows = result.rows;
-      this.keep(read, cacheKey, generation, rows);
+      this.keep(cacheKey, generation, rows);
       return rows as T[];
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
