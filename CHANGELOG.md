@@ -1,3 +1,25 @@
+## [0.7.16] - 2026-10-17
+
+### Security
+- `PostgresExporter` refuses, before `pg_dump` starts, a connection string whose password it cannot move to `PGPASSWORD`: a URI password that is not valid percent-encoding (`%zz`, a `%` at its end, bytes that are not UTF-8) or that decodes to a NUL, and a connection string that holds a NUL. 0.7.15 passed such a URI whole, its password in `--dbname`, where the process list shows it. The refusal never holds the connection string.
+- `PostgresExporter` moves the `password` of keyword=value settings (`host=db.example password='a b'`) to `PGPASSWORD` too, read as libpq reads them: a value runs to whitespace or sits in single quotes, a backslash takes the character after it, and the later of two passwords wins. Settings libpq refuses (an unterminated quote, a setting with no `=`) are refused before `pg_dump` starts. 0.7.15 passed them whole on the command line.
+- The exporter of a PostgreSQL adapter leaves `sslpassword`, `oauth_client_secret` and the SCRAM keys of a pool's connection string off `pg_dump`'s command line, where libpq takes them alone: pg reads none of them.
+
+### Changed
+- `new PostgresExporter(connectionString)` takes a function that gives the connection string, or a promise of it, when an export runs.
+
+### Fixed
+- `createStorageFeatures(adapter).exporter` on PostgreSQL reads the connection of the adapter's pool as pg reads it, and hands `pg_dump` a libpq URI of it, so `pg_dump` reaches the server, the database and the user the pool reaches:
+  - A connection string pg and libpq read apart: `postgresql://db.example?application_name=x@y` names the host `db.example` to pg and `y` to libpq, and `pg_dump` connected to `y`. An `@` in a URL's password, a host left out, `ssl=1`, `sslmode=no-verify` and pg's own parameters are written as libpq reads them.
+  - A pool made without a host, a port, a user or a database: `PGHOST`, `PGPORT`, `PGUSER` and `PGDATABASE`, then localhost, 5432, the operating system's user and the user's name for the database, as pg fills them. 0.7.15 wrote localhost and 5432 for a pool that named no host or port, and refused one that named no database. The adapter's own settings keep the localhost and 5432 of the pool it makes.
+  - A pool whose password is a function: the function is called when the export runs, and its answer goes to `PGPASSWORD`. A function that fails, or answers anything but a string or `undefined`, refuses the export. 0.7.15 left the password out, so `pg_dump` could not log in.
+  - A pool whose `ssl` holds `ca`, `cert`, `key`, `pfx` or another TLS option is refused, naming the options and what to do instead: `pg_dump` reads TLS material from files alone. 0.7.15 wrote `sslmode=require` in its place, so `pg_dump` connected without the client certificate, or checked the server against no certificate authority.
+  - A pool that connects without TLS gets `sslmode=disable` where `PGSSLMODE` would make libpq insist on TLS or refuse the connection (pg's `no-verify`).
+- `resolveStorageAdapter()` and `createDatabase()` open a PostgreSQL candidate in the segment of its own options or the top-level one alone. Tried after an IndexedDB or Capacitor candidate whose options named a segment, it took that segment: on a pool of the caller's the adapter threw, and on a connection string the server got a schema only the browser's options asked for. A local candidate still opens in it.
+- IndexedDB adapter: a PRAGMA assignment through `all()` or `get()` with a comment between its words (`PRAGMA user_version /* note */ = 7`), or with a quoted name and no space before it (`PRAGMA"user_version"=9`), is saved; the statement is read as SQLite reads it. 0.7.15 found no assignment in it, so it was stored neither with `durability: 'commit'` nor by `flush()` or `close()`.
+- `createSqlKeyValueStore()` writes a value's text from the copy the runtime's `structuredClone` returns, so each property is read once, as IndexedDB's put reads it, and the value is copied once. 0.7.15 read each property a second time for the text: a getter's second answer was stored, and a value whose getter answered a function the second time was refused.
+- `S3StorageProvider.list()` follows `NextContinuationToken` to the last page (#64). It read the first page alone, at most 1,000 keys.
+
 ## [0.7.15] - 2026-10-17
 
 ### Added
