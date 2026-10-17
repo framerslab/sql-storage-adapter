@@ -5,7 +5,8 @@
  * version commit together, so a lost answer or a repeated push never applies a mutation twice. A permanent refusal
  * consumes its id and records its result; any other failure rolls the whole push back. `pull` reads the version, the
  * rows changed since a cookie, every client's last id and the caller's results in one transaction, and streams them as
- * one JSON answer, batch by batch; a cancelled stream rolls its transaction back and never completes.
+ * one JSON answer, batch by batch; a cancelled stream, or one still open at `maxPullMs`, rolls its transaction back and
+ * never completes.
  * `replayTombstone` writes a deletion fence's tombstone after a restore. The store is the caller's: its tables, its
  * locks and its isolation.
  */
@@ -121,6 +122,12 @@ export interface MutationServerOptions {
   maxMutations: number;
   /** The most rows one read of a pull takes (default 200). */
   pullBatchRows?: number;
+  /**
+   * How long a pull's transaction may stay open, in milliseconds (default 120,000, the fetch transport's own deadline):
+   * a stream still open then is cancelled and its transaction rolled back, so a reader that stops reading cannot hold
+   * it; `Infinity` sets no limit.
+   */
+  maxPullMs?: number;
   clock?: () => Date;
 }
 
@@ -225,8 +232,8 @@ export class MutationServer {
   /**
    * Opens a pull. The refusals (a changed epoch, another group, a cookie past the version) are decided before any row is
    * read; otherwise the answer streams from one transaction: the version first, the rows in batches, then the
-   * results and every client's last id. Aborting `signal`, or stopping the iteration, cancels the stream and rolls its
-   * transaction back.
+   * results and every client's last id. Aborting `signal`, stopping the iteration, or `maxPullMs` passing cancels the
+   * stream and rolls its transaction back.
    */
   async pull(context: ScopeContext, request: PullRequest, signal?: AbortSignal): Promise<PullOpening> {
     if (request.epoch !== context.epoch) return { kind: 'epoch_changed', epoch: context.epoch };
@@ -247,6 +254,9 @@ export class MutationServer {
     const onAbort = (): void => handOver.cancel(signal?.reason ?? new PullCancelled());
     if (signal?.aborted) return Promise.reject(signal.reason ?? new PullCancelled());
     signal?.addEventListener('abort', onAbort, { once: true });
+    // a reader that stops reading holds the transaction no longer than the limit; a timer holds at most 2^31 - 1 ms
+    const limit = this.options.maxPullMs ?? 120_000;
+    const deadline = Number.isFinite(limit) ? setTimeout(() => handOver.cancel(new PullCancelled()), Math.min(limit, 2_147_483_647)) : null;
     void adapter
       .transaction(async (trx) => {
         await store.begin(trx, 'pull');
@@ -288,6 +298,7 @@ export class MutationServer {
         },
       )
       .finally(() => {
+        if (deadline !== null) clearTimeout(deadline);
         signal?.removeEventListener('abort', onAbort);
         finished();
       });
