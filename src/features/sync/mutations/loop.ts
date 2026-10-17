@@ -1,10 +1,11 @@
 /**
  * The cadence of a client's sync: a cycle pushes then pulls; it runs at start, on a save (at once), when the page
  * becomes visible, on reconnecting and on sign-in, and every `pullEveryMs` while the page is visible. A failed cycle is
- * tried again after `firstRetryMs`, doubling to `maxRetryMs`; a rate refusal waits as long as it asks, and a kick during
- * that wait, or during the cycle the refusal ended, runs nothing before the wait is over. One cycle runs at a time; a
- * kick during a cycle runs one more after it. A stop ends the run: a cycle still running when it came schedules
- * nothing, even when the loop starts again before that cycle ends.
+ * tried again after `firstRetryMs`, doubling to `maxRetryMs`; a rate refusal waits as long as it asks, up to the
+ * longest wait a timer holds (2^31 - 1 ms), and a kick during that wait, or during the cycle the refusal ended, runs
+ * nothing before the wait is over. One cycle runs at a time; a kick during a cycle runs one more after it. A stop ends
+ * the run: a cycle still running when it came schedules nothing, even when the loop starts again before that cycle
+ * ends.
  */
 import type { SyncOutcome } from './client';
 
@@ -31,6 +32,9 @@ export interface SyncLoopOptions {
 
 /** Why the loop was kicked. */
 export type KickReason = 'load' | 'save' | 'visible' | 'online' | 'sign_in' | 'timer';
+
+/** The longest wait a timer holds: browsers and Node run a longer one at once. */
+const LONGEST_TIMER_MS = 2_147_483_647;
 
 /** The loop. */
 export class SyncLoop {
@@ -145,7 +149,7 @@ export class SyncLoop {
       this.timer = null;
       this.holding = false;
       this.kick('timer');
-    }, next);
+    }, Math.min(next, LONGEST_TIMER_MS));
   }
 }
 
