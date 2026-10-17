@@ -4,9 +4,10 @@ import { SupabaseAdapter, isUniqueViolation, setStorageLogger, type StorageLogge
 // The Supabase adapter is deprecated in favour of the PostgreSQL adapter,
 // which reaches Supabase with its connection string. Until it goes, it reads
 // `?` and `@name` placeholders as the PostgreSQL adapter does, keeps
-// PostgreSQL's error code on the errors it throws, and says once, through the
+// PostgreSQL's error code on the errors it throws, says once, through the
 // host logger, that it is deprecated and does not verify the server's
-// certificate. These specs run when POSTGRES_TEST_URL names a server.
+// certificate, and, with its cache on, never answers a row as it stood before
+// one of its own writes. These specs run when POSTGRES_TEST_URL names a server.
 
 const POSTGRES_TEST_URL = process.env.POSTGRES_TEST_URL;
 
@@ -68,5 +69,78 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
     expect((error as { code?: string }).code).toBe('23505');
     expect(isUniqueViolation(error)).toBe(true);
     expect(String((error as Error).message)).toMatch(/^Query failed: /);
+  });
+
+  // enableCache() keeps the answers of plain reads. A row it answers must be the row as this adapter's
+  // own last write left it, and a statement that writes must run each time it is asked.
+  describe('with its cache on', () => {
+    beforeAll(() => db.enableCache());
+    afterAll(() => db.disableCache());
+
+    const hitsSoFar = (): number => db.getMetrics().cacheHits ?? 0;
+
+    it("answers a row as the adapter's last write left it, whichever call wrote", async () => {
+      const read = `SELECT label FROM ${table} WHERE id = ?`;
+      await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [10, 'first']);
+      expect(await db.get(read, [10])).toEqual({ label: 'first' });
+      const hits = hitsSoFar();
+      expect(await db.get(read, [10])).toEqual({ label: 'first' });
+      expect(hitsSoFar()).toBe(hits + 1);
+
+      await db.run(`UPDATE ${table} SET label = ? WHERE id = ?`, ['by run', 10]);
+      expect(await db.get(read, [10])).toEqual({ label: 'by run' });
+      await db.exec(`UPDATE ${table} SET label = 'by exec' WHERE id = 10`);
+      expect(await db.get(read, [10])).toEqual({ label: 'by exec' });
+      await db.transaction(async (trx) => {
+        await trx.run(`UPDATE ${table} SET label = ? WHERE id = ?`, ['by a transaction', 10]);
+      });
+      expect(await db.get(read, [10])).toEqual({ label: 'by a transaction' });
+      await db.batchWrite([{ statement: '', type: 'update', table, values: { label: 'by a batch' }, where: { id: 10 } }]);
+      expect(await db.get(read, [10])).toEqual({ label: 'by a batch' });
+
+      const list = `SELECT id FROM ${table} WHERE id IN (?, ?) ORDER BY id`;
+      expect(await db.all(list, [10, 11])).toEqual([{ id: 10 }]);
+      await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [11, 'second']);
+      expect(await db.all(list, [10, 11])).toEqual([{ id: 10 }, { id: 11 }]);
+      await db.get(`DELETE FROM ${table} WHERE id = ? RETURNING id`, [11]);
+      expect(await db.all(list, [10, 11])).toEqual([{ id: 10 }]);
+    });
+
+    it('runs a statement that writes each time it is asked, through get and all too', async () => {
+      const insert = `INSERT INTO ${table} (id, label) VALUES (?, ?) RETURNING id`;
+      expect(await db.get(insert, [12, 'returned'])).toEqual({ id: 12 });
+      const duplicate = await db.get(insert, [12, 'returned']).catch((caught: unknown) => caught);
+      expect((duplicate as { code?: string }).code).toBe('23505');
+
+      const append = `UPDATE ${table} SET label = label || '!' WHERE id = ? RETURNING label`;
+      expect(await db.all(append, [12])).toEqual([{ label: 'returned!' }]);
+      expect(await db.all(append, [12])).toEqual([{ label: 'returned!!' }]);
+
+      // PostgreSQL nests block comments: this one ends after the second */, so the statement is the UPDATE.
+      const hidden = `/* one /* two */ SELECT */ UPDATE ${table} SET label = label || '.' WHERE id = ? RETURNING label`;
+      expect(await db.get(hidden, [12])).toEqual({ label: 'returned!!.' });
+      expect(await db.get(hidden, [12])).toEqual({ label: 'returned!!..' });
+
+      // SELECT ... INTO makes a table.
+      const copy = `${table}_copy`;
+      const into = `SELECT id INTO ${copy} FROM ${table} WHERE id = 12`;
+      expect(await db.all(into)).toEqual([]);
+      const made = await db.all(into).catch((caught: unknown) => caught);
+      expect((made as { code?: string }).code).toBe('42P07');
+      await db.exec(`DROP TABLE ${copy}`);
+
+      expect(await db.get(`SELECT label FROM ${table} WHERE id = ?`, [12])).toEqual({ label: 'returned!!..' });
+    });
+
+    it('keeps nothing of a read that was in flight across a write', async () => {
+      await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [13, 'before']);
+      // A statement reads the rows as they stood when it began; the write commits while this one sleeps.
+      const slow = `SELECT label FROM ${table} CROSS JOIN pg_sleep(1) WHERE id = ?`;
+      const pending = db.get(slow, [13]);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      await db.run(`UPDATE ${table} SET label = ? WHERE id = ?`, ['after', 13]);
+      expect(await pending).toEqual({ label: 'before' });
+      expect(await db.get(slow, [13])).toEqual({ label: 'after' });
+    });
   });
 });
