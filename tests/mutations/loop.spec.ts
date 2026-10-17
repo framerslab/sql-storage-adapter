@@ -197,6 +197,22 @@ describe('the sync loop', () => {
     expect(client.calls).toHaveLength(6);
     loop.stop();
   });
+
+  it('waits the longest a timer can hold for a rate refusal that asks for longer, and never runs again at once', async () => {
+    const client = fakeClient();
+    client.pushAnswer = { kind: 'wait', ms: 3_000_000_000 };
+    const loop = new SyncLoop({ client, visible: () => true });
+    loop.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.calls).toEqual(['push']);
+    // a timer asked for more than 2^31 - 1 milliseconds fires at once in browsers and Node; the loop holds the longest wait
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(client.calls).toEqual(['push']);
+    client.pushAnswer = { kind: 'idle' };
+    await vi.advanceTimersByTimeAsync(2_147_483_647);
+    expect(client.calls).toEqual(['push', 'push', 'pull']);
+    loop.stop();
+  });
 });
 
 describe('attaching the loop to a page', () => {
