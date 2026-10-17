@@ -169,4 +169,32 @@ describe('the SQL key-value store value text', () => {
     expect(text.includes('\u0000')).toBe(false);
     expect(roundTrip({ nul: 'a\u0000b' })).toEqual({ nul: 'a\u0000b' });
   });
+
+  // IndexedDB's put reads each property of a value once, through the
+  // structured clone. The SQL store wrote its text from a second read of the
+  // value, after the clone that refuses a proxy had read it once.
+  it('reads a getter once and keeps the answer the structured clone took', () => {
+    let reads = 0;
+    const value = {
+      get count(): number {
+        reads += 1;
+        return reads;
+      },
+    };
+
+    expect(roundTrip(value)).toStrictEqual({ count: 1 });
+    expect(reads).toBe(1);
+  });
+
+  it('stores a value whose getter answers a function on a second read, as the structured clone took it', () => {
+    let reads = 0;
+    const value = {
+      get field(): unknown {
+        reads += 1;
+        return reads === 1 ? 'first' : () => 'second';
+      },
+    };
+
+    expect(roundTrip(value)).toStrictEqual({ field: 'first' });
+  });
 });
