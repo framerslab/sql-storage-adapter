@@ -2,7 +2,8 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import pg from 'pg';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { PostgresExporter, pgDumpInvocation } from '../src/exporters/PostgresExporter';
 
 // The exporter built pg_dump's command as one shell string, so a quote or a $(...) in the output path or the
@@ -69,8 +70,41 @@ function hasPgDump(): boolean {
   }
 }
 
+// pg_dump reads every table of the database it dumps, and the other spec files create and drop tables in the test
+// database while this one runs: a table dropped between pg_dump's catalog read and its LOCK TABLE fails the dump with
+// "relation ... does not exist". So the dump reads a database of its own, made here and dropped after.
 describe.skipIf(!process.env.POSTGRES_TEST_URL || !hasPgDump())('PostgresExporter against a PostgreSQL server', () => {
   const dirs: string[] = [];
+  const database = `dump_${process.pid}_${Math.random().toString(36).slice(2, 10)}`;
+  let admin: pg.Client | undefined;
+  let databaseUrl = '';
+
+  beforeAll(async () => {
+    admin = new pg.Client({ connectionString: process.env.POSTGRES_TEST_URL });
+    await admin.connect();
+    await admin.query(`CREATE DATABASE ${database}`);
+    const parsed = new URL(process.env.POSTGRES_TEST_URL as string);
+    parsed.pathname = `/${database}`;
+    databaseUrl = parsed.toString();
+    const own = new pg.Client({ connectionString: databaseUrl });
+    await own.connect();
+    try {
+      await own.query('CREATE TABLE exported_rows (id INTEGER PRIMARY KEY, label TEXT NOT NULL)');
+      await own.query("INSERT INTO exported_rows (id, label) VALUES (1, 'kept')");
+    } finally {
+      await own.end();
+    }
+  });
+
+  afterAll(async () => {
+    if (admin === undefined) return;
+    try {
+      await admin.query(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
+    } finally {
+      await admin.end();
+    }
+  });
+
   afterEach(() => {
     for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -80,9 +114,10 @@ describe.skipIf(!process.env.POSTGRES_TEST_URL || !hasPgDump())('PostgresExporte
     dirs.push(dir);
     const marker = `pwned-${process.pid}-${Date.now()}`;
     const target = path.join(dir, `dump"; touch ${marker}; echo "$(touch ${marker}-sub).custom`);
-    await new PostgresExporter(process.env.POSTGRES_TEST_URL).exportToFile(target);
+    await new PostgresExporter(databaseUrl).exportToFile(target);
     expect(fs.existsSync(target)).toBe(true);
-    expect(fs.statSync(target).size).toBeGreaterThan(0);
+    // the custom format keeps each object's definition as plain text beside the compressed data
+    expect(fs.readFileSync(target).toString('latin1')).toContain('CREATE TABLE public.exported_rows');
     expect(fs.existsSync(path.join(process.cwd(), marker))).toBe(false);
     expect(fs.existsSync(path.join(process.cwd(), `${marker}-sub`))).toBe(false);
   });
