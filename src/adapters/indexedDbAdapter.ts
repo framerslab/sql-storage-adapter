@@ -837,30 +837,33 @@ export class IndexedDbAdapter implements StorageAdapter {
       return;
     }
     const target = this.writeGeneration;
-    await this.waitForSave(target, async () => {
-      while (this.savedGeneration < target && this.db && this.idb) {
-        if (this.saving) {
-          const covering = this.savingGeneration >= target;
-          try {
-            await this.saving;
-          } catch (error) {
-            if (covering) throw error;
-          }
-          continue;
+    await this.waitForSave(target, () => this.flushThrough(target));
+  }
+
+  /** flush() without `crossTab`: stores the writes up to `target`, and rejects while a `BEGIN` is open. */
+  private async flushThrough(target: number): Promise<void> {
+    while (this.savedGeneration < target && this.db && this.idb) {
+      if (this.saving) {
+        const covering = this.savingGeneration >= target;
+        try {
+          await this.saving;
+        } catch (error) {
+          if (covering) throw error;
         }
-        if (this.gate.openToken() !== null) {
-          await this.gate.ended();
-          continue;
-        }
-        if (this.inTransaction()) {
-          throw new Error(
-            `IndexedDbAdapter: flush() cannot store "${this.dbName}" while a transaction begun with BEGIN is open: ` +
-              "sql.js's export would end it. COMMIT or ROLLBACK it first.",
-          );
-        }
-        await this.startSave();
+        continue;
       }
-    });
+      if (this.gate.openToken() !== null) {
+        await this.gate.ended();
+        continue;
+      }
+      if (this.inTransaction()) {
+        throw new Error(
+          `IndexedDbAdapter: flush() cannot store "${this.dbName}" while a transaction begun with BEGIN is open: ` +
+            "sql.js's export would end it. COMMIT or ROLLBACK it first.",
+        );
+      }
+      await this.startSave();
+    }
   }
 
   /**
@@ -1419,27 +1422,30 @@ export class IndexedDbAdapter implements StorageAdapter {
    * stored image in their place before they were stored.
    */
   private async saveThrough(generation: number): Promise<void> {
-    await this.waitForSave(generation, async () => {
-      while (this.savedGeneration < generation && this.db && this.idb) {
-        if (this.saving) {
-          const covering = this.savingGeneration >= generation;
-          try {
-            await this.saving;
-          } catch (error) {
-            if (covering) throw error;
-          }
-          continue;
+    await this.waitForSave(generation, () => this.storeThrough(generation));
+  }
+
+  /** saveThrough()'s loop: settles once the writes up to `generation` are stored, or while a `BEGIN` is open. */
+  private async storeThrough(generation: number): Promise<void> {
+    while (this.savedGeneration < generation && this.db && this.idb) {
+      if (this.saving) {
+        const covering = this.savingGeneration >= generation;
+        try {
+          await this.saving;
+        } catch (error) {
+          if (covering) throw error;
         }
-        if (this.gate.openToken() !== null) {
-          await this.gate.ended();
-          continue;
-        }
-        if (this.inTransaction()) {
-          return;
-        }
-        await this.startSave();
+        continue;
       }
-    });
+      if (this.gate.openToken() !== null) {
+        await this.gate.ended();
+        continue;
+      }
+      if (this.inTransaction()) {
+        return;
+      }
+      await this.startSave();
+    }
   }
 
   /**
