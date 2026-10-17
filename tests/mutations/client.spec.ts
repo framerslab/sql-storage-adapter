@@ -87,6 +87,7 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('the 
     expect(results.map((row) => row.outcome)).toEqual(['applied']);
   });
 
+  // two to three seconds on a CI runner: forty values replayed, packed and stored on both sides, so a deadline of its own
   it('carries forty values of 30,000 code units, escapes and multibyte text included, in several pushes within the byte limit', async () => {
     const a = await browser(w);
     await a.join();
@@ -99,7 +100,7 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('the 
     await b.join();
     expect((await b.blocks()).length).toBe(40);
     expect(await b.values()).toEqual(blocks.map((block) => block.value).sort());
-  });
+  }, 20_000);
 
   it('splits a push the server refuses as too large, in order with its ids, and keeps a mutation refused alone pending with sends stopped', async () => {
     const a = await browser(w);
