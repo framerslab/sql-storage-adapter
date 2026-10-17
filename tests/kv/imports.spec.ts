@@ -48,6 +48,17 @@ const importsOf = (file: string): { runtime: string[]; typesOnly: string[] } => 
   return { runtime, typesOnly };
 };
 
+/** The module's files, as the package entry expects them. */
+const MODULE_FILES = [
+  'idb.ts',
+  'index.ts',
+  'indexedDbKeyValueStore.ts',
+  'keyValueStore.ts',
+  'migrateIndexedDbKeyValue.ts',
+  'sqlKeyValueStore.ts',
+  'valueCodec.ts',
+];
+
 describe('the key-value module', () => {
   const files = fs
     .readdirSync(KV_DIR)
@@ -55,12 +66,10 @@ describe('the key-value module', () => {
     .map((name) => path.join(KV_DIR, name));
 
   it('has its files where the package entry expects them', () => {
-    expect(files.map((file) => path.basename(file)).sort()).toEqual(
-      ['idb.ts', 'index.ts', 'indexedDbKeyValueStore.ts', 'keyValueStore.ts', 'sqlKeyValueStore.ts', 'valueCodec.ts'].sort(),
-    );
+    expect(files.map((file) => path.basename(file)).sort()).toEqual([...MODULE_FILES].sort());
   });
 
-  it.each(['idb.ts', 'index.ts', 'indexedDbKeyValueStore.ts', 'keyValueStore.ts', 'sqlKeyValueStore.ts', 'valueCodec.ts'])(
+  it.each(MODULE_FILES)(
     '%s reaches only files of the module at run time',
     (name) => {
       const { runtime } = importsOf(path.join(KV_DIR, name));
@@ -71,8 +80,8 @@ describe('the key-value module', () => {
     },
   );
 
-  it('names the adapter contract for types only', () => {
-    const { runtime, typesOnly } = importsOf(path.join(KV_DIR, 'sqlKeyValueStore.ts'));
+  it.each(['sqlKeyValueStore.ts', 'migrateIndexedDbKeyValue.ts'])('%s names the adapter contract for types only', (name) => {
+    const { runtime, typesOnly } = importsOf(path.join(KV_DIR, name));
 
     expect(typesOnly).toContain('../../core/contracts');
     expect(runtime.some((specifier) => specifier.includes('core') || specifier.includes('adapters'))).toBe(false);
