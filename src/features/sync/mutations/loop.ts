@@ -1,8 +1,9 @@
 /**
  * The cadence of a client's sync: a cycle pushes then pulls; it runs at start, on a save (at once), when the page
  * becomes visible, on reconnecting and on sign-in, and every `pullEveryMs` while the page is visible. A failed cycle is
- * tried again after `firstRetryMs`, doubling to `maxRetryMs`; a rate refusal waits as long as it asks. One cycle runs
- * at a time; a kick during a cycle runs one more after it.
+ * tried again after `firstRetryMs`, doubling to `maxRetryMs`; a rate refusal waits as long as it asks, and a kick during
+ * that wait, or during the cycle the refusal ended, runs nothing before the wait is over. One cycle runs at a time; a
+ * kick during a cycle runs one more after it.
  */
 import type { SyncOutcome } from './client';
 
@@ -23,7 +24,7 @@ export interface SyncLoopOptions {
   maxRetryMs?: number;
   /** Whether the page is visible; true when left out. */
   visible?: () => boolean;
-  /** Told of every failed cycle. */
+  /** Told of every failed cycle; an error it throws is dropped and the retry stands. */
   onError?: (error: unknown) => void;
 }
 
@@ -36,6 +37,8 @@ export class SyncLoop {
   private running = false;
   private again = false;
   private stopped = true;
+  /** A rate refusal's wait is running: a kick runs nothing until its timer does. */
+  private holding = false;
   private retryMs: number;
 
   constructor(private readonly options: SyncLoopOptions) {
@@ -48,16 +51,18 @@ export class SyncLoop {
     this.kick('load');
   }
 
-  /** Stops; a running cycle ends and schedules nothing. */
+  /** Stops; a running cycle ends and schedules nothing, and a rate refusal's wait is dropped. */
   stop(): void {
     this.stopped = true;
+    this.again = false;
+    this.holding = false;
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;
   }
 
-  /** Runs a cycle now, or one more after the running one. */
+  /** Runs a cycle now, or one more after the running one; while a rate refusal's wait runs, nothing. */
   kick(_reason: KickReason): void {
-    if (this.stopped) return;
+    if (this.stopped || this.holding) return;
     if (this.running) {
       this.again = true;
       return;
@@ -70,17 +75,20 @@ export class SyncLoop {
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;
     let next: number | null = null;
+    let refused = false;
     try {
       for (let round = 0; round < 5; round += 1) {
         const pushed = await this.options.client.push();
         if (pushed.kind === 'wait') {
           next = pushed.ms;
+          refused = true;
           break;
         }
         if (pushed.kind === 'resend') continue;
         const pulled = await this.options.client.pull();
         if (pulled.kind === 'wait') {
           next = pulled.ms;
+          refused = true;
           break;
         }
         // after a recovery the rebuilt mutations go again at once
@@ -90,7 +98,11 @@ export class SyncLoop {
       this.retryMs = this.options.firstRetryMs ?? 2000;
       if (next === null && (this.options.visible?.() ?? true)) next = this.options.pullEveryMs ?? 60_000;
     } catch (error) {
-      this.options.onError?.(error);
+      try {
+        this.options.onError?.(error);
+      } catch {
+        // the listener's own failure is dropped: the retry below still stands
+      }
       next = this.retryMs;
       this.retryMs = Math.min(this.retryMs * 2, this.options.maxRetryMs ?? 300_000);
     } finally {
@@ -99,10 +111,19 @@ export class SyncLoop {
     if (this.stopped) return;
     if (this.again) {
       this.again = false;
-      void this.cycle();
-      return;
+      // a kick during a refused cycle is served by the cycle its wait's timer runs
+      if (!refused) {
+        void this.cycle();
+        return;
+      }
     }
-    if (next !== null) this.timer = setTimeout(() => this.kick('timer'), next);
+    if (next === null) return;
+    this.holding = refused;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.holding = false;
+      this.kick('timer');
+    }, next);
   }
 }
 
