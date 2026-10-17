@@ -33,6 +33,7 @@ jobs:
     env:
       TZ: Europe/Berlin
       POSTGRES_TEST_URL: postgresql://adapter:adapter@localhost:5432/adapter_test
+      SYNC_TEST_REQUIRE_POSTGRES: '1'
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
