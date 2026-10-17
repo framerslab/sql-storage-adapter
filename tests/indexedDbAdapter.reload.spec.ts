@@ -156,6 +156,32 @@ describe('IndexedDbAdapter.reload()', () => {
     expect(await labels(adapter)).toEqual(['inside']);
   });
 
+  it('rejects a durable write and a flush() still waiting for their save when reload() puts the stored image in their place', async () => {
+    const adapter = await openTab('reload-pending');
+    await adapter.run('INSERT INTO items (label) VALUES (?)', ['stored']);
+    // The first write's save starts at once; the second write and the flush wait for it, and reload() is asked for
+    // before the second is stored.
+    const first = adapter.run('INSERT INTO items (label) VALUES (?)', ['first']);
+    const second = adapter.run('INSERT INTO items (label) VALUES (?)', ['second']).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    const flushed = adapter.flush().then(
+      () => null,
+      (error: unknown) => error,
+    );
+    const reloaded = adapter.reload();
+    await first;
+    expect(await reloaded).toBe(true);
+    const discarded = await second;
+    expect(discarded).toBeInstanceOf(Error);
+    expect((discarded as Error).message).toContain('reload()');
+    expect(await flushed).toBeInstanceOf(Error);
+    expect(await labels(adapter)).toEqual(['stored', 'first']);
+    const reader = await openTab('reload-pending');
+    expect(await labels(reader)).toEqual(['stored', 'first']);
+  });
+
   describe('with crossTab.rollbackRefusedSaves', () => {
     it('puts the stored image back inside the lock, so a statement queued behind a refused transaction neither reads nor stores its write', async () => {
       const adapter = await openTab('rollback-queued', { crossTab: { locks: createLockManager(), rollbackRefusedSaves: true } });
