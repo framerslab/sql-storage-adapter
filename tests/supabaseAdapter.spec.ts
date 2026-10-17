@@ -132,6 +132,43 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
       expect(await db.get(`SELECT label FROM ${table} WHERE id = ?`, [12])).toEqual({ label: 'returned!!..' });
     });
 
+    it('runs a SELECT that writes through a function each time it is asked, and answers rows as it left them', async () => {
+      // A SELECT can call a function that writes: its text alone cannot tell it from a read.
+      const bump = `${table}_bump`;
+      await db.exec(
+        `CREATE FUNCTION ${bump}(target integer) RETURNS text LANGUAGE sql AS ` +
+          `$$ UPDATE ${table} SET label = label || '+' WHERE id = target RETURNING label $$`,
+      );
+      try {
+        const read = `SELECT label FROM ${table} WHERE id = ?`;
+        await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [14, 'n']);
+        expect(await db.get(read, [14])).toEqual({ label: 'n' });
+
+        const call = `SELECT ${bump}(?) AS label`;
+        expect(await db.get(call, [14])).toEqual({ label: 'n+' });
+        expect(await db.get(call, [14])).toEqual({ label: 'n++' });
+        expect(await db.get(read, [14])).toEqual({ label: 'n++' });
+        expect(await db.all(call, [14])).toEqual([{ label: 'n+++' }]);
+        expect(await db.all(call, [14])).toEqual([{ label: 'n++++' }]);
+        expect(await db.get(read, [14])).toEqual({ label: 'n++++' });
+      } finally {
+        await db.exec(`DROP FUNCTION ${bump}(integer)`);
+      }
+    });
+
+    it('keeps a SELECT that names into only in a literal, a quoted name or a comment, and the reads kept before it', async () => {
+      const read = `SELECT label FROM ${table} WHERE id = ?`;
+      await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [15, 'kept']);
+      expect(await db.get(read, [15])).toEqual({ label: 'kept' });
+
+      const word = `SELECT 'into' AS "into" /* into */`;
+      expect(await db.get(word)).toEqual({ into: 'into' });
+      const hits = hitsSoFar();
+      expect(await db.get(word)).toEqual({ into: 'into' });
+      expect(await db.get(read, [15])).toEqual({ label: 'kept' });
+      expect(hitsSoFar()).toBe(hits + 2);
+    });
+
     it('keeps nothing of a read that was in flight across a write', async () => {
       await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [13, 'before']);
       // A statement reads the rows as they stood when it began; the write commits while this one sleeps.
