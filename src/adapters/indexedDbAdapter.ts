@@ -41,6 +41,13 @@
  * const session = await adapter.get('SELECT * FROM sessions WHERE id = ?', ['session-1']);
  * console.log(session);
  * ```
+ *
+ * `memoryOnly: true` keeps the database in memory alone, for a browser that refuses IndexedDB or a private window:
+ * the same SQL, no `persistence` capability, nothing opened or stored, whatever `durability` and `crossTab` say.
+ *
+ * `reload()` puts the stored image in place of the one in memory, whatever the version stamp says. A caller whose
+ * `durability: 'commit'` call was refused runs it before its next statement, so the refused write is gone rather than
+ * stored by the next save; a connection without `crossTab` runs it to read what another connection stored.
  */
 
 import initSqlJs from 'sql.js';
@@ -212,6 +219,14 @@ export interface IndexedDbAdapterOptions {
    * underscores.
    */
   segment?: string;
+  /**
+   * Keeps the database in memory alone: IndexedDB is never opened, nothing is
+   * stored, and `capabilities` carries no `persistence`. `durability` reads
+   * `'interval'` and `crossTab` is off, since there is nothing to store or to
+   * share. For a browser that refuses IndexedDB (a private window, a blocked
+   * storage setting), where `open()` would otherwise reject.
+   */
+  memoryOnly?: boolean;
 }
 
 /**
@@ -281,7 +296,7 @@ const firstKeyword = (statement: string): string => {
  */
 export class IndexedDbAdapter implements StorageAdapter {
   public readonly kind = 'indexeddb';
-  public readonly capabilities: ReadonlySet<StorageCapability> = new Set(['transactions', 'persistence', 'json', 'prepared']);
+  public readonly capabilities: ReadonlySet<StorageCapability>;
 
   private SQL: SqlJsStatic | null = null;
   private db: SqlJsDatabase | null = null;
@@ -345,6 +360,8 @@ export class IndexedDbAdapter implements StorageAdapter {
   private readonly saveIntervalMs: number;
   private readonly durability: IndexedDbDurability;
   private readonly crossTab: IndexedDbCrossTabOptions | null;
+  /** The database lives in memory alone: IndexedDB is never opened. */
+  private readonly memoryOnly: boolean;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly sqlJsConfig: any;
 
@@ -352,12 +369,21 @@ export class IndexedDbAdapter implements StorageAdapter {
   constructor(options: IndexedDbAdapterOptions = {}) {
     this.dbName = segmentName(options.dbName || 'app-db', options.segment);
     this.storeName = options.storeName || 'sqliteDb';
-    this.autoSave = options.autoSave ?? true;
+    this.memoryOnly = options.memoryOnly ?? false;
+    this.autoSave = this.memoryOnly ? false : (options.autoSave ?? true);
     this.saveIntervalMs = options.saveIntervalMs || 5000;
     this.sqlJsConfig = options.sqlJsConfig || {};
-    this.crossTab =
-      options.crossTab === true ? {} : typeof options.crossTab === 'object' && options.crossTab !== null ? options.crossTab : null;
-    this.durability = this.crossTab ? 'commit' : options.durability ?? 'interval';
+    this.crossTab = this.memoryOnly
+      ? null
+      : options.crossTab === true
+        ? {}
+        : typeof options.crossTab === 'object' && options.crossTab !== null
+          ? options.crossTab
+          : null;
+    this.durability = this.memoryOnly ? 'interval' : this.crossTab ? 'commit' : (options.durability ?? 'interval');
+    this.capabilities = new Set<StorageCapability>(
+      this.memoryOnly ? ['transactions', 'json', 'prepared'] : ['transactions', 'persistence', 'json', 'prepared'],
+    );
   }
 
   /** The name of the Web Lock that coordinates the tabs on this database. */
@@ -389,6 +415,14 @@ export class IndexedDbAdapter implements StorageAdapter {
   private async openNow(): Promise<void> {
     // Initialize sql.js using global singleton (prevents race conditions)
     this.SQL = await getGlobalSQL(this.sqlJsConfig);
+
+    if (this.memoryOnly) {
+      const db = new this.SQL.Database();
+      this.pragmaDefaults = readPragmas(db);
+      this.db = db;
+      this.applyConnectionSettings();
+      return;
+    }
 
     // Open IndexedDB with retry logic for race conditions
     this.idb = await this.openIndexedDbWithRetry();
@@ -684,6 +718,54 @@ export class IndexedDbAdapter implements StorageAdapter {
    */
   public async rollback(): Promise<void> {
     await this.run('ROLLBACK');
+  }
+
+  /**
+   * Puts the stored image in place of the one in memory, whatever the version stamp says, and answers whether anything
+   * changed: true when another connection stored a newer image since this one loaded or saved, or when this connection
+   * holds writes that are not stored (one IndexedDB refused, which a `durability: 'commit'` call reports by rejecting,
+   * or with `durability: 'interval'` one the auto-save has not stored yet), which are then gone; false when the memory
+   * image already is the stored one, and in memory-only mode. A caller whose commit was refused runs it before its next
+   * statement: the next save, under `crossTab` the next coordinated statement, would store the refused writes with its
+   * own. It waits for an open `transaction()` to end, holds statements while it runs, and refuses while a transaction
+   * begun with `BEGIN` is open, which replacing the database would end.
+   */
+  public async reload(): Promise<boolean> {
+    this.ensureOpen();
+    if (this.memoryOnly || !this.idb) return false;
+    const refuseOpenBegin = (): void => {
+      if (this.inTransaction()) {
+        throw new Error(
+          `IndexedDbAdapter: reload() cannot replace "${this.dbName}" while a transaction begun with BEGIN is open: COMMIT or ROLLBACK it first.`,
+        );
+      }
+    };
+    const replace = async (): Promise<boolean> => {
+      this.ensureOpen();
+      await this.settleSave();
+      const stored = await this.loadFromIndexedDb();
+      // close() may have begun while the image was read.
+      this.ensureOpen();
+      if (stored.stamp === this.loadedStamp && !this.hasUnsavedWrites()) return false;
+      this.replaceDatabase(stored.image ? new this.SQL!.Database(stored.image) : new this.SQL!.Database());
+      this.loadedStamp = stored.stamp;
+      this.savedGeneration = this.writeGeneration;
+      return true;
+    };
+    if (this.crossTab) {
+      return this.withCoordination(async () => {
+        this.ensureOpen();
+        refuseOpenBegin();
+        return replace();
+      });
+    }
+    // refuseOpenBegin runs before the gate is held: inside the hold,
+    // inTransaction() would read the hold's own token as an open transaction.
+    return this.runSerializedTransaction(async () => {
+      this.ensureOpen();
+      refuseOpenBegin();
+      return this.gate.hold(replace);
+    });
   }
 
   /**
