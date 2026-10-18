@@ -164,6 +164,32 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
     ]);
   });
 
+  it('counts an operation of a batch whose values cannot be read as failed, and writes the others', async () => {
+    // Reading an operation's values can throw (a getter, a proxy): that operation fails, as one whose statement fails.
+    const unreadable = {
+      statement: '',
+      type: 'insert' as const,
+      table,
+      get values(): Record<string, unknown> {
+        throw new Error('the values could not be read');
+      },
+    };
+    const result = await db.batchWrite([
+      { statement: '', type: 'insert', table, values: { id: 47, label: 'before' } },
+      unreadable,
+      { statement: '', type: 'insert', table, values: { id: 48, label: 'after' } },
+    ]);
+
+    expect(result.successful).toBe(2);
+    expect(result.failed).toBe(1);
+    expect(result.errors?.map(({ index }) => index)).toEqual([1]);
+    expect(result.errors?.[0]?.error.message).toMatch(/could not be read/);
+    expect(await db.all(`SELECT id, label FROM ${table} WHERE id IN (?, ?) ORDER BY id`, [47, 48])).toEqual([
+      { id: 47, label: 'before' },
+      { id: 48, label: 'after' },
+    ]);
+  });
+
   it('rejects a transaction that PostgreSQL rolled back at its COMMIT, as a statement in it failed', async () => {
     // The callback caught the duplicate's error and went on. PostgreSQL answers the COMMIT of an aborted
     // transaction with ROLLBACK and no error, so the transaction resolved with nothing written.
