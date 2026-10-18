@@ -56,6 +56,140 @@ const failure = (message: string, error: unknown): Error => {
   return wrapped;
 };
 
+/**
+ * Whether the query cache may hold a statement's answer: a SELECT, whose first word past white space and comments is
+ * SELECT. Block comments nest, as PostgreSQL reads them. Any other statement can write, such as `UPDATE ... RETURNING`
+ * through `get`, and runs each time it is asked. A SELECT can write too, through a function it calls or with `INTO`,
+ * which its text cannot show, so its answer is kept only when PostgreSQL says it wrote nothing (`readAndCheck`).
+ */
+const isSelect = (statement: unknown): boolean => {
+  if (typeof statement !== 'string') return false;
+  let at = 0;
+  for (;;) {
+    while (at < statement.length && /\s/.test(statement.charAt(at))) at += 1;
+    if (statement.startsWith('--', at)) {
+      const end = statement.indexOf('\n', at);
+      if (end < 0) return false;
+      at = end + 1;
+    } else if (statement.startsWith('/*', at)) {
+      let depth = 1;
+      at += 2;
+      while (depth > 0) {
+        if (at >= statement.length) return false;
+        if (statement.startsWith('/*', at)) {
+          depth += 1;
+          at += 2;
+        } else if (statement.startsWith('*/', at)) {
+          depth -= 1;
+          at += 2;
+        } else {
+          at += 1;
+        }
+      }
+    } else {
+      return /^select\b/i.test(statement.slice(at, at + 7));
+    }
+  }
+};
+
+/** Stands for an answer the cache cannot copy faithfully, which it then does not keep. */
+const UNCOPIED = Symbol('uncopied');
+
+/**
+ * A copy of an answer the cache keeps or gives, so a caller that changes the row or list it was given changes nothing
+ * the cache answers next: arrays and plain objects, such as rows and parsed JSON, copied through, a Date and a Buffer
+ * as themselves, and text, numbers, booleans and null as they are, as those cannot be changed. Any other object, such
+ * as the interval pg parses to an object of its own, has no faithful copy, so an answer holding one is `UNCOPIED`.
+ */
+const copyOf = (value: unknown): unknown => {
+  if (typeof value === 'function') return UNCOPIED;
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) {
+    const items = value.map(copyOf);
+    return items.includes(UNCOPIED) ? UNCOPIED : items;
+  }
+  if (value instanceof Date) return new Date(value.getTime());
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) return Buffer.from(value);
+  if (Object.getPrototypeOf(value) !== Object.prototype) return UNCOPIED;
+  const fields = Object.entries(value).map(([name, field]) => [name, copyOf(field)] as const);
+  return fields.some(([, field]) => field === UNCOPIED) ? UNCOPIED : Object.fromEntries(fields);
+};
+
+/** Stands for parameters the cache key cannot write, so the read bound to them runs each time it is asked. */
+const UNKEYED = Symbol('unkeyed');
+
+/** Whether the value is a Date of any realm, as pg reads one: `Date.prototype.getTime` takes nothing else. */
+const isDate = (value: unknown): value is Date => {
+  try {
+    Date.prototype.getTime.call(value as Date);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** The bytes of a view, such as a Buffer, as hex. */
+const hexOf = (view: ArrayBufferView): string =>
+  Array.from(new Uint8Array(view.buffer, view.byteOffset, view.byteLength), (byte) =>
+    byte.toString(16).padStart(2, '0')
+  ).join('');
+
+/**
+ * A parameter as the cache key writes it, so two parameters share a key only when pg binds them alike: text, numbers,
+ * bigints and booleans as the text pg binds, and a tagged list for bytes, a Date, an array and any other object, which
+ * pg binds as its JSON text. `UNKEYED` for one the key cannot write so: an object with a `toPostgres` of its own,
+ * which pg binds through it, a function, a symbol, an object JSON cannot write, and text holding U+0000, which
+ * PostgreSQL refuses, so that no read bound to it answers from the cache.
+ */
+const keyOf = (value: unknown): unknown => {
+  if (value === null || value === undefined) return null;
+  switch (typeof value) {
+    case 'string':
+      return value.includes('\u0000') ? UNKEYED : value;
+    case 'number':
+    case 'bigint':
+    case 'boolean':
+      return String(value);
+    case 'object':
+      break;
+    default:
+      return UNKEYED;
+  }
+  if (ArrayBuffer.isView(value)) return ['bytes', hexOf(value)];
+  if (isDate(value)) return ['date', value.getTime()];
+  if (Array.isArray(value)) {
+    const items = value.map(keyOf);
+    return items.includes(UNKEYED) ? UNKEYED : ['array', ...items];
+  }
+  if (typeof (value as { toPostgres?: unknown }).toPostgres === 'function') return UNKEYED;
+  try {
+    return ['json', JSON.stringify(value)];
+  } catch {
+    return UNKEYED;
+  }
+};
+
+/**
+ * The parameters as the cache key writes them, read as `toPostgresStatement` reads them: an array as positional values,
+ * a plain object as named ones and any other value as the one positional value. `UNKEYED` as `keyOf` says, and for
+ * named values on an object whose prototype could answer a name the statement asks for.
+ */
+const parametersKeyOf = (parameters?: StorageParameters): unknown => {
+  if (parameters === undefined || parameters === null) return null;
+  if (Array.isArray(parameters)) {
+    const items = parameters.map(keyOf);
+    return items.includes(UNKEYED) ? UNKEYED : ['positional', ...items];
+  }
+  if (typeof parameters === 'object') {
+    const prototype = Object.getPrototypeOf(parameters);
+    if (prototype !== Object.prototype && prototype !== null) return UNKEYED;
+    const entries = Object.entries(parameters).map(([name, value]) => [name, keyOf(value)] as const);
+    return entries.some(([, key]) => key === UNKEYED) ? UNKEYED : ['named', ...entries];
+  }
+  const item = keyOf(parameters);
+  return item === UNKEYED ? UNKEYED : ['positional', item];
+};
+
 /** @deprecated Use `createPostgresAdapter` from `@framers/sql-storage-adapter/postgres` with the Supabase connection string. */
 export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions {
   readonly kind = 'supabase-postgres';
@@ -81,6 +215,8 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
   private queryCache = new Map<string, unknown>();
   private cacheEnabled = false;
   private maxCacheSize = 100;
+  /** Moves with every `clearCache()`, so a read that was in flight across one keeps nothing. */
+  private cacheGeneration = 0;
 
   async open(options?: SupabaseAdapterOptions): Promise<void> {
     this.options = options;
@@ -159,8 +295,19 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     }
   }
 
-  private getCacheKey(query: string, params?: unknown): string {
-    return `${query}::${JSON.stringify(params || {})}`;
+  /**
+   * The key of an answer: the call, the statement and the parameters as pg binds them (`parametersKeyOf`), or
+   * `undefined` for parameters the key cannot write, so the read runs each time it is asked. `get` and `all` keep
+   * apart, as one answers a row and the other a list.
+   */
+  private getCacheKey(call: 'get' | 'all', query: string, params?: StorageParameters): string | undefined {
+    let bound: unknown;
+    try {
+      bound = parametersKeyOf(params);
+    } catch {
+      return undefined;
+    }
+    return bound === UNKEYED ? undefined : `${call}::${query}::${JSON.stringify(bound)}`;
   }
 
   async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
@@ -177,98 +324,145 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       };
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
+    } finally {
+      this.clearCache();
+    }
+  }
+
+  /** The key a SELECT is cached under while the cache is on; `undefined` for any other statement or with it off. */
+  private cacheKeyOf(
+    call: 'get' | 'all',
+    statement: string,
+    parameters?: StorageParameters
+  ): string | undefined {
+    return this.cacheEnabled && isSelect(statement) ? this.getCacheKey(call, statement, parameters) : undefined;
+  }
+
+  /**
+   * Runs a SELECT the cache may keep, once, in a transaction of its own on one client, and answers its rows and
+   * whether it wrote. PostgreSQL gives a transaction an ID when it first writes to the database
+   * (https://www.postgresql.org/docs/current/transaction-id.html), and `pg_current_xact_id_if_assigned()`, PostgreSQL
+   * 13's, answers NULL until then, so a SELECT that calls a function that writes, or makes a table with `INTO`, answers
+   * `wrote: true`. What it wrote commits, as it would outside the cache.
+   */
+  private async readAndCheck(
+    pool: Pool,
+    statement: string,
+    parameters?: StorageParameters
+  ): Promise<{ rows: unknown[]; wrote: boolean }> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(...prepare(statement, parameters));
+      const check = await client.query<{ wrote: boolean }>(
+        'SELECT pg_current_xact_id_if_assigned() IS NOT NULL AS wrote'
+      );
+      await client.query('COMMIT');
+      // A string of statements answers a list of results, and a COMMIT in it can end this transaction before a
+      // statement after it writes in one of its own, which the check cannot see: it counts as a write.
+      const several = Array.isArray(result);
+      return { rows: result.rows, wrote: several || check.rows[0]?.wrote !== false };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Runs a statement for `get` or `all`: a SELECT the cache may keep through `readAndCheck`, and any other statement,
+   * or any with the cache off, as it is, taken as a write.
+   */
+  private async answer(
+    pool: Pool,
+    cacheKey: string | undefined,
+    statement: string,
+    parameters?: StorageParameters
+  ): Promise<{ rows: unknown[]; wrote: boolean }> {
+    if (cacheKey !== undefined) return this.readAndCheck(pool, statement, parameters);
+    const result = await pool.query(...prepare(statement, parameters));
+    return { rows: result.rows, wrote: true };
+  }
+
+  /** A copy of the cached answer under the key, counted as a hit; `undefined` when the cache holds none. */
+  private cached<T>(cacheKey: string | undefined): T | undefined {
+    if (cacheKey === undefined) return undefined;
+    if (this.queryCache.has(cacheKey)) {
+      if (this.metrics.cacheHits !== undefined) {
+        this.metrics.cacheHits++;
+      }
+      return copyOf(this.queryCache.get(cacheKey)) as T;
+    }
+    if (this.metrics.cacheMisses !== undefined) {
+      this.metrics.cacheMisses++;
+    }
+    return undefined;
+  }
+
+  /**
+   * Keeps a copy of a SELECT's answer under its key, apart from the one its caller gets, unless a write or
+   * `clearCache()` came while it was read, or the answer holds a value with no faithful copy.
+   */
+  private keep(cacheKey: string | undefined, generation: number, value: unknown): void {
+    if (cacheKey === undefined || !this.cacheEnabled || generation !== this.cacheGeneration) return;
+    const copy = copyOf(value);
+    if (copy === UNCOPIED) return;
+    this.queryCache.set(cacheKey, copy);
+    if (this.queryCache.size > this.maxCacheSize) {
+      const firstKey = this.queryCache.keys().next().value;
+      if (firstKey !== undefined) {
+        this.queryCache.delete(firstKey);
+      }
     }
   }
 
   async get<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T | null> {
     if (!this.pool) throw new Error('Storage adapter not opened');
 
-    // Check cache
-    if (this.cacheEnabled) {
-      const cacheKey = this.getCacheKey(statement, parameters);
-      if (this.queryCache.has(cacheKey)) {
-        if (this.metrics.cacheHits !== undefined) {
-          this.metrics.cacheHits++;
-        }
-        const cached = this.queryCache.get(cacheKey) as T | null | undefined;
-        return cached ?? null;
-      }
-      if (this.metrics.cacheMisses !== undefined) {
-        this.metrics.cacheMisses++;
-      }
-    }
+    const cacheKey = this.cacheKeyOf('get', statement, parameters);
+    const cached = this.cached<T | null>(cacheKey);
+    if (cached !== undefined) return cached ?? null;
 
+    const generation = this.cacheGeneration;
     const startTime = Date.now();
+    let wrote = true;
     try {
-      const result = await this.pool.query(...prepare(statement, parameters));
+      const outcome = await this.answer(this.pool, cacheKey, statement, parameters);
+      wrote = outcome.wrote;
       this.trackQuery(statement, startTime);
 
-      const value = result.rows[0] || null;
-
-      // Update cache
-      if (this.cacheEnabled && value !== null) {
-        const cacheKey = this.getCacheKey(statement, parameters);
-        this.queryCache.set(cacheKey, value);
-
-        // Enforce cache size limit
-        if (this.queryCache.size > this.maxCacheSize) {
-          const firstKey = this.queryCache.keys().next().value;
-          if (firstKey !== undefined) {
-            this.queryCache.delete(firstKey);
-          }
-        }
-      }
-
+      const value = outcome.rows[0] || null;
+      if (!wrote && value !== null) this.keep(cacheKey, generation, value);
       return value as T;
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
+    } finally {
+      if (wrote) this.clearCache();
     }
   }
 
   async all<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T[]> {
     if (!this.pool) throw new Error('Storage adapter not opened');
 
-    // Check cache
-    if (this.cacheEnabled) {
-      const cacheKey = this.getCacheKey(statement, parameters);
-      if (this.queryCache.has(cacheKey)) {
-        if (this.metrics.cacheHits !== undefined) {
-          this.metrics.cacheHits++;
-        }
-        const cached = this.queryCache.get(cacheKey) as T[] | undefined;
-        if (cached) {
-          return cached;
-        }
-      }
-      if (this.metrics.cacheMisses !== undefined) {
-        this.metrics.cacheMisses++;
-      }
-    }
+    const cacheKey = this.cacheKeyOf('all', statement, parameters);
+    const cached = this.cached<T[]>(cacheKey);
+    if (cached !== undefined) return cached;
 
+    const generation = this.cacheGeneration;
     const startTime = Date.now();
+    let wrote = true;
     try {
-      const result = await this.pool.query(...prepare(statement, parameters));
+      const outcome = await this.answer(this.pool, cacheKey, statement, parameters);
+      wrote = outcome.wrote;
       this.trackQuery(statement, startTime);
 
-      const rows = result.rows;
-
-      // Update cache
-      if (this.cacheEnabled) {
-        const cacheKey = this.getCacheKey(statement, parameters);
-        this.queryCache.set(cacheKey, rows);
-
-        // Enforce cache size limit
-        if (this.queryCache.size > this.maxCacheSize) {
-          const firstKey = this.queryCache.keys().next().value;
-          if (firstKey !== undefined) {
-            this.queryCache.delete(firstKey);
-          }
-        }
-      }
-
-      return rows as T[];
+      if (!wrote) this.keep(cacheKey, generation, outcome.rows);
+      return outcome.rows as T[];
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
+    } finally {
+      if (wrote) this.clearCache();
     }
   }
 
@@ -281,6 +475,8 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       this.trackQuery(script, startTime);
     } catch (error) {
       throw failure(`Script execution failed: ${error}`, error);
+    } finally {
+      this.clearCache();
     }
   }
 
@@ -323,6 +519,8 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       throw error;
     } finally {
       client.release();
+      // What the transaction wrote is visible from here, so nothing read before it may answer again.
+      this.clearCache();
     }
   }
 
@@ -481,6 +679,25 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     };
   }
 
+  /**
+   * Keeps the answers of SELECTs through `get` and `all`, at most `maxSize` of them, and answers the same statement with
+   * the same parameters from them, each time with a copy, so a caller that changes the row or list it was given changes
+   * nothing the cache answers next. An answer holding a value with no faithful copy, such as an interval, which pg
+   * parses to an object of its own, is not kept. A SELECT is a statement whose first word, past white space and
+   * comments, is SELECT; a string of several statements counts as a write. One the cache does not hold runs once, in a
+   * transaction of its own, and its answer is kept only when PostgreSQL gave that transaction no ID, which it gives a
+   * transaction when it first writes to the database: a SELECT that calls a function that writes, or makes a table with
+   * INTO, runs each time it is asked. That check reads `pg_current_xact_id_if_assigned()`, so the cache needs
+   * PostgreSQL 13 or later. Two calls share an answer only when pg binds their parameters alike, and a SELECT bound to
+   * an object with a `toPostgres` of its own, or to text holding U+0000, runs each time it is asked, as one that writes
+   * does. Every statement that writes, through `run`, `exec`, `get` or `all`, and every `transaction`, `batchWrite` and
+   * `migrate`, clears the cache when it ends, and a read that was in flight across one keeps nothing, so the cache never
+   * answers a row as it stood before this adapter's own write. It cannot see a write through another adapter, pool or
+   * process, an effect that writes no row, such as `pg_notify()` or an advisory lock, nor a SELECT whose answer changes
+   * from one call to the next by itself, such as one that calls `random()`, `now()` or `nextval()`: a kept answer is
+   * given again without running the statement, until `clearCache()`. Run a statement wanted for its effect through
+   * `run`, or begin it with a word other than SELECT, such as `VALUES (nextval('ids'))`, which runs each time.
+   */
   enableCache(maxSize: number = 100): void {
     this.cacheEnabled = true;
     this.maxCacheSize = maxSize;
@@ -491,7 +708,9 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     this.clearCache();
   }
 
+  /** Empties the cache; a read in flight when it is called keeps nothing. */
   clearCache(): void {
+    this.cacheGeneration += 1;
     this.queryCache.clear();
   }
 
