@@ -10,12 +10,15 @@ on:
       - 'src/**'
   workflow_dispatch:
 
-# One release run at a time: a run that starts while another runs waits for it,
-# so two pushes whose package.json holds the same new version never race
-# npm publish, and no publish is cancelled part way.
+# One release run at a time, in the order the runs began to wait: a run that
+# starts while another runs waits for it, and up to 100 wait (queue: max), so a
+# newer run never replaces one still waiting. Two pushes whose package.json holds
+# the same new version never race npm publish, no version is skipped, and no
+# publish is cancelled part way.
 concurrency:
   group: release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   publish:
@@ -60,8 +63,10 @@ jobs:
         env:
           VERSION: ${{ steps.pkg.outputs.version }}
         run: |
-          CURRENT=$(npm view @framers/sql-storage-adapter version 2>/dev/null || echo "0.0.0")
-          if [ "$CURRENT" = "$VERSION" ]; then
+          # The exact version, not npm's latest: a run of an older commit, such as a
+          # re-run, finds its version published and publishes nothing.
+          PUBLISHED=$(npm view "@framers/sql-storage-adapter@$VERSION" version 2>/dev/null || true)
+          if [ "$PUBLISHED" = "$VERSION" ]; then
             echo "published=true" >> "$GITHUB_OUTPUT"
           else
             echo "published=false" >> "$GITHUB_OUTPUT"

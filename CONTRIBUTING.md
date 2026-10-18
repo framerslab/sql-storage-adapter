@@ -190,7 +190,7 @@ docs: update README with Capacitor examples
 
 ## Release Process
 
-A release is a version bump merged to `master`. The [release workflow](https://github.com/framerslab/sql-storage-adapter/blob/master/.github/workflows/release.yml) runs on every push to `master` that changes `package.json`, a file under `src/` or the workflow itself. It installs, runs the tests and builds; when `package.json`'s version is not npm's latest, it publishes to npm, then creates the GitHub release `v<version>` with the notes of that version's section in `CHANGELOG.md`. The release creates the tag.
+A release is a version bump merged to `master`. The [release workflow](https://github.com/framerslab/sql-storage-adapter/blob/master/.github/workflows/release.yml) runs on every push to `master` that changes `package.json`, a file under `src/` or the workflow itself. It installs, runs the tests and builds; when npm holds no release of `package.json`'s version, it publishes to npm, then creates the GitHub release `v<version>` with the notes of that version's section in `CHANGELOG.md`. The release creates the tag.
 
 1. **Update the version** in `package.json` following [semantic versioning](https://semver.org/):
    - **MAJOR**: breaking changes (1.0.0 to 2.0.0)

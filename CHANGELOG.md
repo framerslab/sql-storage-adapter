@@ -4,7 +4,10 @@
 - `@framers/sql-storage-adapter/browser` (#71), one entry with what a page needs: the IndexedDB adapter with `IndexedDbConflictError` and its option types, the key-value module with `migrateIndexedDbKeyValue`, `createTabLock`, and the mutation sync's client with its counters, wire contract, row mutations, packing, fetch transport, loop and change channel. Its import graph holds no Node built-in and no pg: the one package it imports is sql.js. The mutation sync's server half (`MutationServer`, `createSqlMutationStore`, `DrainGate`) stays in `./sync`. CI checks that `require()` loads the entry, that its bundle holds no pg, better-sqlite3 or `@aws-sdk/client-s3`, and that a NodeNext and a CommonJS TypeScript consumer type-check against it.
 
 ### Changed
-- The release workflow runs one release at a time: a run that starts while another runs waits for it. Two merges close together whose `package.json` holds the same new version no longer race `npm publish`: the later run publishes nothing, so the version and its tag come from the earlier merge.
+- The release workflow runs one release at a time, in the order the runs began to wait: a run that starts while another runs waits for it, and up to 100 wait (`queue: max`), so a newer run never replaces one still waiting and no version is skipped. Two merges close together whose `package.json` holds the same new version no longer race `npm publish`: the later run publishes nothing, so the version and its tag come from the earlier merge.
+
+### Fixed
+- The release workflow publishes when npm holds no release of the commit's exact version. It compared the version with npm's `latest` alone, so a run of an older commit, such as a re-run after a newer release, tried to publish a version npm already held, and failed.
 
 ### Documentation
 - `guides/MUTATION_SYNC.md` describes the mutation sync: the row mutations and their copies; the server with its store, its push, its streamed pull, its tombstone replay and its drain gate; the client with its saves, joins, kept rows, restores and removal; the fetch transport and the loop; the browser storage the client runs on; the move of an old IndexedDB key-value store; and an example server, its routes and a page. The README's "Mutation Sync" section links it.
