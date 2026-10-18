@@ -21,6 +21,11 @@ export type { PostgresNotificationHandler } from './postgresListener';
 export interface PostgresQueryResultLike {
   rows: unknown[];
   rowCount?: number | null;
+  /**
+   * The command PostgreSQL says it ran, as pg reads it from the server's answer: `ROLLBACK` for a COMMIT that ended a
+   * transaction in which a statement failed. A pool that leaves it out is not checked for that.
+   */
+  command?: string;
 }
 
 /** A connection checked out of a pool: the part of pg's `PoolClient` the adapter uses. */
@@ -447,6 +452,16 @@ const unqualifiedCreateExtension = (statement: string): string | null => {
 
 /** An unknown thrown value as an Error. */
 const asError = (value: unknown): Error => (value instanceof Error ? value : new Error(String(value)));
+
+/**
+ * The error of a transaction whose COMMIT PostgreSQL answered with ROLLBACK: a statement in it failed and the callback
+ * went on, and PostgreSQL ends an aborted transaction that way, with no error of its own.
+ */
+const rolledBackAtCommit = (): Error =>
+  new Error(
+    'The transaction was rolled back at COMMIT: a statement in it failed, so PostgreSQL wrote none of it. ' +
+      'A statement that may fail inside a transaction runs under a savepoint of its own.',
+  );
 
 /** The savepoint each operation of a batch runs under. */
 const BATCH_SAVEPOINT = 'storage_adapter_batch';
@@ -898,6 +913,9 @@ class PostgresTransactionAdapter implements StorageAdapter {
 /**
  * Runs `fn` in a transaction that `begin` opens on `client`: COMMIT when `fn`
  * resolves, ROLLBACK when `fn` or COMMIT throws, and that error is rethrown.
+ * A COMMIT that PostgreSQL answers with ROLLBACK, as it answers one when a
+ * statement in the transaction failed and `fn` went on, throws too, as
+ * nothing was written.
  * `onBroken` hears when the connection cannot be trusted any more (BEGIN or
  * ROLLBACK failed), so the caller closes it instead of returning it to the
  * pool. When ROLLBACK fails, the original error is still the one thrown, with
@@ -921,7 +939,8 @@ const runTransaction = async <T>(
   const handle = new PostgresTransactionAdapter(client, capabilities, segment, afterEnd);
   try {
     const result = await fn(handle);
-    await client.query('COMMIT');
+    const committed = await client.query('COMMIT');
+    if (committed?.command === 'ROLLBACK') throw rolledBackAtCommit();
     return result;
   } catch (error) {
     try {
@@ -1424,6 +1443,8 @@ export class PostgresAdapter implements StorageAdapter {
   /**
    * Runs `fn` in a transaction on one pooled connection: COMMIT when it
    * resolves, ROLLBACK when it or COMMIT throws, and that error is rethrown.
+   * A COMMIT that PostgreSQL answers with ROLLBACK, because a statement in the
+   * transaction failed and `fn` went on, throws too.
    * `options` sets the isolation level and the read-only and deferrable modes;
    * an unknown isolation level is refused before a connection is checked out.
    *
