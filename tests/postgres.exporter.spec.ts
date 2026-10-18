@@ -154,6 +154,55 @@ describe.skipIf(!POSTGRES_TEST_URL)('the PostgreSQL exporter, through pg_dump', 
     }
   });
 
+  // pg calls the function as a method of the client it connects, with no
+  // arguments before 8.19.0 and from 8.19.0 with the client's
+  // ConnectionParameters (lib/client.js, _getPassword). The export asks it as
+  // the pool's own pg asked it, whichever pg is installed.
+  it("asks a pool's password function as the pool's pg asks it: on a client, with that pg's arguments", async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGPASSWORD', '');
+    const asked: Array<{ self: unknown; args: unknown[] }> = [];
+    const pool = new pg.Pool({
+      host: server.hostname,
+      port: Number(server.port || 5432),
+      database,
+      user: decodeURIComponent(server.username),
+      application_name: 'exporter-spec',
+      password: async function (this: unknown, ...args: unknown[]) {
+        asked.push({ self: this, args });
+        return decodeURIComponent(server.password);
+      },
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE asked_items (id INTEGER PRIMARY KEY)');
+      const before = asked.length;
+      expect(before).toBeGreaterThan(0);
+
+      const file = path.join(dir, `${database}-asked.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.asked_items']);
+      expect(asked).toHaveLength(before + 1);
+      const [byPool] = asked;
+      const byExport = asked[before];
+      expect(byPool.self).toBeInstanceOf(pg.Client);
+      expect(byExport.self).toBeInstanceOf(pg.Client);
+      for (const field of ['user', 'database', 'host', 'port'] as const) {
+        expect((byExport.self as Record<string, unknown>)[field]).toEqual((byPool.self as Record<string, unknown>)[field]);
+      }
+      expect(byExport.args).toHaveLength(byPool.args.length);
+      expect(byExport.args).toEqual(byPool.args);
+      if (byPool.args.length > 0) {
+        expect(byExport.args[0]).toBeInstanceOf((byPool.args[0] as object).constructor);
+      }
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
   // pg reads a pool's connection string as a WHATWG URL, libpq by its own
   // grammar: given this string as it was, pg_dump read the user part up to the
   // @ in the query and the host y.

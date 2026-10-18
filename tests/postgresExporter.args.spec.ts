@@ -23,6 +23,19 @@ vi.mock('node:child_process', () => ({
   },
 }));
 
+// How a pool's password function is called follows the version of the pg this
+// library loads. A spec that sets pgRead.as reads pg as that; the others read
+// the pg installed.
+const { pgRead } = vi.hoisted(() => ({
+  pgRead: { as: null as null | { version?: string; Client?: unknown } },
+}));
+
+vi.mock('../src/exporters/pgModule.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/exporters/pgModule.js')>();
+  return { ...actual, loadPg: async () => pgRead.as ?? actual.loadPg() };
+});
+
+import { Client as PgClient } from 'pg';
 import { PostgresExporter } from '../src/exporters/PostgresExporter.js';
 import { createStorageFeatures } from '../src/core/contracts/features.js';
 import type { StorageAdapter } from '../src/core/contracts/index.js';
@@ -310,6 +323,7 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     for (const name of ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD', 'PGSSLMODE', 'USER', 'USERNAME']) {
       vi.stubEnv(name, undefined);
     }
+    pgRead.as = null;
   });
 
   afterEach(() => {
@@ -475,6 +489,101 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
 
     expect(password).not.toHaveBeenCalled();
     expect(calls[0].env.PGPASSWORD).toBe(process.env.PGPASSWORD);
+  });
+
+  // pg calls a pool's password function as a method of the client it is
+  // connecting (pg-pool newClient: new this.Client(this.options)), with no
+  // arguments before 8.19.0 and from 8.19.0 with the client's
+  // ConnectionParameters (node-postgres #3602; lib/client.js, _getPassword).
+  it.each(['8.13.1', '8.18.0'])(
+    'calls the password function with no arguments, on a client of the pool, where pg is %s, as that pg calls it',
+    async (version) => {
+      pgRead.as = { version, Client: PgClient };
+      const seen: Array<{ self: unknown; args: unknown[] }> = [];
+      const exporter = poolExporter({
+        host: 'db.example',
+        database: 'app',
+        user: 'app',
+        // A function written for pg before 8.19.0, which gives it no argument:
+        // it reads the client it is called on, and an argument names another
+        // secret, as when other code calls it.
+        password: function (this: { user?: string } | undefined, ...args: unknown[]) {
+          seen.push({ self: this, args });
+          return args.length === 0 && this?.user === 'app' ? 'pool-secret' : 'another-secret';
+        },
+      });
+
+      await exporter.exportToBytes();
+
+      expect(seen).toHaveLength(1);
+      expect(seen[0].args).toEqual([]);
+      expect(seen[0].self).toBeInstanceOf(PgClient);
+      expect(seen[0].self).toMatchObject({ user: 'app', database: 'app', host: 'db.example', port: 5432 });
+      expect(calls[0].env.PGPASSWORD).toBe('pool-secret');
+    },
+  );
+
+  it.each(['8.19.0', '8.23.1'])(
+    "calls the password function with the client's ConnectionParameters, on that client, where pg is %s, as that pg calls it",
+    async (version) => {
+      pgRead.as = { version, Client: PgClient };
+      const seen: Array<{ self: unknown; args: unknown[] }> = [];
+      const settings = {
+        host: 'db.example',
+        database: 'app',
+        user: 'app',
+        application_name: 'reports',
+        statement_timeout: 5000,
+        password: function (this: unknown, ...args: unknown[]) {
+          seen.push({ self: this, args });
+          return 'pool-secret';
+        },
+      };
+
+      await poolExporter(settings).exportToBytes();
+
+      expect(seen).toHaveLength(1);
+      expect(seen[0].self).toBeInstanceOf(PgClient);
+      expect(seen[0].args).toHaveLength(1);
+      expect(seen[0].args[0]).toBe((seen[0].self as { connectionParameters: unknown }).connectionParameters);
+      expect(seen[0].args[0]).toBeInstanceOf(ConnectionParameters);
+      expect(seen[0].args[0]).toEqual(new ConnectionParameters(settings));
+      expect(seen[0].args[0]).toMatchObject({ host: 'db.example', port: 5432, user: 'app', application_name: 'reports' });
+      expect(calls[0].env.PGPASSWORD).toBe('pool-secret');
+    },
+  );
+
+  // pg calls a stream function of the settings to open a client's socket, as
+  // a connector does (stream: () => tls.connect(...)): the client the export
+  // makes for the password function never opens one.
+  it("never calls the pool's stream function when it asks the password function", async () => {
+    pgRead.as = { version: '8.23.1', Client: PgClient };
+    const stream = vi.fn(() => {
+      throw new Error('the export opened a socket');
+    });
+
+    await poolExporter({ host: 'db.example', database: 'app', user: 'app', stream, password: () => 'pool-secret' }).exportToBytes();
+
+    expect(stream).not.toHaveBeenCalled();
+    expect(calls[0].env.PGPASSWORD).toBe('pool-secret');
+  });
+
+  it("calls the password function with the connection's user, database, host and port where pg cannot be read", async () => {
+    pgRead.as = {};
+    const seen: unknown[][] = [];
+
+    await poolExporter({
+      host: 'db.example',
+      database: 'app',
+      user: 'app',
+      password: (...args: unknown[]) => {
+        seen.push(args);
+        return 'pool-secret';
+      },
+    }).exportToBytes();
+
+    expect(seen).toEqual([[{ user: 'app', database: 'app', host: 'db.example', port: 5432 }]]);
+    expect(calls[0].env.PGPASSWORD).toBe('pool-secret');
   });
 
   it.each([
