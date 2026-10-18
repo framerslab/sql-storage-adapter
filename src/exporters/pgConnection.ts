@@ -9,7 +9,7 @@
  * that comes before any `/`, and it refuses a query parameter it does not know. So
  * `postgresql://db.example?application_name=x@y` names the host `db.example` to pg and `y` to libpq. The URI
  * written here holds pg's reading: the user, the host, the port and the database spelled out and percent-encoded,
- * the parameters libpq knows, and an `sslmode` wherever libpq, left to itself, would use TLS differently from pg.
+ * the parameters pg reads that libpq takes, and the `sslmode` that has libpq use TLS and check the server as pg does.
  *
  * The variables pg reads are read here as pg reads them. libpq's own, which pg does not read (`PGHOSTADDR`,
  * `PGSERVICE`, `PGREQUIRESSL`, `PGSSLROOTCERT` and the rest), configure pg_dump as they configure psql.
@@ -51,52 +51,28 @@ const environment = (): Environment =>
   typeof process !== 'undefined' && process.env ? (process.env as Environment) : {};
 
 /**
- * The parameters libpq takes in a connection URI (PostgreSQL 18, `fe-connect.c`, `PQconninfoOptions`), less the
- * ones the URI spells out (`user`, `password`, `host`, `port`, `dbname`), `sslmode`, which is written for the TLS
- * pg uses, and the ones pg does not read (`service`, `hostaddr`). libpq refuses a URI with any other, so pg's own
- * (`statement_timeout`, `uselibpqcompat`) and names neither knows are left out. So are `sslpassword`,
- * `oauth_client_secret`, `scram_client_key` and `scram_server_key`: libpq takes them from the connection string
- * alone, which is pg_dump's command line, and pg reads none of them, so the connection pg makes needs none.
+ * The parameters of a connection string that pg reads and that libpq takes in a connection URI (PostgreSQL 18,
+ * `fe-connect.c`, `PQconninfoOptions`): the settings pg sends when it connects (`options`, `application_name`,
+ * `fallback_application_name`, `client_encoding`, `replication`; pg 8.23.1 `lib/connection-parameters.js:63-124`),
+ * `sslnegotiation`, which pg reads from 8.22.0, and the certificate files pg-connection-string reads (`sslcert`,
+ * `sslkey`, `sslrootcert`; `index.js:88-100`). The URI spells out the user, the host, the port and the database, and
+ * `sslmode` is written for the TLS pg uses. libpq's other parameters pg does not read, and pg_dump given them would
+ * read another password file than the pool (`passfile`), or refuse a server, an authentication or a session the pool
+ * takes (`target_session_attrs`, `require_auth`, `channel_binding`, `gssencmode`, `sslcrl` and the rest), so they
+ * are left out; so are pg's own (`statement_timeout`, `uselibpqcompat`), which libpq refuses in a URI, and
+ * `sslpassword`, `oauth_client_secret`, `scram_client_key` and `scram_server_key`, which libpq takes from the
+ * connection string alone, pg_dump's command line.
  */
-const LIBPQ_PARAMETERS = new Set([
-  'passfile',
-  'channel_binding',
-  'connect_timeout',
-  'client_encoding',
+const PG_READ_PARAMETERS = new Set([
   'options',
   'application_name',
   'fallback_application_name',
-  'keepalives',
-  'keepalives_idle',
-  'keepalives_interval',
-  'keepalives_count',
-  'tcp_user_timeout',
+  'client_encoding',
+  'replication',
   'sslnegotiation',
-  'sslcompression',
   'sslcert',
   'sslkey',
-  'sslcertmode',
   'sslrootcert',
-  'sslcrl',
-  'sslcrldir',
-  'sslsni',
-  'requirepeer',
-  'require_auth',
-  'min_protocol_version',
-  'max_protocol_version',
-  'ssl_min_protocol_version',
-  'ssl_max_protocol_version',
-  'gssencmode',
-  'krbsrvname',
-  'gsslib',
-  'gssdelegation',
-  'replication',
-  'target_session_attrs',
-  'load_balance_hosts',
-  'oauth_issuer',
-  'oauth_client_id',
-  'oauth_scope',
-  'sslkeylogfile',
 ]);
 
 /** The `sslmode` values with which libpq connects without TLS to a server that offers none, as pg does with no `ssl`. */
@@ -305,13 +281,14 @@ const tlsSettingsBeyondSslmode = (ssl: unknown): string[] =>
  * settings', then the environment, then pg's defaults. Undefined where pg cannot read the connection string.
  *
  * @throws {Error} When the settings ask for TLS options libpq takes only from files, or the connection string for
- *   `verify-ca` read as libpq reads it with no root certificate, which pg refuses.
+ *   `verify-ca` read as libpq reads it with no root certificate, or a port pg reads no number in, which pg refuses.
  */
 const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnection | undefined => {
   let user = settings.user;
   let password = settings.password;
   let host = settings.host;
-  let port = settings.port === undefined ? undefined : String(settings.port);
+  // As the settings give it: pg reads 0 and an empty port as none (its val() takes a falsy setting for none).
+  let port: unknown = settings.port;
   let database = settings.database;
   const parameters: Array<[string, string]> = [];
   // pg's ssl: the connection string's where its parameters make one, else the settings', else PGSSLMODE's
@@ -352,7 +329,7 @@ const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnectio
       hostNameChecked = !(compatible && (sslmode === 'verify-ca' || (sslmode === 'require' && rootCertificateNamed)));
     }
     for (const [key, value] of parsed.parameters) {
-      if (LIBPQ_PARAMETERS.has(key)) parameters.push([key, value]);
+      if (PG_READ_PARAMETERS.has(key)) parameters.push([key, value]);
     }
   }
   if (source === 'environment') ssl = sslFromEnvironment(env.PGSSLMODE);
@@ -370,13 +347,23 @@ const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnectio
   }
   parameters.push(...tlsSettingsFor(tls, source !== 'environment', hostNameChecked, rootCertificateNamed, env));
 
+  // pg reads the port with parseInt, after the setting, PGPORT and 5432 (lib/connection-parameters.js:70), so
+  // `5432x` is 5432, which libpq would refuse as no number.
+  const portNumber = Number.parseInt(String(port || env.PGPORT || 5432), 10);
+  if (Number.isNaN(portNumber)) {
+    throw new Error(
+      "PostgresExporter: pg reads no number in the pool's port, so the pool makes no connection, and pg_dump makes " +
+        'none either.',
+    );
+  }
+
   const osUser = typeof process !== 'undefined' && process.platform === 'win32' ? env.USERNAME : env.USER;
   const resolvedUser = user || env.PGUSER || osUser || undefined;
   return {
     user: resolvedUser,
     database: database || env.PGDATABASE || resolvedUser,
     host: host || env.PGHOST || 'localhost',
-    port: port || env.PGPORT || '5432',
+    port: String(portNumber),
     password: password || undefined,
     parameters,
   };
@@ -398,10 +385,10 @@ let toldPgUnread = false;
  * client made of the pool's settings (pg-pool `newClient`: `new this.Client(this.options)`), which pg calls the
  * function as a method of, with no arguments before pg 8.19.0 and from 8.19.0 with the client's
  * `ConnectionParameters` (node-postgres #3602; `lib/client.js` `_getPassword`:
- * `this.password(this.connectionParameters)`). The client is of the pg this library loads, made without the
- * settings' `stream`, a function pg calls to open the socket, and never connected. Where that pg cannot be read, the
- * function gets no receiver and the connection's user, database, host and port, as pg 8.19.0 and later give it
- * theirs, or nothing where the version read is older.
+ * `this.password(this.connectionParameters)`), where the pool names no `Client` that asks it itself. The client is of
+ * the pg this library loads, made without the settings' `stream`, a function pg calls to open the socket, and never
+ * connected. Where that pg cannot be read, the function gets no receiver and the connection's user, database, host
+ * and port, as pg 8.19.0 and later give it theirs, or nothing where the version read is older.
  */
 const passwordCallOf = async (
   connection: PgConnection,
@@ -430,33 +417,132 @@ const passwordCallOf = async (
   };
 };
 
+/** pg's words for an answer of a password function that is not a string (`lib/client.js`, `_getPassword`). */
+const NOT_A_STRING = 'Password must be a string';
+
+/**
+ * The refusal of an export whose password function failed, or answered no string, which pg reports as a
+ * `TypeError` in its own words. The function's own error is kept as the cause, out of the message, which a log may
+ * show.
+ */
+const passwordFailure = (error: unknown): Error => {
+  if (error instanceof TypeError && error.message === NOT_A_STRING) {
+    return new Error('PostgresExporter: the password function of the pool answered no string, which pg refuses too.');
+  }
+  const failure: Error & { cause?: unknown } = new Error(
+    'PostgresExporter: the password function of the pool failed, so pg_dump has no password.',
+  );
+  failure.cause = error;
+  return failure;
+};
+
+/** The connection of a pg `Client`, whose `error` event reports what its password routine meets. */
+interface ClientConnection {
+  once(event: 'error', listener: (error: unknown) => void): unknown;
+  removeListener?(event: 'error', listener: (error: unknown) => void): unknown;
+}
+
+/** A pg `Client` as the exporter uses one: its password, its connection and the routine that asks a function. */
+interface AskingClient {
+  password?: unknown;
+  connection?: unknown;
+  _getPassword?: (done: () => void) => void;
+  _checkPgPass?: (done: () => void) => void;
+}
+
+const hasEvents = (value: unknown): value is ClientConnection =>
+  value !== null && typeof value === 'object' && typeof (value as { once?: unknown }).once === 'function';
+
+/**
+ * The name of the routine with which a pg `Client` class asks a password function for each connection:
+ * `_getPassword`, which pg 8.13.1 and earlier name `_checkPgPass`. Undefined for a class with neither, which is no
+ * pg `Client` (pg's native one among them).
+ */
+const askingRoutineOf = (PoolClient: unknown): '_getPassword' | '_checkPgPass' | undefined => {
+  const prototype = typeof PoolClient === 'function' ? (PoolClient as { prototype?: unknown }).prototype : undefined;
+  if (prototype === null || typeof prototype !== 'object') return undefined;
+  if (typeof (prototype as AskingClient)._getPassword === 'function') return '_getPassword';
+  if (typeof (prototype as AskingClient)._checkPgPass === 'function') return '_checkPgPass';
+  return undefined;
+};
+
+/**
+ * Asks a pool's password function through the pool's own `Client`, as that Client asks it for each connection the
+ * pool makes (pg-pool 3.14.0, `newClient`, `index.js:241`): the Client's routine runs on a client of the pool's
+ * settings, made without the settings' `stream` and `connection` and never connected, and calls the function on that
+ * client with the arguments its pg gives, none before pg 8.19.0 and the client's `ConnectionParameters` from 8.19.0.
+ * So a pool made with another copy of pg than the one this library loads is asked as its own pg asks. The answer is
+ * the client's password once the routine is done: a string, or undefined where the function answered none.
+ * Undefined where the Client has no such routine, or no connection whose errors it can be heard on.
+ *
+ * @throws {unknown} What the routine reports on the client's connection: the function's own error, or pg's
+ *   `TypeError` for an answer that is not a string.
+ */
+const askThroughPoolClient = async (
+  PoolClient: unknown,
+  settings: PgConnectionSettings,
+): Promise<{ answer: string | undefined } | undefined> => {
+  const routine = askingRoutineOf(PoolClient);
+  if (routine === undefined) return undefined;
+  const client = new (PoolClient as new (config: object) => AskingClient)({
+    ...settings,
+    // pg-pool keeps the settings' password from enumeration, so it is copied by name.
+    password: settings.password,
+    stream: undefined,
+    connection: undefined,
+  });
+  const ask = client[routine];
+  const { connection } = client;
+  if (typeof ask !== 'function' || !hasEvents(connection)) return undefined;
+  return new Promise((resolve, reject) => {
+    const failed = (error: unknown): void => reject(error);
+    connection.once('error', failed);
+    try {
+      ask.call(client, () => {
+        connection.removeListener?.('error', failed);
+        resolve({ answer: typeof client.password === 'string' ? client.password : undefined });
+      });
+    } catch (error) {
+      connection.removeListener?.('error', failed);
+      reject(error);
+    }
+  });
+};
+
 /**
  * The password pg sends for a connection: the settings' string, or the answer of the settings' function, which pg
- * calls on the connecting client, with its `ConnectionParameters` from pg 8.19.0. Undefined where neither gives one.
+ * calls on the connecting client, with its `ConnectionParameters` from pg 8.19.0. The function is asked through the
+ * pool's own `Client` where the pool names one, as pg-pool's pools do, and otherwise as the pg this library loads
+ * asks it. Undefined where neither gives one.
  *
  * @throws {Error} When the function fails or answers something other than a string or undefined.
  */
-const passwordOf = async (connection: PgConnection, settings: PgConnectionSettings): Promise<string | undefined> => {
+const passwordOf = async (
+  connection: PgConnection,
+  settings: PgConnectionSettings,
+  PoolClient?: unknown,
+): Promise<string | undefined> => {
   const { password } = connection;
   if (typeof password !== 'function') {
     return typeof password === 'string' ? password : undefined;
   }
+  let asked: { answer: string | undefined } | undefined;
+  try {
+    asked = await askThroughPoolClient(PoolClient, settings);
+  } catch (error) {
+    throw passwordFailure(error);
+  }
+  if (asked !== undefined) return asked.answer;
+
   const { self, args } = await passwordCallOf(connection, settings);
   let answer: unknown;
   try {
     answer = await (password as (...parameters: unknown[]) => unknown).apply(self, args);
   } catch (error) {
-    // The function's own error is kept as the cause, out of the message, which a log may show.
-    const failure: Error & { cause?: unknown } = new Error(
-      'PostgresExporter: the password function of the pool failed, so pg_dump has no password.',
-    );
-    failure.cause = error;
-    throw failure;
+    throw passwordFailure(error);
   }
   if (answer === undefined) return undefined;
-  if (typeof answer !== 'string') {
-    throw new Error('PostgresExporter: the password function of the pool answered no string, which pg refuses too.');
-  }
+  if (typeof answer !== 'string') throw passwordFailure(new TypeError(NOT_A_STRING));
   return answer;
 };
 
@@ -467,12 +553,16 @@ const passwordOf = async (connection: PgConnection, settings: PgConnectionSettin
  * with no password and reads no `PGPASSWORD` (`lib/client.js`, `_getPassword`): the URI holds an empty `password`
  * parameter, which becomes an empty `PGPASSWORD`, so libpq sends the environment's no more than pg does. A
  * connection string pg cannot read as a URL (a keyword=value string) is given back as it is. Undefined when the
- * settings name no database pg would reach.
+ * settings name no database pg would reach. `PoolClient` is the `Client` the pool makes its connections with, which
+ * pg-pool keeps as the pool's `Client`: a password function is asked through it.
  *
- * @throws {Error} When the settings ask for TLS that pg_dump cannot take or that pg refuses, or the password function
- *   fails.
+ * @throws {Error} When the settings ask for TLS that pg_dump cannot take or that pg refuses, or a port pg reads no
+ *   number in, or the password function fails.
  */
-export const libpqConnectionStringOf = async (settings: PgConnectionSettings): Promise<string | undefined> => {
+export const libpqConnectionStringOf = async (
+  settings: PgConnectionSettings,
+  PoolClient?: unknown,
+): Promise<string | undefined> => {
   const { connectionString } = settings;
   if (connectionString && !connectionString.startsWith('/') && !URL_SCHEME.test(connectionString)) {
     return connectionString;
@@ -482,7 +572,7 @@ export const libpqConnectionStringOf = async (settings: PgConnectionSettings): P
   if (connection === undefined) return connectionString;
   if (!connection.database) return undefined;
 
-  const password = await passwordOf(connection, settings);
+  const password = await passwordOf(connection, settings, PoolClient);
   const parameters = [...connection.parameters];
   if (typeof connection.password === 'function' && !password) parameters.push(['password', '']);
   const user = connection.user ? encodeURIComponent(connection.user) : '';

@@ -14,17 +14,26 @@ import { SqliteFileExporter } from '../../exporters/SqliteFileExporter.js';
 import { PostgresExporter, type PostgresExporterOptions } from '../../exporters/PostgresExporter.js';
 import { libpqConnectionStringOf, type PgConnectionSettings } from '../../exporters/pgConnection.js';
 
+/**
+ * A pg Pool as the exporter reads one: the settings it was made with (`options`) and the `Client` it makes its
+ * connections with, which pg-pool keeps (pg-pool 3.14.0, `index.js:95`).
+ */
+interface PgPoolLike {
+  options?: PgConnectionSettings;
+  Client?: unknown;
+}
+
 interface PostgresAdapterOptionsLike extends PgConnectionSettings {
   segment?: string;
-  /** A pool of the caller's; a pg Pool keeps the settings it was made with as `options`. */
-  pool?: { options?: PgConnectionSettings } | null;
+  /** A pool of the caller's. */
+  pool?: PgPoolLike | null;
 }
 
 /** What the exporter reads of a Postgres adapter. */
 interface PostgresAdapterLike {
   options?: PostgresAdapterOptionsLike;
   /** The pool the adapter runs on: the pool it made when it opened, or its caller's; null while it is closed. */
-  getPool?: () => { options?: PgConnectionSettings } | null;
+  getPool?: () => PgPoolLike | null;
 }
 
 /**
@@ -50,9 +59,10 @@ const ownPoolSettings = (options: PostgresAdapterOptionsLike | undefined): PgCon
  * The exporter of a Postgres adapter. When an export runs it reads the
  * connection of the pool the adapter runs on, as pg reads it (the connection
  * string `open()` was given included, and a password function of the pool's,
- * which it calls), and hands pg_dump a libpq URI of it; before the adapter
- * opens, the settings of the pool it will make, or of the pool its caller gave
- * it. A segmented adapter exports its segment's schema alone.
+ * which it asks through the pool's own Client), and hands pg_dump a libpq URI
+ * of it; before the adapter opens, the settings of the pool it will make, or of
+ * the pool its caller gave it. A segmented adapter exports its segment's schema
+ * alone.
  */
 function postgresExporterOf(adapter: StorageAdapter): PostgresExporter {
   const postgres = adapter as StorageAdapter & PostgresAdapterLike;
@@ -65,10 +75,15 @@ function postgresExporterOf(adapter: StorageAdapter): PostgresExporter {
       : 'PostgresExporter: the adapter names no database for pg_dump to reach. Make it with a connectionString, or ' +
         'with host, database and user, or export once open() has been given a connection string.',
   };
+  // A password function is asked through the Client of the pool whose settings are read; the pool the adapter will
+  // make is of the pg this library loads.
   const connectionString = async (): Promise<string | undefined> => {
     const pool = typeof postgres.getPool === 'function' ? postgres.getPool() : null;
-    const settings = pool?.options ?? ownPoolSettings(options) ?? options?.pool?.options;
-    return settings ? libpqConnectionStringOf(settings) : undefined;
+    if (pool?.options) return libpqConnectionStringOf(pool.options, pool.Client);
+    const own = ownPoolSettings(options);
+    if (own) return libpqConnectionStringOf(own);
+    const given = options?.pool;
+    return given?.options ? libpqConnectionStringOf(given.options, given.Client) : undefined;
   };
   return new PostgresExporter(connectionString, exportOptions);
 }
