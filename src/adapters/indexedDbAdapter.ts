@@ -296,7 +296,7 @@ const IMAGE_PRAGMAS_WHEN_SET = new Set(['user_version', 'application_id', 'schem
 /** PRAGMAs that change the image in any form: incremental_vacuum frees pages, optimize may run ANALYZE. */
 const IMAGE_PRAGMAS_ALWAYS = new Set(['incremental_vacuum', 'optimize']);
 
-/** A token of a statement's head: a name, bare or quoted, or one character of punctuation. */
+/** A token of a statement's head: a name, bare or quoted (a string in single quotes included), or one character of punctuation. */
 interface HeadToken {
   text: string;
   name: boolean;
@@ -309,7 +309,11 @@ const NAME_PART = /[A-Za-z0-9_$]/;
  * The first `count` tokens of a statement as SQLite's tokenizer reads them: a
  * comment (`-- ...` to the end of its line, `/* ... *\/`) or whitespace
  * separates two tokens and is no token itself, and a quoted name (in double
- * quotes, brackets or backticks) needs no space before it.
+ * quotes, brackets or backticks) needs no space before it. A string in single
+ * quotes is read as a name as well: SQLite's grammar takes one for a name where
+ * a PRAGMA's schema or name goes (parse.y, `nm ::= STRING`), and its tokenizer
+ * ends it as it ends a quoted name, at a quote not written twice (tokenize.c,
+ * `CC_QUOTE`).
  */
 const headTokens = (statement: string, count: number): HeadToken[] => {
   const tokens: HeadToken[] = [];
@@ -324,7 +328,7 @@ const headTokens = (statement: string, count: number): HeadToken[] => {
     } else if (statement.startsWith('/*', at)) {
       const end = statement.indexOf('*/', at + 2);
       at = end < 0 ? statement.length : end + 2;
-    } else if (char === '"' || char === '`') {
+    } else if (char === '"' || char === '`' || char === "'") {
       // A quote character inside the name is written twice.
       let text = '';
       let end = at + 1;
