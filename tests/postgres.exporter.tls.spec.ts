@@ -97,4 +97,53 @@ describe.skipIf(!TLS_URL || !ROOT_CERT)('the PostgreSQL exporter, through pg_dum
       await pool.end();
     }
   });
+
+  /** The server's URL with another host, which reaches the same server, and these parameters. */
+  const urlWith = (host: string, parameters: Record<string, string>): string => {
+    const url = new URL(TLS_URL ?? 'postgresql://localhost');
+    url.hostname = host;
+    for (const [name, value] of Object.entries(parameters)) url.searchParams.set(name, value);
+    return url.toString();
+  };
+
+  // The certificate names localhost and 127.0.0.1, and 127.0.0.2 reaches the
+  // same server. Node's TLS checks the host name, an IP address too, against
+  // the certificate, and libpq's verify-full does (fe-secure-common.c,
+  // pq_verify_peer_name_matches_certificate).
+  it('refuses, as pg does, a host the certificate does not name, though its root certificate signed it', async () => {
+    const pool = new pg.Pool({ connectionString: urlWith('127.0.0.2', { sslrootcert: ROOT_CERT as string }) });
+    try {
+      await expect(pool.query('SELECT 1')).rejects.toThrow(/does not match certificate's altnames/);
+
+      const file = path.join(dir, 'other-host.dump');
+      await expect(createStorageFeatures(createPostgresAdapter({ pool })).exporter.exportToFile(file)).rejects.toThrow(
+        /pg_dump failed.*does not match host name/s,
+      );
+    } finally {
+      await pool.end();
+    }
+  });
+
+  // pg reads verify-ca as libpq does with uselibpqcompat=true, and checks the
+  // certificate against the root certificate and no host name
+  // (pg-connection-string index.js:125-132); pg_dump gets verify-ca.
+  it('exports, where pg connects, from a host the certificate does not name with uselibpqcompat=true and verify-ca', async () => {
+    const pool = new pg.Pool({
+      connectionString: urlWith('127.0.0.2', {
+        uselibpqcompat: 'true',
+        sslmode: 'verify-ca',
+        sslrootcert: ROOT_CERT as string,
+      }),
+    });
+    try {
+      await pool.query('SELECT 1');
+
+      const file = path.join(dir, 'verify-ca.dump');
+      await createStorageFeatures(createPostgresAdapter({ pool })).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toContain(`public.${table}`);
+    } finally {
+      await pool.end();
+    }
+  });
 });

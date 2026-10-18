@@ -1,4 +1,7 @@
-import { describe, expect, it, afterEach, beforeEach, vi } from 'vitest';
+import { describe, expect, it, afterAll, afterEach, beforeAll, beforeEach, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // PostgresExporter runs pg_dump. These specs read what it hands pg_dump: the
 // arguments, each passed as it is with no shell between, and the environment.
@@ -243,6 +246,17 @@ describe('PostgresExporter', () => {
     ['a backslash before a space in a bare value', 'password=s3cr\\ et host=db.example', 'host=db.example', 's3cr et'],
     ['spaces around the equals sign', 'password = s3cret host=db.example', 'host=db.example', 's3cret'],
     ['two passwords, of which libpq takes the later', 'password=s3cr-first host=db.example password=s3cret', 'host=db.example', 's3cret'],
+    // After a closing quote libpq reads the next keyword at once, with no
+    // space between, and a later value of a keyword replaces the earlier one
+    // (fe-connect.c, conninfo_parse and conninfo_storeval): libpq reaches
+    // other.example from the string as given and from the string with its
+    // password taken out alike.
+    [
+      'a setting right after a quoted password, with no space between',
+      "host=db.example password='s3cret'host=other.example dbname=app",
+      'host=db.example host=other.example dbname=app',
+      's3cret',
+    ],
   ])('keeps the password of keyword=value settings off the command line, with %s', async (_name, connectionString, dbname, password) => {
     await new PostgresExporter(connectionString).exportToBytes();
 
@@ -309,6 +323,26 @@ describe('PostgresExporter', () => {
     outcome.error = Object.assign(new Error('spawn pg_dump ENOENT'), { code: 'ENOENT' });
 
     await expect(new PostgresExporter('postgresql://app@db/app').exportToBytes()).rejects.toThrow(/pg_dump was not found/);
+  });
+
+  // libpq reads sslrootcert=system as the system's certificate authorities
+  // from PostgreSQL 16 on. An older libpq looks for a file named system, and
+  // without it refuses verify-full (REL_15_STABLE fe-secure-openssl.c,
+  // initialize_SSL), in these words.
+  it('says what to do where the libpq of pg_dump is older than 16 and looks for a file named system', async () => {
+    outcome.error = Object.assign(new Error('Command failed: pg_dump'), { code: 1 });
+    outcome.stderr =
+      'pg_dump: error: connection to server at "db.example" (192.0.2.10), port 5432 failed: ' +
+      'root certificate file "system" does not exist\n' +
+      'Either provide the file or change sslmode to disable server certificate verification.';
+
+    const failure = await refusal(
+      new PostgresExporter('postgresql://app@db.example/app?sslmode=verify-full&sslrootcert=system').exportToBytes(),
+    );
+
+    expect(failure?.message).toMatch(/root certificate file "system" does not exist/);
+    expect(failure?.message).toMatch(/PostgreSQL 16 or later/);
+    expect(failure?.message).toMatch(/sslrootcert parameter.*PGSSLROOTCERT/s);
   });
 });
 
@@ -638,6 +672,83 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
 
     expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=verify-full');
     expect(calls[0].env.PGSSLROOTCERT).toBe('/etc/ssl/private-ca.pem');
+  });
+
+  // pg refuses sslmode=verify-ca read as libpq reads it (uselibpqcompat=true)
+  // where no root certificate names what to check the server against
+  // (pg-connection-string index.js:125-130), so the pool makes no connection;
+  // pg_dump, which PGSSLROOTCERT would give a root certificate, makes none
+  // either.
+  it('refuses, as pg does, sslmode=verify-ca with uselibpqcompat=true and no root certificate', async () => {
+    const connectionString = 'postgresql://app@db.example/app?uselibpqcompat=true&sslmode=verify-ca';
+    expect(() => new ConnectionParameters({ connectionString })).toThrow(/verify-ca requires specifying a CA/);
+    vi.stubEnv('PGSSLROOTCERT', '/etc/ssl/private-ca.pem');
+
+    const failure = await refusal(poolExporter({ connectionString }).exportToBytes());
+
+    expect(failure?.message).toMatch(/sslmode=verify-ca.*sslrootcert/s);
+    expect(calls).toHaveLength(0);
+  });
+
+  // What libpq is asked to check follows pg's own reading of the string, the
+  // ssl of its ConnectionParameters: no TLS (disable), TLS that checks nothing
+  // (require), the certificate alone, where pg's checkServerIdentity checks
+  // nothing (verify-ca), or the certificate and the host name (verify-full),
+  // against the root certificate the string names, which pg reads, else the
+  // system's certificate authorities.
+  describe("asks libpq to check what pg's own reading of a connection string checks", () => {
+    let dir = '';
+    let root = '';
+
+    beforeAll(() => {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-tls-parity-'));
+      root = path.join(dir, 'root.pem');
+      // pg reads the file's text, and leaves checking it to Node's TLS.
+      fs.writeFileSync(root, 'ROOT PEM');
+    });
+
+    afterAll(() => {
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it.each([
+      'sslmode=disable',
+      'sslmode=prefer',
+      'sslmode=require',
+      'sslmode=verify-ca',
+      'sslmode=verify-full',
+      'sslmode=no-verify',
+      'ssl=true',
+      'ssl=0',
+      'sslrootcert=ROOT',
+      'sslmode=require&sslrootcert=ROOT',
+      'sslmode=no-verify&sslrootcert=ROOT',
+      'uselibpqcompat=true&sslmode=disable',
+      'uselibpqcompat=true&sslmode=prefer',
+      'uselibpqcompat=true&sslmode=require',
+      'uselibpqcompat=true&sslmode=require&sslrootcert=ROOT',
+      'uselibpqcompat=true&sslmode=verify-ca&sslrootcert=ROOT',
+      'uselibpqcompat=true&sslmode=verify-full',
+      'uselibpqcompat=true&sslmode=verify-full&sslrootcert=ROOT',
+    ])('with %s', async (query) => {
+      const connectionString = `postgresql://app@db.example/app?${query.replace('ROOT', encodeURIComponent(root))}`;
+      const ssl = new ConnectionParameters({ connectionString }).ssl as
+        | boolean
+        | { rejectUnauthorized?: unknown; checkServerIdentity?: unknown };
+      const named = query.includes('sslrootcert=ROOT') ? root : null;
+      const expected = !ssl
+        ? { sslmode: 'disable', sslrootcert: null }
+        : typeof ssl === 'object' && ssl.rejectUnauthorized === false
+          ? { sslmode: 'require', sslrootcert: named }
+          : typeof ssl === 'object' && typeof ssl.checkServerIdentity === 'function'
+            ? { sslmode: 'verify-ca', sslrootcert: named }
+            : { sslmode: 'verify-full', sslrootcert: named ?? 'system' };
+
+      await poolExporter({ connectionString }).exportToBytes();
+
+      const written = new URL(dbnameOf(calls[0].args) as string).searchParams;
+      expect({ sslmode: written.get('sslmode'), sslrootcert: written.get('sslrootcert') }).toEqual(expected);
+    });
   });
 
   // pg_dump reads TLS material from files alone, and sslmode=require in their
