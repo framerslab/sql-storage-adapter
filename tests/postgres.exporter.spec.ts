@@ -6,6 +6,7 @@ import path from 'node:path';
 import pg from 'pg';
 import { createPostgresAdapter, createStorageFeatures, type StorageAdapter } from '../src/index.js';
 import { ClientOfEarlierPg } from './fixtures/clientOfEarlierPg.js';
+import { clientOfPgBeforeDirectNegotiation } from './fixtures/clientOfPgBeforeDirectNegotiation.js';
 
 // The feature exporter runs pg_dump against the PostgreSQL that
 // POSTGRES_TEST_URL names (CI's service); the runner has the PostgreSQL client
@@ -414,5 +415,33 @@ describe.skipIf(!POSTGRES_TEST_URL)('the PostgreSQL exporter, through pg_dump', 
     await exporter.exportToFile(file);
 
     expect(dumpedTables(file)).toEqual([`${segment}.opened_items`]);
+  });
+
+  // A pg before 8.22.0 reads no sslnegotiation, and under it a
+  // pg-connection-string before 2.14.0 makes no TLS of sslnegotiation=direct,
+  // so the pool connects to CI's server, which offers no TLS. pg_dump was
+  // given sslnegotiation=direct with verify-full, which this server cannot
+  // meet, and which a libpq before 17 refuses as a parameter it does not know.
+  it('exports through a pool whose pg reads nothing in sslnegotiation=direct, where the pool connects without TLS', async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    server.pathname = `/${database}`;
+    server.searchParams.set('sslnegotiation', 'direct');
+    const pool = new pg.Pool({
+      connectionString: server.toString(),
+      Client: clientOfPgBeforeDirectNegotiation('reads-nothing'),
+    } as pg.PoolConfig);
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE negotiation_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-negotiation.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.negotiation_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
   });
 });

@@ -40,8 +40,10 @@ vi.mock('../src/exporters/pgModule.js', async (importOriginal) => {
 
 import { Client as PgClient } from 'pg';
 import { ClientOfEarlierPg } from './fixtures/clientOfEarlierPg.js';
+import { clientOfPgBeforeDirectNegotiation, type ParseOfDirect } from './fixtures/clientOfPgBeforeDirectNegotiation.js';
 import { PostgresExporter } from '../src/exporters/PostgresExporter.js';
 import { createStorageFeatures } from '../src/core/contracts/features.js';
+import { setStorageLogger } from '../src/shared/logger.js';
 import type { StorageAdapter } from '../src/core/contracts/index.js';
 // pg's own reading of a pool's settings (pg exports ./lib/*).
 // @ts-expect-error pg ships no declarations for its lib files.
@@ -355,7 +357,7 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     // pg reads these where the settings leave a value out, and takes the user
     // name from the operating system's; each spec that needs one sets it.
     // They are removed, not emptied: libpq refuses an empty PGSSLMODE.
-    for (const name of ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD', 'PGSSLMODE', 'PGSSLROOTCERT', 'USER', 'USERNAME']) {
+    for (const name of ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD', 'PGSSLMODE', 'PGSSLROOTCERT', 'PGSSLNEGOTIATION', 'USER', 'USERNAME']) {
       vi.stubEnv(name, undefined);
     }
     pgRead.as = null;
@@ -1283,5 +1285,110 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
 
     await expect(createStorageFeatures(adapter).exporter.exportToBytes()).rejects.toThrow(/names no database/);
     expect(calls).toHaveLength(0);
+  });
+
+  // pg reads sslnegotiation from 8.22.0 (lib/connection-parameters.js:102-112):
+  // the connection string's over the settings', an empty one as none, then
+  // PGSSLNEGOTIATION; with direct it starts TLS at once instead of with an
+  // SSLRequest. pg 8.13.1 to 8.21.x read none and open TLS with an SSLRequest.
+  // pg-connection-string turns TLS on for sslnegotiation=direct from 2.14.0
+  // (index.js:81-86), and the caret ranges of pg 8.13.1 to 8.21.x admit one
+  // from either side of it. pg_dump gets what the pool's own pg reads.
+  describe("sslnegotiation, as the pool's own pg reads it", () => {
+    /** The features exporter of an adapter on a pool of the caller whose connections are made with this Client. */
+    const clientPoolExporter = (options: Record<string, unknown>, Client: unknown) =>
+      createStorageFeatures(postgresAdapter({ pool: { options, Client } })).exporter;
+
+    it.each([
+      [
+        'whose parse reads nothing in sslnegotiation=direct: no TLS, and no sslnegotiation',
+        'reads-nothing',
+        'postgresql://app@db.example/app?sslnegotiation=direct',
+        'postgresql://app@db.example:5432/app',
+      ],
+      [
+        'whose parse turns TLS on for sslnegotiation=direct: the TLS, and no sslnegotiation',
+        'turns-tls-on',
+        'postgresql://app@db.example/app?sslnegotiation=direct',
+        'postgresql://app@db.example:5432/app?sslmode=verify-full&sslrootcert=system',
+      ],
+      [
+        'given sslnegotiation=postgres beside application_name: application_name alone',
+        'turns-tls-on',
+        'postgresql://app@db.example/app?sslnegotiation=postgres&application_name=reports',
+        'postgresql://app@db.example:5432/app?application_name=reports',
+      ],
+    ])('gives pg_dump what a pool whose pg before 8.22.0 reads, %s', async (_name, parse, connectionString, dbname) => {
+      const Client = clientOfPgBeforeDirectNegotiation(parse as ParseOfDirect);
+
+      await clientPoolExporter({ connectionString }, Client).exportToBytes();
+
+      expect(dbnameOf(calls[0].args)).toBe(dbname);
+      // The pool's own reading: TLS where pg_dump is given it, and no sslnegotiation.
+      const { connectionParameters } = new Client({ connectionString }) as unknown as {
+        connectionParameters: { ssl?: unknown; sslnegotiation?: unknown };
+      };
+      expect(Boolean(connectionParameters.ssl)).toBe(dbname.includes('sslmode=verify-full'));
+      expect(connectionParameters.sslnegotiation).toBeUndefined();
+    });
+
+    it('gives pg_dump the sslnegotiation of the settings of a pool whose pg reads it', async () => {
+      const settings = { host: 'db.example', database: 'app', user: 'app', ssl: true, sslnegotiation: 'direct' };
+
+      await poolExporter(settings).exportToBytes();
+
+      expect(new ConnectionParameters(settings).sslnegotiation).toBe('direct');
+      expect(dbnameOf(calls[0].args)).toBe(
+        'postgresql://app@db.example:5432/app?sslnegotiation=direct&sslmode=verify-full&sslrootcert=system',
+      );
+    });
+
+    it('gives pg_dump no sslnegotiation of the settings of a pool whose pg before 8.22.0 reads none', async () => {
+      const options = { host: 'db.example', database: 'app', user: 'app', ssl: true, sslnegotiation: 'direct' };
+
+      await clientPoolExporter(options, clientOfPgBeforeDirectNegotiation('turns-tls-on')).exportToBytes();
+
+      expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=verify-full&sslrootcert=system');
+    });
+
+    it.each([
+      [
+        "a connection string's, over the settings'",
+        { connectionString: 'postgresql://app@db.example/app?sslnegotiation=postgres', ssl: true, sslnegotiation: 'direct' },
+        'postgresql://app@db.example:5432/app?sslnegotiation=postgres&sslmode=verify-full&sslrootcert=system',
+      ],
+      [
+        'an empty one in a connection string, which pg reads as none',
+        { connectionString: 'postgresql://app@db.example/app?sslnegotiation=', ssl: true, sslnegotiation: 'direct' },
+        'postgresql://app@db.example:5432/app?sslmode=verify-full&sslrootcert=system',
+      ],
+    ])('gives pg_dump the sslnegotiation pg reads, with %s', async (_name, settings, dbname) => {
+      await poolExporter(settings).exportToBytes();
+
+      expect(dbnameOf(calls[0].args)).toBe(dbname);
+      const written = new URL(dbname).searchParams.get('sslnegotiation') ?? undefined;
+      expect(written).toBe(new ConnectionParameters(settings).sslnegotiation);
+    });
+
+    it('reads sslnegotiation as pg 8.22.0 and later do where pg cannot be read, and says so once', async () => {
+      pgRead.as = {};
+      const warn = vi.fn();
+      setStorageLogger({ info: () => undefined, warn, error: () => undefined });
+      try {
+        for (let run = 0; run < 2; run += 1) {
+          await poolExporter({ connectionString: 'postgresql://app@db.example/app?sslnegotiation=direct' }).exportToBytes();
+        }
+      } finally {
+        setStorageLogger(null);
+      }
+
+      expect(calls.map((call) => dbnameOf(call.args))).toEqual([
+        'postgresql://app@db.example:5432/app?sslnegotiation=direct&sslmode=verify-full&sslrootcert=system',
+        'postgresql://app@db.example:5432/app?sslnegotiation=direct&sslmode=verify-full&sslrootcert=system',
+      ]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toMatchObject({ scope: 'PostgresExporter' });
+      expect(warn.mock.calls[0][1]).toMatch(/sslnegotiation/);
+    });
   });
 });

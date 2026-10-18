@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import pg from 'pg';
 import { createPostgresAdapter, createStorageFeatures } from '../src/index.js';
+import { clientOfPgBeforeDirectNegotiation } from './fixtures/clientOfPgBeforeDirectNegotiation.js';
 
 // CI starts a PostgreSQL that offers TLS with a certificate made for the run,
 // for localhost, which no public certificate authority signed: it reads
@@ -139,6 +140,27 @@ describe.skipIf(!TLS_URL || !ROOT_CERT)('the PostgreSQL exporter, through pg_dum
       await pool.query('SELECT 1');
 
       const file = path.join(dir, 'verify-ca.dump');
+      await createStorageFeatures(createPostgresAdapter({ pool })).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toContain(`public.${table}`);
+    } finally {
+      await pool.end();
+    }
+  });
+
+  // A pg before 8.22.0 opens TLS with an SSLRequest whatever sslnegotiation
+  // says. pg_dump was given sslnegotiation=direct, which starts TLS at once:
+  // this PostgreSQL 16 takes no direct TLS (it came with PostgreSQL 17), and a
+  // libpq before 17 refuses the parameter as one it does not know.
+  it('exports through a pool whose pg opens TLS with an SSLRequest past sslnegotiation=direct, as pg before 8.22.0 does', async () => {
+    const pool = new pg.Pool({
+      connectionString: urlWith('localhost', { sslrootcert: ROOT_CERT as string, sslnegotiation: 'direct' }),
+      Client: clientOfPgBeforeDirectNegotiation('turns-tls-on'),
+    } as pg.PoolConfig);
+    try {
+      await pool.query('SELECT 1');
+
+      const file = path.join(dir, 'negotiation.dump');
       await createStorageFeatures(createPostgresAdapter({ pool })).exporter.exportToFile(file);
 
       expect(dumpedTables(file)).toContain(`public.${table}`);
