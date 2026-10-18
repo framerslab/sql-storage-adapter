@@ -385,8 +385,6 @@ export class DeviceManager {
 
     if (existing) {
       // Update existing peer
-      const changes: Partial<DeviceInfo> = {};
-
       if (peerInfo.lastSeenAt > existing.lastSeenAt) {
         Object.assign(existing, peerInfo);
         this._emit('deviceUpdated', { device: existing, changes: peerInfo });

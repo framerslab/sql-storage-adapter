@@ -7,7 +7,7 @@ import { syncPostgresSequence } from '../../shared/identitySequence';
 import type { StorageAdapter } from '../../core/contracts';
 import { createStorageFeatures } from '../../core/contracts/features';
 import { splitSqlStatements } from '../../shared/splitSqlStatements';
-import type { ExportedData, TableSchema } from './dataExport';
+import type { ExportedData } from './dataExport';
 import { createTableStatement, quoteIdentifier, type Engine } from './tableDefinition';
 
 /**
