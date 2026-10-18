@@ -10,6 +10,13 @@ on:
       - 'src/**'
   workflow_dispatch:
 
+# One release run at a time: a run that starts while another runs waits for it,
+# so two pushes whose package.json holds the same new version never race
+# npm publish, and no publish is cancelled part way.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
