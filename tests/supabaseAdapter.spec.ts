@@ -119,6 +119,30 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
     expect(String((error as Error).message)).toMatch(/^Query failed: /);
   });
 
+  it('runs each statement of a string of them, and answers no rows for it, as the PostgreSQL adapter does', async () => {
+    // pg answers a string of statements sent with no parameters with a list of results, which has no rows of its own:
+    // get threw on it and all answered undefined, after PostgreSQL had run every statement.
+    const read = `SELECT label FROM ${table} WHERE id = ?`;
+    await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [46, 'inserted']);
+
+    expect(await db.run(`UPDATE ${table} SET label = 'by run' WHERE id = 46; SELECT 1 AS one`)).toEqual({
+      changes: 0,
+      lastInsertRowid: 0,
+    });
+    expect(await db.get(read, [46])).toEqual({ label: 'by run' });
+    expect(await db.get(`UPDATE ${table} SET label = 'by get' WHERE id = 46; SELECT 1 AS one`)).toBeNull();
+    expect(await db.get(read, [46])).toEqual({ label: 'by get' });
+    expect(await db.all(`UPDATE ${table} SET label = 'by all' WHERE id = 46; SELECT 1 AS one`)).toEqual([]);
+    expect(await db.get(read, [46])).toEqual({ label: 'by all' });
+
+    const inside = await db.transaction(async (trx) => ({
+      got: await trx.get(`UPDATE ${table} SET label = 'in get' WHERE id = 46; SELECT 1 AS one`),
+      all: await trx.all(`UPDATE ${table} SET label = 'in all' WHERE id = 46; SELECT 1 AS one`),
+    }));
+    expect(inside).toEqual({ got: null, all: [] });
+    expect(await db.get(read, [46])).toEqual({ label: 'in all' });
+  });
+
   it('commits the operations of a batch that succeed, and reports the one that fails', async () => {
     // A failed statement aborts a PostgreSQL transaction: without a savepoint each operation after it failed too,
     // and the COMMIT rolled everything back while the result said one operation was written.
@@ -393,8 +417,10 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
 
       // With no parameters pg sends the text as one simple query, and PostgreSQL runs each statement in it: the
       // COMMIT ends the transaction the SELECT began in, and the UPDATE commits in one of its own.
-      await db.all(`SELECT 1 AS one; COMMIT; UPDATE ${table} SET label = 'two' WHERE id = 20`);
+      expect(await db.all(`SELECT 1 AS one; COMMIT; UPDATE ${table} SET label = 'two' WHERE id = 20`)).toEqual([]);
       expect(await db.get(read, [20])).toEqual({ label: 'two' });
+      expect(await db.get(`SELECT 1 AS one; COMMIT; UPDATE ${table} SET label = 'three' WHERE id = 20`)).toBeNull();
+      expect(await db.get(read, [20])).toEqual({ label: 'three' });
     });
 
     it('keys a read bound to bytes apart from one bound to an object that JSON writes alike', async () => {
@@ -406,7 +432,7 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
       expect(await db.get(size, [{ 0: 1, 1: 2 }])).toEqual({ n: 13 });
     });
 
-    it('runs a read bound to an object that pg binds through its own toPostgres each time it is asked', async () => {
+    it('keys a read bound to an object with a toPostgres of its own by the text it gives when the call is made', async () => {
       const cents = 'SELECT ?::int AS cents';
       expect(await db.get(cents, [{ toPostgres: () => '1' }])).toEqual({ cents: 1 });
       expect(await db.get(cents, [{ toPostgres: () => '2' }])).toEqual({ cents: 2 });

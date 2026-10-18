@@ -8,7 +8,7 @@
  * way, with pool control, transaction error handling and `strict` resolution.
  */
 
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { toPostgresStatement } from '../shared/sqlPlaceholders';
 import { getStorageLogger } from '../shared/logger';
 import type {
@@ -56,11 +56,114 @@ const failure = (message: string, error: unknown): Error => {
   return wrapped;
 };
 
+/** An unknown thrown value as an Error. */
+const asError = (value: unknown): Error => (value instanceof Error ? value : new Error(String(value)));
+
+/**
+ * The rows of a statement's answer. pg answers a string of several statements, sent with no parameters as one simple
+ * query, with a list of results, which has no rows of its own: such a call answers no rows, as the PostgreSQL adapter's
+ * does, so `get` answers null, `all` an empty list and `run` no row's id, after PostgreSQL ran every statement.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- rows as pg types them, so callers keep their types
+const rowsOf = (result: unknown): any[] => {
+  if (Array.isArray(result)) return [];
+  const rows = (result as { rows?: unknown } | null | undefined)?.rows;
+  return Array.isArray(rows) ? rows : [];
+};
+
+/** Puts a failed ROLLBACK's error on the error thrown, as a non-enumerable `rollbackError`, when that error takes one. */
+const keepRollbackError = (error: unknown, rollbackError: Error): void => {
+  if (typeof error !== 'object' || error === null || !Object.isExtensible(error)) return;
+  try {
+    Object.defineProperty(error, 'rollbackError', {
+      value: rollbackError,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  } catch {
+    // A non-configurable rollbackError is already there: keep it.
+  }
+};
+
+/**
+ * Hears a connection error on a client checked out of the pool, until `stop()`. pg emits a client's connection error
+ * (the server ending the session, a broken socket) on the client, and pg-pool listens only on idle clients, so an
+ * error nothing heard would end the process. The client goes back to the pool with the error `failure()` answers, and
+ * the pool closes it.
+ */
+const watchClient = (client: PoolClient): { failure: () => Error | undefined; stop: () => void } => {
+  let failed: Error | undefined;
+  const onError = (error: Error): void => {
+    if (!failed) failed = error;
+  };
+  client.on('error', onError);
+  return {
+    failure: () => failed,
+    stop: () => {
+      client.removeListener('error', onError);
+    },
+  };
+};
+
+/** The pool's listener for a failed idle connection, which pg-pool has dropped by then. */
+const warnOfIdleError = (error: Error): void => {
+  const message = error instanceof Error ? error.message : String(error);
+  getStorageLogger().warn(
+    { adapter: 'supabase-postgres', error: message },
+    `SupabaseAdapter: an idle connection of the pool failed; the pool opens another when one is needed. ${message}`,
+  );
+};
+
+/**
+ * The error of a transaction whose COMMIT PostgreSQL answered with ROLLBACK: a statement in it failed and the callback
+ * went on, and PostgreSQL ends an aborted transaction that way, with no error of its own.
+ */
+const rolledBackAtCommit = (): Error =>
+  new Error(
+    'The transaction was rolled back at COMMIT: a statement in it failed, so PostgreSQL wrote none of it. ' +
+      'A statement that may fail inside a transaction runs under a savepoint of its own.',
+  );
+
+/** The savepoint each operation of `batchWrite` runs under. */
+const BATCH_SAVEPOINT = 'supabase_adapter_batch';
+
+/** The statement and the values of one `batchWrite` operation, or `undefined` for a type the batch does not know. */
+const batchStatementOf = (op: ExtendedBatchOperation): { query: string; params: unknown[] } | undefined => {
+  switch (op.type) {
+    case 'insert': {
+      const keys = Object.keys(op.values || {});
+      const values = Object.values(op.values || {});
+      const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
+      return { query: `INSERT INTO ${op.table} (${keys.join(', ')}) VALUES (${placeholders})`, params: values };
+    }
+    case 'update': {
+      const sets = Object.keys(op.values || {}).map((k, i) => `${k} = $${i + 1}`).join(', ');
+      const whereClause = Object.keys(op.where || {})
+        .map((k, i) => `${k} = $${i + Object.keys(op.values || {}).length + 1}`)
+        .join(' AND ');
+      return {
+        query: `UPDATE ${op.table} SET ${sets} WHERE ${whereClause}`,
+        params: [...Object.values(op.values || {}), ...Object.values(op.where || {})],
+      };
+    }
+    case 'delete': {
+      const whereClause = Object.keys(op.where || {})
+        .map((k, i) => `${k} = $${i + 1}`)
+        .join(' AND ');
+      return { query: `DELETE FROM ${op.table} WHERE ${whereClause}`, params: Object.values(op.where || {}) };
+    }
+    default:
+      return undefined;
+  }
+};
+
 /**
  * Whether the query cache may hold a statement's answer: a SELECT, whose first word past white space and comments is
- * SELECT. Block comments nest, as PostgreSQL reads them. Any other statement can write, such as `UPDATE ... RETURNING`
- * through `get`, and runs each time it is asked. A SELECT can write too, through a function it calls or with `INTO`,
- * which its text cannot show, so its answer is kept only when PostgreSQL says it wrote nothing (`readAndCheck`).
+ * SELECT. Block comments nest, and a `--` comment ends at a line feed or a carriage return, as PostgreSQL reads them.
+ * Any other statement can write, such as `UPDATE ... RETURNING` through `get`, and runs each time it is asked. A SELECT
+ * can write too, through a function it calls or with `INTO`, which its text cannot show, so its answer is kept only
+ * when PostgreSQL says it wrote nothing (`readAndCheck`).
  */
 const isSelect = (statement: unknown): boolean => {
   if (typeof statement !== 'string') return false;
@@ -68,9 +171,9 @@ const isSelect = (statement: unknown): boolean => {
   for (;;) {
     while (at < statement.length && /\s/.test(statement.charAt(at))) at += 1;
     if (statement.startsWith('--', at)) {
-      const end = statement.indexOf('\n', at);
+      const end = statement.slice(at).search(/[\n\r]/);
       if (end < 0) return false;
-      at = end + 1;
+      at += end + 1;
     } else if (statement.startsWith('/*', at)) {
       let depth = 1;
       at += 2;
@@ -115,79 +218,45 @@ const copyOf = (value: unknown): unknown => {
   return fields.some(([, field]) => field === UNCOPIED) ? UNCOPIED : Object.fromEntries(fields);
 };
 
-/** Stands for parameters the cache key cannot write, so the read bound to them runs each time it is asked. */
-const UNKEYED = Symbol('unkeyed');
+/** What the cache needs of pg: `prepareValue`, which writes a parameter as pg sends it. pg 8.15.0 and later export it. */
+interface PgUtilities {
+  prepareValue(value: unknown): unknown;
+}
 
-/** Whether the value is a Date of any realm, as pg reads one: `Date.prototype.getTime` takes nothing else. */
-const isDate = (value: unknown): value is Date => {
-  try {
-    Date.prototype.getTime.call(value as Date);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-/** The bytes of a view, such as a Buffer, as hex. */
-const hexOf = (view: ArrayBufferView): string =>
-  Array.from(new Uint8Array(view.buffer, view.byteOffset, view.byteLength), (byte) =>
-    byte.toString(16).padStart(2, '0')
-  ).join('');
+/** A statement as pg is sent it, with its values, and the key a SELECT's answer is kept under while the cache may keep it. */
+interface Call {
+  text: string;
+  values: unknown[];
+  cacheKey?: string;
+}
 
 /**
- * A parameter as the cache key writes it, so two parameters share a key only when pg binds them alike: text, numbers,
- * bigints and booleans as the text pg binds, and a tagged list for bytes, a Date, an array and any other object, which
- * pg binds as its JSON text. `UNKEYED` for one the key cannot write so: an object with a `toPostgres` of its own,
- * which pg binds through it, a function, a symbol, an object JSON cannot write, and text holding U+0000, which
- * PostgreSQL refuses, so that no read bound to it answers from the cache.
+ * The values a read the cache may keep is sent with, each written by pg's own `prepareValue` when the call is made, as
+ * text, bytes (copied) or null, and the key they give. The read is sent those, so its answer is the answer to them
+ * whatever the caller changes afterwards, and two reads share an answer only when pg sends them the same values.
+ * `undefined` when `prepareValue` answers anything else, as one a host put in its place may, and the read then runs
+ * each time it is asked.
  */
-const keyOf = (value: unknown): unknown => {
-  if (value === null || value === undefined) return null;
-  switch (typeof value) {
-    case 'string':
-      return value.includes('\u0000') ? UNKEYED : value;
-    case 'number':
-    case 'bigint':
-    case 'boolean':
-      return String(value);
-    case 'object':
-      break;
-    default:
-      return UNKEYED;
+const sentValuesOf = (values: unknown[], utilities: PgUtilities): { values: unknown[]; key: unknown[] } | undefined => {
+  const sent: unknown[] = [];
+  const key: unknown[] = [];
+  for (const value of values) {
+    const prepared = utilities.prepareValue(value);
+    if (prepared === null || prepared === undefined) {
+      sent.push(null);
+      key.push(null);
+    } else if (typeof prepared === 'string') {
+      sent.push(prepared);
+      key.push(prepared);
+    } else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(prepared)) {
+      const bytes = Buffer.from(prepared);
+      sent.push(bytes);
+      key.push(['bytes', bytes.toString('hex')]);
+    } else {
+      return undefined;
+    }
   }
-  if (ArrayBuffer.isView(value)) return ['bytes', hexOf(value)];
-  if (isDate(value)) return ['date', value.getTime()];
-  if (Array.isArray(value)) {
-    const items = value.map(keyOf);
-    return items.includes(UNKEYED) ? UNKEYED : ['array', ...items];
-  }
-  if (typeof (value as { toPostgres?: unknown }).toPostgres === 'function') return UNKEYED;
-  try {
-    return ['json', JSON.stringify(value)];
-  } catch {
-    return UNKEYED;
-  }
-};
-
-/**
- * The parameters as the cache key writes them, read as `toPostgresStatement` reads them: an array as positional values,
- * a plain object as named ones and any other value as the one positional value. `UNKEYED` as `keyOf` says, and for
- * named values on an object whose prototype could answer a name the statement asks for.
- */
-const parametersKeyOf = (parameters?: StorageParameters): unknown => {
-  if (parameters === undefined || parameters === null) return null;
-  if (Array.isArray(parameters)) {
-    const items = parameters.map(keyOf);
-    return items.includes(UNKEYED) ? UNKEYED : ['positional', ...items];
-  }
-  if (typeof parameters === 'object') {
-    const prototype = Object.getPrototypeOf(parameters);
-    if (prototype !== Object.prototype && prototype !== null) return UNKEYED;
-    const entries = Object.entries(parameters).map(([name, value]) => [name, keyOf(value)] as const);
-    return entries.some(([, key]) => key === UNKEYED) ? UNKEYED : ['named', ...entries];
-  }
-  const item = keyOf(parameters);
-  return item === UNKEYED ? UNKEYED : ['positional', item];
+  return { values: sent, key };
 };
 
 /** @deprecated Use `createPostgresAdapter` from `@framers/sql-storage-adapter/postgres` with the Supabase connection string. */
@@ -217,6 +286,8 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
   private maxCacheSize = 100;
   /** Moves with every `clearCache()`, so a read that was in flight across one keeps nothing. */
   private cacheGeneration = 0;
+  /** pg's `prepareValue`, from pg's main export (pg 8.15.0 and later); without it a read with parameters is not kept. */
+  private pgUtilities?: PgUtilities;
 
   async open(options?: SupabaseAdapterOptions): Promise<void> {
     this.options = options;
@@ -231,6 +302,8 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     // Dynamic import to avoid bundling pg when not needed
     const pg = await import('pg');
     const { Pool } = pg;
+    const main = ((pg as unknown as { default?: unknown }).default ?? pg) as { utils?: Partial<PgUtilities> };
+    this.pgUtilities = typeof main.utils?.prepareValue === 'function' ? (main.utils as PgUtilities) : undefined;
 
     // Browser-safe process.env access
     const getEnv = (key: string): string | undefined => {
@@ -253,6 +326,8 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       connectionTimeoutMillis: options?.poolConfig?.connectionTimeoutMillis || 5000,
       ssl: options?.ssl === false ? undefined : typeof options?.ssl === 'object' ? options.ssl : { rejectUnauthorized: false }
     });
+    // pg-pool emits an idle connection's failure on the pool, and with no listener that ends the process.
+    this.pool.on('error', warnOfIdleError);
 
     // Test connection
     try {
@@ -295,21 +370,6 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     }
   }
 
-  /**
-   * The key of an answer: the call, the statement and the parameters as pg binds them (`parametersKeyOf`), or
-   * `undefined` for parameters the key cannot write, so the read runs each time it is asked. `get` and `all` keep
-   * apart, as one answers a row and the other a list.
-   */
-  private getCacheKey(call: 'get' | 'all', query: string, params?: StorageParameters): string | undefined {
-    let bound: unknown;
-    try {
-      bound = parametersKeyOf(params);
-    } catch {
-      return undefined;
-    }
-    return bound === UNKEYED ? undefined : `${call}::${query}::${JSON.stringify(bound)}`;
-  }
-
   async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
     if (!this.pool) throw new Error('Storage adapter not opened');
 
@@ -320,7 +380,7 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
 
       return {
         changes: result.rowCount || 0,
-        lastInsertRowid: result.rows[0]?.id || 0
+        lastInsertRowid: rowsOf(result)[0]?.id || 0
       };
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
@@ -329,13 +389,21 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     }
   }
 
-  /** The key a SELECT is cached under while the cache is on; `undefined` for any other statement or with it off. */
-  private cacheKeyOf(
-    call: 'get' | 'all',
-    statement: string,
-    parameters?: StorageParameters
-  ): string | undefined {
-    return this.cacheEnabled && isSelect(statement) ? this.getCacheKey(call, statement, parameters) : undefined;
+  /**
+   * A statement for `get` or `all` as pg is sent it, with its values, and, while the cache is on and the statement is
+   * a SELECT, the key its answer is kept under. Such a read is sent the values `sentValuesOf` writes when the call is
+   * made, and its key names the call, the statement and those values, so `get` and `all` keep apart, as one answers a
+   * row and the other a list. With values pg's `prepareValue` cannot write, or without it, the read has no key and
+   * runs each time it is asked.
+   */
+  private callOf(call: 'get' | 'all', statement: string, parameters?: StorageParameters): Call {
+    const [text, values] = prepare(statement, parameters);
+    if (!this.cacheEnabled || !isSelect(statement)) return { text, values };
+    if (values.length === 0) return { text, values, cacheKey: JSON.stringify([call, text, []]) };
+    const utilities = this.pgUtilities;
+    const sent = utilities === undefined ? undefined : sentValuesOf(values, utilities);
+    if (sent === undefined) return { text, values };
+    return { text, values: sent.values, cacheKey: JSON.stringify([call, text, sent.key]) };
   }
 
   /**
@@ -343,17 +411,17 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
    * whether it wrote. PostgreSQL gives a transaction an ID when it first writes to the database
    * (https://www.postgresql.org/docs/current/transaction-id.html), and `pg_current_xact_id_if_assigned()`, PostgreSQL
    * 13's, answers NULL until then, so a SELECT that calls a function that writes, or makes a table with `INTO`, answers
-   * `wrote: true`. What it wrote commits, as it would outside the cache.
+   * `wrote: true`. What it wrote commits, as it would outside the cache. The client goes back to the pool closed when
+   * its connection failed, or when a ROLLBACK after a failure could not run, as when pg's `query_timeout` dropped it,
+   * since it could still be inside this transaction.
    */
-  private async readAndCheck(
-    pool: Pool,
-    statement: string,
-    parameters?: StorageParameters
-  ): Promise<{ rows: unknown[]; wrote: boolean }> {
+  private async readAndCheck(pool: Pool, call: Call): Promise<{ rows: unknown[]; wrote: boolean }> {
     const client = await pool.connect();
+    const watch = watchClient(client);
+    let broken: Error | undefined;
     try {
       await client.query('BEGIN');
-      const result = await client.query(...prepare(statement, parameters));
+      const result = await client.query(call.text, call.values);
       const check = await client.query<{ wrote: boolean }>(
         'SELECT pg_current_xact_id_if_assigned() IS NOT NULL AS wrote'
       );
@@ -361,12 +429,17 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       // A string of statements answers a list of results, and a COMMIT in it can end this transaction before a
       // statement after it writes in one of its own, which the check cannot see: it counts as a write.
       const several = Array.isArray(result);
-      return { rows: result.rows, wrote: several || check.rows[0]?.wrote !== false };
+      return { rows: rowsOf(result), wrote: several || check.rows[0]?.wrote !== false };
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        broken = asError(rollbackError);
+      }
       throw error;
     } finally {
-      client.release();
+      watch.stop();
+      client.release(broken ?? watch.failure());
     }
   }
 
@@ -374,15 +447,10 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
    * Runs a statement for `get` or `all`: a SELECT the cache may keep through `readAndCheck`, and any other statement,
    * or any with the cache off, as it is, taken as a write.
    */
-  private async answer(
-    pool: Pool,
-    cacheKey: string | undefined,
-    statement: string,
-    parameters?: StorageParameters
-  ): Promise<{ rows: unknown[]; wrote: boolean }> {
-    if (cacheKey !== undefined) return this.readAndCheck(pool, statement, parameters);
-    const result = await pool.query(...prepare(statement, parameters));
-    return { rows: result.rows, wrote: true };
+  private async answer(pool: Pool, call: Call): Promise<{ rows: unknown[]; wrote: boolean }> {
+    if (call.cacheKey !== undefined) return this.readAndCheck(pool, call);
+    const result = await pool.query(call.text, call.values);
+    return { rows: rowsOf(result), wrote: true };
   }
 
   /** A copy of the cached answer under the key, counted as a hit; `undefined` when the cache holds none. */
@@ -420,20 +488,23 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
   async get<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T | null> {
     if (!this.pool) throw new Error('Storage adapter not opened');
 
-    const cacheKey = this.cacheKeyOf('get', statement, parameters);
-    const cached = this.cached<T | null>(cacheKey);
-    if (cached !== undefined) return cached ?? null;
-
-    const generation = this.cacheGeneration;
     const startTime = Date.now();
     let wrote = true;
     try {
-      const outcome = await this.answer(this.pool, cacheKey, statement, parameters);
+      const call = this.callOf('get', statement, parameters);
+      const cached = this.cached<T | null>(call.cacheKey);
+      if (cached !== undefined) {
+        wrote = false;
+        return cached ?? null;
+      }
+
+      const generation = this.cacheGeneration;
+      const outcome = await this.answer(this.pool, call);
       wrote = outcome.wrote;
       this.trackQuery(statement, startTime);
 
       const value = outcome.rows[0] || null;
-      if (!wrote && value !== null) this.keep(cacheKey, generation, value);
+      if (!wrote && value !== null) this.keep(call.cacheKey, generation, value);
       return value as T;
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
@@ -445,19 +516,22 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
   async all<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T[]> {
     if (!this.pool) throw new Error('Storage adapter not opened');
 
-    const cacheKey = this.cacheKeyOf('all', statement, parameters);
-    const cached = this.cached<T[]>(cacheKey);
-    if (cached !== undefined) return cached;
-
-    const generation = this.cacheGeneration;
     const startTime = Date.now();
     let wrote = true;
     try {
-      const outcome = await this.answer(this.pool, cacheKey, statement, parameters);
+      const call = this.callOf('all', statement, parameters);
+      const cached = this.cached<T[]>(call.cacheKey);
+      if (cached !== undefined) {
+        wrote = false;
+        return cached;
+      }
+
+      const generation = this.cacheGeneration;
+      const outcome = await this.answer(this.pool, call);
       wrote = outcome.wrote;
       this.trackQuery(statement, startTime);
 
-      if (!wrote) this.keep(cacheKey, generation, outcome.rows);
+      if (!wrote) this.keep(call.cacheKey, generation, outcome.rows);
       return outcome.rows as T[];
     } catch (error) {
       throw failure(`Query failed: ${error}`, error);
@@ -480,10 +554,19 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     }
   }
 
+  /**
+   * Runs `fn` in a transaction on one pooled client: COMMIT when it resolves, ROLLBACK when it or COMMIT throws, and
+   * that error is thrown. A COMMIT that PostgreSQL answers with ROLLBACK, as it answers one when a statement in the
+   * transaction failed and `fn` went on, throws too, as nothing was written. When the ROLLBACK cannot run either, the
+   * error thrown is still the transaction's own, with the ROLLBACK's on it as `rollbackError`, and the client goes back
+   * to the pool closed, as it does when its connection failed, since it could still be inside the transaction.
+   */
   async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
     if (!this.pool) throw new Error('Storage adapter not opened');
 
     const client = await this.pool.connect();
+    const watch = watchClient(client);
+    let broken: Error | undefined;
     try {
       await client.query('BEGIN');
 
@@ -499,11 +582,11 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
         },
         get: async (stmt, params) => {
           const result = await client.query(...prepare(stmt, params));
-          return result.rows[0] || null;
+          return rowsOf(result)[0] || null;
         },
         all: async (stmt, params) => {
           const result = await client.query(...prepare(stmt, params));
-          return result.rows;
+          return rowsOf(result);
         },
         exec: async (script) => {
           await client.query(script);
@@ -512,13 +595,20 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       };
 
       const result = await fn(trxAdapter);
-      await client.query('COMMIT');
+      const committed = await client.query('COMMIT');
+      if (committed.command === 'ROLLBACK') throw rolledBackAtCommit();
       return result;
     } catch (error) {
-      await client.query('ROLLBACK');
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        broken = asError(rollbackError);
+        keepRollbackError(error, broken);
+      }
       throw error;
     } finally {
-      client.release();
+      watch.stop();
+      client.release(broken ?? watch.failure());
       // What the transaction wrote is visible from here, so nothing read before it may answer again.
       this.clearCache();
     }
@@ -552,6 +642,12 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
     }
   }
 
+  /**
+   * Writes the operations in one transaction, each under a savepoint: a failed statement aborts a PostgreSQL
+   * transaction, so a failed operation rolls back to its savepoint and the batch goes on, as the PostgreSQL adapter's
+   * batch does. The operations that succeeded commit, and the result names each one that failed by its index. An
+   * operation of a type the batch does not know writes nothing and is not counted.
+   */
   async batchWrite(operations: ExtendedBatchOperation[]): Promise<BatchResult> {
     return this.transaction(async (trx) => {
       let successful = 0;
@@ -559,46 +655,20 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       const errors: Array<{ index: number; error: Error }> = [];
 
       for (let index = 0; index < operations.length; index++) {
-        const op = operations[index];
+        const step = batchStatementOf(operations[index]);
+        if (!step) continue;
+        await trx.exec(`SAVEPOINT ${BATCH_SAVEPOINT}`);
         try {
-          switch (op.type) {
-            case 'insert': {
-              const keys = Object.keys(op.values || {});
-              const values = Object.values(op.values || {});
-              const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
-              const query = `INSERT INTO ${op.table} (${keys.join(', ')}) VALUES (${placeholders})`;
-              await trx.run(query, values);
-              successful++;
-              break;
-            }
-            case 'update': {
-              const sets = Object.keys(op.values || {}).map((k, i) => `${k} = $${i + 1}`).join(', ');
-              const whereClause = Object.keys(op.where || {})
-                .map((k, i) => `${k} = $${i + Object.keys(op.values || {}).length + 1}`)
-                .join(' AND ');
-              const query = `UPDATE ${op.table} SET ${sets} WHERE ${whereClause}`;
-              const params = [...Object.values(op.values || {}), ...Object.values(op.where || {})];
-              await trx.run(query, params);
-              successful++;
-              break;
-            }
-            case 'delete': {
-              const whereClause = Object.keys(op.where || {})
-                .map((k, i) => `${k} = $${i + 1}`)
-                .join(' AND ');
-              const query = `DELETE FROM ${op.table} WHERE ${whereClause}`;
-              await trx.run(query, Object.values(op.where || {}));
-              successful++;
-              break;
-            }
-          }
+          await trx.run(step.query, step.params);
         } catch (error: unknown) {
+          await trx.exec(`ROLLBACK TO SAVEPOINT ${BATCH_SAVEPOINT}`);
+          await trx.exec(`RELEASE SAVEPOINT ${BATCH_SAVEPOINT}`);
           failed++;
-          errors.push({ 
-            index,
-            error: error instanceof Error ? error : new Error(String(error))
-          });
+          errors.push({ index, error: asError(error) });
+          continue;
         }
+        await trx.exec(`RELEASE SAVEPOINT ${BATCH_SAVEPOINT}`);
+        successful++;
       }
 
       return { successful, failed, errors: errors.length > 0 ? errors : undefined };
@@ -684,13 +754,15 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
    * the same parameters from them, each time with a copy, so a caller that changes the row or list it was given changes
    * nothing the cache answers next. An answer holding a value with no faithful copy, such as an interval, which pg
    * parses to an object of its own, is not kept. A SELECT is a statement whose first word, past white space and
-   * comments, is SELECT; a string of several statements counts as a write. One the cache does not hold runs once, in a
-   * transaction of its own, and its answer is kept only when PostgreSQL gave that transaction no ID, which it gives a
-   * transaction when it first writes to the database: a SELECT that calls a function that writes, or makes a table with
-   * INTO, runs each time it is asked. That check reads `pg_current_xact_id_if_assigned()`, so the cache needs
-   * PostgreSQL 13 or later. Two calls share an answer only when pg binds their parameters alike, and a SELECT bound to
-   * an object with a `toPostgres` of its own, or to text holding U+0000, runs each time it is asked, as one that writes
-   * does. Every statement that writes, through `run`, `exec`, `get` or `all`, and every `transaction`, `batchWrite` and
+   * comments (a `--` comment ends at a line feed or a carriage return), is SELECT; a string of several statements
+   * counts as a write. One the cache does not hold runs once, in a transaction of its own, and its answer is kept only
+   * when PostgreSQL gave that transaction no ID, which it gives a transaction when it first writes to the database: a
+   * SELECT that calls a function that writes, or makes a table with INTO, runs each time it is asked. That check reads
+   * `pg_current_xact_id_if_assigned()`, so the cache needs PostgreSQL 13 or later. A SELECT the cache may keep is sent
+   * its values as pg's own `prepareValue` writes them when the call is made, so its answer is the answer to those values
+   * whatever the caller changes afterwards, and two calls share an answer only when they send the same statement and the
+   * same values; with pg before 8.15.0, which does not export `prepareValue`, a SELECT with parameters runs each time it
+   * is asked. Every statement that writes, through `run`, `exec`, `get` or `all`, and every `transaction`, `batchWrite` and
    * `migrate`, clears the cache when it ends, and a read that was in flight across one keeps nothing, so the cache never
    * answers a row as it stood before this adapter's own write. It cannot see a write through another adapter, pool or
    * process, an effect that writes no row, such as `pg_notify()` or an advisory lock, nor a SELECT whose answer changes
