@@ -157,6 +157,16 @@
         "default": "./dist/cjs/features/kv/index.js"
       }
     },
+    "./browser": {
+      "import": {
+        "types": "./dist/browser.d.ts",
+        "default": "./dist/browser.js"
+      },
+      "require": {
+        "types": "./dist/cjs/browser.d.ts",
+        "default": "./dist/cjs/browser.js"
+      }
+    },
     "./package.json": "./package.json"
   },
   "files": [
