@@ -123,9 +123,9 @@ export interface MutationServerOptions {
   /** The most rows one read of a pull takes (default 200). */
   pullBatchRows?: number;
   /**
-   * How long a pull's transaction may stay open, in milliseconds (default 120,000, the fetch transport's own deadline):
-   * a stream still open then is cancelled and its transaction rolled back, so a reader that stops reading cannot hold
-   * it; `Infinity` sets no limit.
+   * How long a pull may run, in milliseconds, counted from the call, its wait for a transaction included (default
+   * 120,000, the fetch transport's own deadline): a stream still open then is cancelled and its transaction rolled
+   * back, so a reader that stops reading cannot hold it; `Infinity` sets no limit.
    */
   maxPullMs?: number;
   clock?: () => Date;
