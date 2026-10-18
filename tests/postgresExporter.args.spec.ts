@@ -39,6 +39,7 @@ vi.mock('../src/exporters/pgModule.js', async (importOriginal) => {
 });
 
 import { Client as PgClient } from 'pg';
+import { ClientOfEarlierPg } from './fixtures/clientOfEarlierPg.js';
 import { PostgresExporter } from '../src/exporters/PostgresExporter.js';
 import { createStorageFeatures } from '../src/core/contracts/features.js';
 import type { StorageAdapter } from '../src/core/contracts/index.js';
@@ -620,6 +621,81 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     expect(calls[0].env.PGPASSWORD).toBe('pool-secret');
   });
 
+  // pg-pool makes each connection with the Client its options name, else its
+  // pg's, and keeps it as the pool's Client (pg-pool 3.14.0, index.js:95 and
+  // 241). A pool made with another copy of pg asks its password function as
+  // that copy asks it, so the export asks through the pool's own Client,
+  // whatever pg this library loads.
+  it("asks the password function as the pool's own Client asks it, where that Client's pg is earlier than the one this library loads", async () => {
+    pgRead.as = { version: '8.23.1', Client: PgClient };
+    const seen: Array<{ self: unknown; args: unknown[] }> = [];
+    const settings = {
+      host: 'db.example',
+      database: 'app',
+      user: 'app',
+      // Written for the pool's pg, which gives it no argument.
+      password: function (this: unknown, ...args: unknown[]) {
+        seen.push({ self: this, args });
+        return args.length === 0 && this instanceof ClientOfEarlierPg ? 'pool-secret' : 'another-secret';
+      },
+    };
+    const { exporter } = createStorageFeatures(postgresAdapter({ pool: { options: settings, Client: ClientOfEarlierPg } }));
+
+    await exporter.exportToBytes();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].args).toEqual([]);
+    expect(seen[0].self).toBeInstanceOf(ClientOfEarlierPg);
+    expect(seen[0].self).toMatchObject({ user: 'app', database: 'app', host: 'db.example', port: 5432 });
+    expect(calls[0].env.PGPASSWORD).toBe('pool-secret');
+  });
+
+  // The installed pg is 8.19.0 or later, which passes the client's
+  // ConnectionParameters.
+  it("asks the password function as the pool's own Client asks it, where this library loads an earlier pg", async () => {
+    pgRead.as = { version: '8.18.0', Client: ClientOfEarlierPg };
+    const seen: Array<{ self: unknown; args: unknown[] }> = [];
+    const settings = {
+      host: 'db.example',
+      database: 'app',
+      user: 'app',
+      password: function (this: unknown, ...args: unknown[]) {
+        seen.push({ self: this, args });
+        return 'pool-secret';
+      },
+    };
+    const { exporter } = createStorageFeatures(postgresAdapter({ pool: { options: settings, Client: PgClient } }));
+
+    await exporter.exportToBytes();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].self).toBeInstanceOf(PgClient);
+    expect(seen[0].self).not.toBeInstanceOf(ClientOfEarlierPg);
+    expect(seen[0].args).toHaveLength(1);
+    expect(seen[0].args[0]).toBe((seen[0].self as { connectionParameters: unknown }).connectionParameters);
+    expect(seen[0].args[0]).toBeInstanceOf(ConnectionParameters);
+    expect(calls[0].env.PGPASSWORD).toBe('pool-secret');
+  });
+
+  it("refuses, asking through the pool's own Client, a password function that fails or answers with no string", async () => {
+    const exporterWith = (password: () => unknown) =>
+      createStorageFeatures(
+        postgresAdapter({ pool: { options: { host: 'db.example', database: 'app', user: 'app', password }, Client: PgClient } }),
+      ).exporter;
+
+    const failed = await refusal(
+      exporterWith(async () => {
+        throw new Error('token service down');
+      }).exportToBytes(),
+    );
+    const numeric = await refusal(exporterWith(async () => 42).exportToBytes());
+
+    expect(failed?.message).toMatch(/password function of the pool failed/);
+    expect((failed as (Error & { cause?: unknown }) | null)?.cause).toMatchObject({ message: 'token service down' });
+    expect(numeric?.message).toMatch(/password function of the pool answered no string/);
+    expect(calls).toHaveLength(0);
+  });
+
   // pg's TLS is Node's, which checks the server's certificate against Node's
   // certificate authorities, and its host name, unless rejectUnauthorized is
   // false. libpq checks a certificate with verify-ca or verify-full alone, the
@@ -976,6 +1052,30 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
       'postgresql://app@db.example:5432/app?application_name=reports',
       undefined,
     ],
+    // pg reads options, application_name, fallback_application_name,
+    // client_encoding, replication and sslnegotiation of a connection string
+    // (lib/connection-parameters.js:63-124), and the certificate files
+    // (pg-connection-string index.js:88-100); libpq's other parameters it
+    // does not read. Given them, pg_dump read another password file
+    // (passfile), or refused a server, an authentication or a session the
+    // pool takes (target_session_attrs, require_auth, channel_binding,
+    // gssencmode, sslcrl).
+    [
+      'libpq parameters pg does not read, beside ones it reads',
+      'postgresql://app@db.example/app?passfile=/etc/other.pgpass&application_name=reports&target_session_attrs=read-write' +
+        '&require_auth=scram-sha-256&channel_binding=require&gssencmode=require&connect_timeout=2&keepalives=0&sslsni=0' +
+        '&sslcrl=/etc/ssl/crl.pem&options=-c%20work_mem%3D64MB&client_encoding=UTF8&fallback_application_name=app' +
+        '&replication=database',
+      'postgresql://app@db.example:5432/app?application_name=reports&options=-c%20work_mem%3D64MB&client_encoding=UTF8' +
+        '&fallback_application_name=app&replication=database',
+      undefined,
+    ],
+    [
+      'sslnegotiation=direct, which pg reads and which turns its TLS on',
+      'postgresql://app@db.example/app?sslnegotiation=direct',
+      'postgresql://app@db.example:5432/app?sslnegotiation=direct&sslmode=verify-full&sslrootcert=system',
+      undefined,
+    ],
   ])('reads the connection string of a pool as pg does, with %s', async (_name, connectionString, dbname, password) => {
     vi.stubEnv('PGUSER', 'app');
 
@@ -991,6 +1091,62 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     await poolExporter({ connectionString: 'postgresql://app@/app' }).exportToBytes();
 
     expect(dbnameOf(calls[0].args)).toBe('postgresql://app@env-host.example:5432/app');
+  });
+
+  // pg reads the port with parseInt (lib/connection-parameters.js:70), after
+  // its fallbacks: a setting that is empty or 0 gives way to PGPORT, then
+  // 5432 (val(), :9-23). A port with characters after its digits is that
+  // number to pg, and libpq refused it as no number.
+  it.each([
+    [
+      'a port parameter with characters after its digits',
+      { connectionString: 'postgresql://app@db.example/app?port=6543x' },
+      undefined,
+      'postgresql://app@db.example:6543/app',
+    ],
+    [
+      'a port setting with characters after its digits',
+      { host: 'db.example', port: '6543x', database: 'app', user: 'app' },
+      undefined,
+      'postgresql://app@db.example:6543/app',
+    ],
+    [
+      'PGPORT with characters after its digits',
+      { host: 'db.example', database: 'app', user: 'app' },
+      '6543x',
+      'postgresql://app@db.example:6543/app',
+    ],
+    [
+      'a port setting of 0, which pg reads as none',
+      { host: 'db.example', port: 0, database: 'app', user: 'app' },
+      '6432',
+      'postgresql://app@db.example:6432/app',
+    ],
+    [
+      'a port setting with a space before its digits',
+      { host: 'db.example', port: ' 6543', database: 'app', user: 'app' },
+      undefined,
+      'postgresql://app@db.example:6543/app',
+    ],
+  ])('writes the port pg reads, with %s', async (_name, settings, pgport, dbname) => {
+    if (pgport !== undefined) vi.stubEnv('PGPORT', pgport);
+
+    await poolExporter(settings).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe(dbname);
+    expect(Number(new URL(dbname).port)).toBe(new ConnectionParameters(settings).port);
+  });
+
+  // pg's parseInt reads no number in this port, and the pool makes no
+  // connection with it.
+  it('refuses a port pg reads no number in, before pg_dump starts', async () => {
+    const failure = await refusal(
+      poolExporter({ host: 'db.example', port: 'five', database: 'app', user: 'app' }).exportToBytes(),
+    );
+
+    expect(Number.isNaN(new ConnectionParameters({ port: 'five' }).port)).toBe(true);
+    expect(failure?.message).toMatch(/port/);
+    expect(calls).toHaveLength(0);
   });
 
   // pg-connection-string 2.14.1 copies the query's parameters, then sets the
@@ -1026,6 +1182,7 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     ['postgresql://[::1]:6543/app'],
     ['postgresql://app@db.example:5433/app?port=6000'],
     ['postgresql://app@db.example:5433/app?port='],
+    ['postgresql://app@db.example/app?port=6543x'],
     ['postgresql://app@db.example/app?user=other'],
     ['postgresql://%61pp@db.example/r%C3%A9ports'],
     ['socket:/var/run/postgresql?db=app'],
@@ -1060,6 +1217,29 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     await exporter.exportToBytes();
 
     expect(dbnameOf(calls[0].args)).toBe('postgresql://app@%2Fvar%2Frun%2Fpostgresql:5432/app');
+  });
+
+  // libpq reads a URI's host up to its first ':', '/', '?' or ',', unless it
+  // is in brackets, and percent-decodes it (fe-connect.c, REL_18_STABLE:
+  // conninfo_uri_parse_options, 6953-6964, and conninfo_storeval with
+  // uri_decode, 6995-6998). encodeURIComponent writes a ':' as %3A and a '%'
+  // as %25, so an IPv6 address, a zone included, reaches libpq whole.
+  it.each([
+    ['an IPv6 host setting', { host: '::1', database: 'app', user: 'app' }, 'postgresql://app@%3A%3A1:5432/app'],
+    [
+      'an IPv6 host in brackets in a connection string',
+      { connectionString: 'postgresql://app@[::1]:6543/app' },
+      'postgresql://app@%3A%3A1:6543/app',
+    ],
+    [
+      'an IPv6 host with a zone',
+      { host: 'fe80::1%eth0', database: 'app', user: 'app' },
+      'postgresql://app@fe80%3A%3A1%25eth0:5432/app',
+    ],
+  ])('writes %s so that libpq reads the whole address as the host', async (_name, settings, dbname) => {
+    await poolExporter(settings).exportToBytes();
+
+    expect(dbnameOf(calls[0].args)).toBe(dbname);
   });
 
   it('gives PGPASSWORD a password set with no user name', async () => {

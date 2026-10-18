@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import pg from 'pg';
 import { createPostgresAdapter, createStorageFeatures, type StorageAdapter } from '../src/index.js';
+import { ClientOfEarlierPg } from './fixtures/clientOfEarlierPg.js';
 
 // The feature exporter runs pg_dump against the PostgreSQL that
 // POSTGRES_TEST_URL names (CI's service); the runner has the PostgreSQL client
@@ -298,6 +299,100 @@ describe.skipIf(!POSTGRES_TEST_URL)('the PostgreSQL exporter, through pg_dump', 
     try {
       const file = path.join(dir, `${database}-no-password.dump`);
       await expect(createStorageFeatures(adapter).exporter.exportToFile(file)).rejects.toThrow(/pg_dump failed.*password/s);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg-pool makes each connection with the Client its options name (pg-pool
+  // 3.14.0, index.js:95 and 241). This pool's Client asks the password
+  // function as pg before 8.19.0 does, with no arguments, where the pg this
+  // library loads passes the client's ConnectionParameters, and the function
+  // answers the server's password to its pool's call alone. PGPASSWORD is
+  // empty, so pg_dump logs in with the function's answer or not at all.
+  it("logs pg_dump in with the password the pool's own Client asks its password function for", async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGPASSWORD', '');
+    const pool = new pg.Pool({
+      Client: ClientOfEarlierPg,
+      host: server.hostname,
+      port: Number(server.port || 5432),
+      database,
+      user: decodeURIComponent(server.username),
+      password: async function (this: unknown, ...args: unknown[]) {
+        return args.length === 0 && this instanceof ClientOfEarlierPg ? decodeURIComponent(server.password) : 'not-the-password';
+      },
+    } as pg.PoolConfig);
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE client_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-client.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.client_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg reads no passfile parameter: with no password it reads the file
+  // PGPASSFILE names, else ~/.pgpass (pgpass 1.0.5, lib/helper.js:56-58),
+  // where libpq reads the passfile parameter first. Given the parameter,
+  // pg_dump read another file than the pool, and logged in with another
+  // password.
+  it('logs pg_dump in from the password file the pool reads, past a passfile parameter pg does not read', async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    // libpq and pgpass read a password file only when no one else may read it.
+    const passwordFile = (name: string, password: string): string => {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, `*:*:*:*:${password}\n`, { mode: 0o600 });
+      return file;
+    };
+    vi.stubEnv('PGPASSWORD', undefined);
+    vi.stubEnv('PGPASSFILE', passwordFile(`${database}-read.pgpass`, decodeURIComponent(server.password)));
+    const other = passwordFile(`${database}-other.pgpass`, 'not-the-password');
+    const pool = new pg.Pool({
+      connectionString: `postgresql://${server.username}@${server.host}/${database}?passfile=${encodeURIComponent(other)}`,
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE passfile_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-passfile.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.passfile_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg reads a pool's port with parseInt (lib/connection-parameters.js:70),
+  // so 5432x is 5432 to pg, and libpq refused it as no number.
+  it('exports through a pool whose port pg reads with parseInt, where pg reaches', async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    const pool = new pg.Pool({
+      host: server.hostname,
+      port: `${server.port || 5432}x` as unknown as number,
+      database,
+      user: decodeURIComponent(server.username),
+      password: decodeURIComponent(server.password),
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE port_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-port.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.port_items']);
     } finally {
       await adapter.close();
       await pool.end();
