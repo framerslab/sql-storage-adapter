@@ -304,7 +304,8 @@ const tlsSettingsBeyondSslmode = (ssl: unknown): string[] =>
  * Reads connection settings as pg reads them for each connection of a pool: a connection string's parts over the
  * settings', then the environment, then pg's defaults. Undefined where pg cannot read the connection string.
  *
- * @throws {Error} When the settings ask for TLS options libpq takes only from files.
+ * @throws {Error} When the settings ask for TLS options libpq takes only from files, or the connection string for
+ *   `verify-ca` read as libpq reads it with no root certificate, which pg refuses.
  */
 const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnection | undefined => {
   let user = settings.user;
@@ -338,11 +339,17 @@ const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnectio
       ssl = fromString;
       source = 'string';
       const sslmode = last('sslmode');
+      const compatible = last('uselibpqcompat') === 'true';
       rootCertificateNamed = Boolean(last('sslrootcert'));
-      hostNameChecked = !(
-        last('uselibpqcompat') === 'true' &&
-        (sslmode === 'verify-ca' || (sslmode === 'require' && rootCertificateNamed))
-      );
+      // pg refuses verify-ca read as libpq reads it with no root certificate to check the server against
+      // (pg-connection-string index.js:125-130), so the pool makes no connection, and pg_dump makes none either.
+      if (compatible && sslmode === 'verify-ca' && !rootCertificateNamed) {
+        throw new Error(
+          'PostgresExporter: the connection string asks for sslmode=verify-ca with uselibpqcompat=true and names no ' +
+            'sslrootcert, which pg refuses, so pg_dump does not connect either.',
+        );
+      }
+      hostNameChecked = !(compatible && (sslmode === 'verify-ca' || (sslmode === 'require' && rootCertificateNamed)));
     }
     for (const [key, value] of parsed.parameters) {
       if (LIBPQ_PARAMETERS.has(key)) parameters.push([key, value]);
@@ -462,7 +469,8 @@ const passwordOf = async (connection: PgConnection, settings: PgConnectionSettin
  * connection string pg cannot read as a URL (a keyword=value string) is given back as it is. Undefined when the
  * settings name no database pg would reach.
  *
- * @throws {Error} When the settings ask for TLS that pg_dump cannot take, or the password function fails.
+ * @throws {Error} When the settings ask for TLS that pg_dump cannot take or that pg refuses, or the password function
+ *   fails.
  */
 export const libpqConnectionStringOf = async (settings: PgConnectionSettings): Promise<string | undefined> => {
   const { connectionString } = settings;

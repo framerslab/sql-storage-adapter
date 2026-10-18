@@ -26,6 +26,18 @@ export interface PgDumpInvocation {
 const MAX_DUMP_BYTES = 256 * 1024 * 1024;
 
 /**
+ * What libpq older than PostgreSQL 16 says of `sslrootcert=system`: it looks for a file of that name
+ * (fe-secure-openssl.c, initialize_SSL), where libpq 16 and later read the system's certificate authorities.
+ */
+const NO_SYSTEM_ROOTS = /root certificate file "system" does not exist/;
+
+/** What to do where pg_dump's libpq reads `sslrootcert=system` as a file. */
+const SYSTEM_ROOTS_ADVICE =
+  " libpq reads sslrootcert=system as the system's certificate authorities from PostgreSQL 16 on, and an older " +
+  'libpq looks for a file named system: run a pg_dump of PostgreSQL 16 or later, or name the root certificate file ' +
+  "in the connection string's sslrootcert parameter or in PGSSLROOTCERT.";
+
+/**
  * The scheme of a connection URI, at the very start. libpq knows it in lower
  * case alone; pg, which the adapter connects with, reads it in any case. So it
  * is read in any case here and written in lower case for pg_dump.
@@ -311,9 +323,10 @@ export class PostgresExporter implements IDatabaseExporter {
         // pg_dump's own words. The error's message repeats the command
         // line, which can hold a password, so it is left out.
         const said = stderr ? stderr.toString('utf8').trim() : '';
+        const advice = NO_SYSTEM_ROOTS.test(said) ? SYSTEM_ROOTS_ADVICE : '';
         reject(
           new Error(
-            `PostgresExporter: pg_dump failed${typeof code === 'number' ? ` (exit code ${code})` : ''}${said ? `: ${said}` : '.'}`,
+            `PostgresExporter: pg_dump failed${typeof code === 'number' ? ` (exit code ${code})` : ''}${said ? `: ${said}` : '.'}${advice}`,
           ),
         );
       });
