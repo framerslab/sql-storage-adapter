@@ -29,6 +29,7 @@ The SQL Storage Adapter provides a single, ergonomic interface over SQLite (nati
 - [Adapter Matrix](#adapter-matrix)
 - [Electron Adapter](#electron-adapter)
 - [Cross-Platform Sync](#cross-platform-sync)
+- [Mutation Sync](#mutation-sync)
 - [Configuration & Resolution](#configuration--resolution)
 - [Segments](#segments)
 - [A PostgreSQL Pool of Your Own](#a-postgresql-pool-of-your-own)
@@ -95,7 +96,7 @@ import { createStorageFeatures, runSchemaMigrations, isUniqueViolation } from '@
 | `./backup` | S3-compatible backups (`@aws-sdk/client-s3`) |
 | `./authjs` | The Auth.js database adapter (also in `./core`) |
 | `./electron`, `./electron/renderer`, `./electron/preload` | The Electron adapters. `./electron/renderer` holds only what a window uses; `require('./electron/preload')` gives one bundled CommonJS file for a sandboxed preload |
-| `./sync`, `./kv`, `./types` | Cross-platform sync, the key-value store, the types |
+| `./sync`, `./kv`, `./types` | Cross-platform sync and the mutation sync, the key-value store, the types |
 | `./browser` | What a page needs, in one entry: the IndexedDB adapter, the key-value module with its migration, the tab lock, and the mutation sync's client with its wire contract, transport, loop and change channel. Its modules import no Node built-in and no pg: the one package they import is sql.js |
 
 Every entry has an `import` and a `require` condition. The CommonJS build under `dist/cjs` is made from the ES module build file by file, so a class has one identity whichever entry a caller takes it from. It carries its own declarations, so a CommonJS TypeScript consumer under `node16` resolution type-checks against them. CI packs the package, installs it in a new project and checks each of these: `require()` of every entry, what each server entry and `./browser` bundle, and the preload.
@@ -262,6 +263,10 @@ await sync.connect();
 | `remote-wins` | Remote changes always take priority |
 | `merge` | Field-level merge with custom mergers |
 | `manual` | Defer to UI hook for user decision |
+
+## Mutation Sync
+
+`@framers/sql-storage-adapter/sync` also holds a mutation sync for named text rows that a server and many browsers keep the same. A browser saves its rows with the mutations that make them in one transaction of its own database and never waits on the network. The server runs every client's mutations in one order, each push in one transaction that records the client's last mutation id, so a push sent again applies nothing twice, and settles each conflict by that order, keeping a differing value as a copy whose id every side derives alike. A pull streams the server's changes from one snapshot, and the browser replays what the server has not answered over them with the same functions the server runs. The protocol also recovers a browser after a restore of the server's database, keeps a value the server cannot read in the browser that has it, and checks that the server holds every row before a browser removes its own. The server's half (`MutationServer` over your own tables or the reference `createSqlMutationStore`, and `DrainGate`) is in `./sync`; the client's half (`MutationClient`, `createFetchMutationTransport`, `SyncLoop` and `createTabLock`) is in `./sync` and `./browser`. See [**guides/MUTATION_SYNC.md**](./guides/MUTATION_SYNC.md) for both halves, with an example server, its routes and a page.
 
 ## Configuration & Resolution
 
@@ -693,7 +698,7 @@ await kv.set('notes/1', { title: 'One', saved: new Date() });
 const mine = namespaced(kv, 'user-42/');
 
 // In one IndexedDB object store, where a page already keeps its values
-const page = await openIndexedDbStore({ dbName: 'sayshere', storeName: 'kv' });
+const page = await openIndexedDbStore({ dbName: 'app', storeName: 'kv' });
 ```
 
 `KeyValueStore` has `get`, `set`, `delete`, `keys(prefix)` and `deletePrefix(prefix)`, and `memoryOnly`, true when nothing outlives the page or the process. `namespaced(store, prefix)` scopes a store to a prefix: end each prefix with a character no id holds (`ann/`, `anna/`), since the keys under `anna` are among those under `ann`.
