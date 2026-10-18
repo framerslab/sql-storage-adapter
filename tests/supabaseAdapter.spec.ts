@@ -1,4 +1,5 @@
 import { runInNewContext } from 'node:vm';
+import pg from 'pg';
 import { describe, expect, it, afterAll, beforeAll } from 'vitest';
 import { SupabaseAdapter, isUniqueViolation, setStorageLogger, type StorageLogger } from '../src/index.js';
 
@@ -12,6 +13,11 @@ import { SupabaseAdapter, isUniqueViolation, setStorageLogger, type StorageLogge
 
 const POSTGRES_TEST_URL = process.env.POSTGRES_TEST_URL;
 
+/** A name no other run of this suite uses. */
+const unique = (prefix: string): string => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
+
+const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
   const table = `supabase_${Math.random().toString(36).slice(2, 8)}`;
   const lines: Array<{ fields: Record<string, unknown>; message: string }> = [];
@@ -21,16 +27,57 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
     error: () => undefined,
   };
   let db: SupabaseAdapter;
+  /** An adapter with its cache always off, which reads and ends other sessions for the specs that need it. */
+  let admin: SupabaseAdapter;
+  /** The adapters the specs opened, closed after the suite. */
+  const opened: SupabaseAdapter[] = [];
+
+  /** An adapter of a spec's own, with its cache on when asked, on the test server or at `url`. */
+  const openAdapter = async (options: { cache?: boolean; url?: string } = {}): Promise<SupabaseAdapter> => {
+    const adapter = new SupabaseAdapter();
+    await adapter.open({ connectionString: options.url ?? POSTGRES_TEST_URL, ssl: false });
+    opened.push(adapter);
+    if (options.cache) adapter.enableCache();
+    return adapter;
+  };
+
+  /** Ends, from `admin`, the server session that is running a statement holding `marker`, once it shows. */
+  const endSessionRunning = async (marker: string): Promise<void> => {
+    const started = Date.now();
+    while (Date.now() - started < 5_000) {
+      const row = await admin.get<{ pid: number }>(
+        "SELECT pid FROM pg_stat_activity WHERE state = 'active' AND query LIKE ? AND pid <> pg_backend_pid()",
+        [`%${marker}%`],
+      );
+      if (row) {
+        await admin.get('SELECT pg_terminate_backend(?) AS ended', [row.pid]);
+        return;
+      }
+      await pause(25);
+    }
+    throw new Error(`no session ran ${marker}`);
+  };
+
+  /** A URL of the test server whose sessions give up on a query after `ms` milliseconds (pg's query_timeout). */
+  const timingOutAfter = (ms: number): string => {
+    const url = new URL(POSTGRES_TEST_URL as string);
+    url.searchParams.set('query_timeout', String(ms));
+    return url.toString();
+  };
 
   beforeAll(async () => {
     setStorageLogger(logger);
     db = new SupabaseAdapter();
     await db.open({ connectionString: POSTGRES_TEST_URL, ssl: false });
     await db.exec(`CREATE TABLE ${table} (id INTEGER PRIMARY KEY, label TEXT NOT NULL)`);
+    admin = new SupabaseAdapter();
+    await admin.open({ connectionString: POSTGRES_TEST_URL, ssl: false });
   });
 
   afterAll(async () => {
+    for (const adapter of opened.splice(0)) await adapter.close().catch(() => undefined);
     await db.exec(`DROP TABLE IF EXISTS ${table}`).catch(() => undefined);
+    await admin.close().catch(() => undefined);
     await db.close();
     setStorageLogger(null);
   });
@@ -71,6 +118,90 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
     expect(isUniqueViolation(error)).toBe(true);
     expect(String((error as Error).message)).toMatch(/^Query failed: /);
   });
+
+  it('commits the operations of a batch that succeed, and reports the one that fails', async () => {
+    // A failed statement aborts a PostgreSQL transaction: without a savepoint each operation after it failed too,
+    // and the COMMIT rolled everything back while the result said one operation was written.
+    await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [40, 'taken']);
+    const result = await db.batchWrite([
+      { statement: '', type: 'insert', table, values: { id: 41, label: 'before' } },
+      { statement: '', type: 'insert', table, values: { id: 40, label: 'duplicate' } },
+      { statement: '', type: 'insert', table, values: { id: 42, label: 'after' } },
+    ]);
+
+    expect(result.successful).toBe(2);
+    expect(result.failed).toBe(1);
+    expect(result.errors?.map(({ index }) => index)).toEqual([1]);
+    expect(isUniqueViolation(result.errors?.[0]?.error)).toBe(true);
+    expect(await db.all(`SELECT id, label FROM ${table} WHERE id IN (?, ?, ?) ORDER BY id`, [40, 41, 42])).toEqual([
+      { id: 40, label: 'taken' },
+      { id: 41, label: 'before' },
+      { id: 42, label: 'after' },
+    ]);
+  });
+
+  it('rejects a transaction that PostgreSQL rolled back at its COMMIT, as a statement in it failed', async () => {
+    // The callback caught the duplicate's error and went on. PostgreSQL answers the COMMIT of an aborted
+    // transaction with ROLLBACK and no error, so the transaction resolved with nothing written.
+    const outcome = await db
+      .transaction(async (trx) => {
+        await trx.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [43, 'first']);
+        await trx.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [43, 'again']).catch(() => undefined);
+        return 'committed';
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(outcome).toBeInstanceOf(Error);
+    expect(String((outcome as Error).message)).toMatch(/rolled back/i);
+    expect(await db.get(`SELECT label FROM ${table} WHERE id = ?`, [43])).toBeNull();
+    expect(await db.transaction(async (trx) => trx.get<{ one: number }>('SELECT 1 AS one'))).toEqual({ one: 1 });
+  });
+
+  it("rejects a transaction whose session the server ends while it runs, with the statement's own error", async () => {
+    const victim = await openAdapter();
+    const marker = unique('ended_transaction');
+    const running = victim
+      .transaction(async (trx) => trx.get(`SELECT pg_sleep(5) AS slept, '${marker}' AS marker`))
+      .catch((caught: unknown) => caught);
+    await endSessionRunning(marker);
+    const outcome = await running;
+
+    // The ROLLBACK after it cannot run on the ended session; its error is not the one thrown. 57P01 is
+    // PostgreSQL's admin_shutdown, what pg_terminate_backend ends a session with.
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as { code?: string }).code).toBe('57P01');
+    expect(await victim.get('SELECT 1 AS one')).toEqual({ one: 1 });
+  }, 15_000);
+
+  it('carries on when the server ends one of its idle sessions', async () => {
+    const victim = await openAdapter();
+    const pid = (await victim.get<{ pid: number }>('SELECT pg_backend_pid() AS pid'))?.pid;
+    await admin.get('SELECT pg_terminate_backend(?) AS ended', [pid]);
+    const started = Date.now();
+    while (victim.getPoolStatus().active + victim.getPoolStatus().idle > 0 && Date.now() - started < 5_000) {
+      await pause(25);
+    }
+
+    expect(victim.getPoolStatus().idle).toBe(0);
+    expect(await victim.get('SELECT 2 AS two')).toEqual({ two: 2 });
+    expect(lines.some((line) => /idle connection/i.test(line.message))).toBe(true);
+  }, 15_000);
+
+  it("gives up a transaction's session whose ROLLBACK could not run, so the next statement commits", async () => {
+    // pg's query_timeout rejects a query it gave up on while the server still runs it, and drops a query queued
+    // behind it. The ROLLBACK after the timed-out statement was such a query: the session went back to the pool
+    // inside its transaction, and the next statement ran there and never committed.
+    const victim = await openAdapter({ url: timingOutAfter(500) });
+    await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [44, 'before']);
+    const outcome = await victim
+      .transaction(async (trx) => trx.get('SELECT pg_sleep(1.5) AS slept'))
+      .catch((caught: unknown) => caught);
+    expect(String((outcome as Error).message)).toMatch(/timeout/i);
+
+    await pause(1_500);
+    await victim.run(`UPDATE ${table} SET label = ? WHERE id = ?`, ['after', 44]);
+    expect(await admin.get(`SELECT label FROM ${table} WHERE id = ?`, [44])).toEqual({ label: 'after' });
+  }, 15_000);
 
   // enableCache() keeps the answers of plain reads. A row it answers must be the row as this adapter's
   // own last write left it, and a statement that writes must run each time it is asked.
@@ -321,5 +452,105 @@ describe.skipIf(!POSTGRES_TEST_URL)('SupabaseAdapter', () => {
       expect(await pending).toEqual({ label: 'before' });
       expect(await db.get(slow, [13])).toEqual({ label: 'after' });
     });
+
+    it('binds and keys each parameter as it was when the call was made, whatever the caller changes after', async () => {
+      // A read the cache may keep runs on a client of its own, which it waits for: the values it was given are bound
+      // then, and the caller may have changed them by that time.
+      await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?), (?, ?)`, [21, 'twenty-one', 22, 'twenty-two']);
+
+      const byId = `SELECT label FROM ${table} WHERE id = ?`;
+      const positional = [21];
+      const first = db.get(byId, positional);
+      positional[0] = 22;
+      expect(await first).toEqual({ label: 'twenty-one' });
+      expect(await db.get(byId, [21])).toEqual({ label: 'twenty-one' });
+      expect(await db.get(byId, [22])).toEqual({ label: 'twenty-two' });
+
+      const byName = `SELECT label AS named FROM ${table} WHERE id = @id`;
+      const named = { id: 21 };
+      const second = db.get(byName, named);
+      named.id = 22;
+      expect(await second).toEqual({ named: 'twenty-one' });
+      expect(await db.get(byName, { id: 21 })).toEqual({ named: 'twenty-one' });
+
+      const byDocument = `SELECT label AS from_document FROM ${table} WHERE id = (?::jsonb ->> 'id')::int`;
+      const document = { id: 21 };
+      const third = db.all(byDocument, [document]);
+      document.id = 22;
+      expect(await third).toEqual([{ from_document: 'twenty-one' }]);
+      expect(await db.all(byDocument, [{ id: 21 }])).toEqual([{ from_document: 'twenty-one' }]);
+    });
+
+    it('keys named parameters by the values bound for them, own or inherited, enumerable or not', async () => {
+      await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?), (?, ?)`, [23, 'twenty-three', 24, 'twenty-four']);
+      const byName = `SELECT label AS hidden FROM ${table} WHERE id = @id`;
+      expect(await db.get(byName, Object.defineProperty({}, 'id', { value: 23 }))).toEqual({ hidden: 'twenty-three' });
+      expect(await db.get(byName, Object.defineProperty({}, 'id', { value: 24 }))).toEqual({ hidden: 'twenty-four' });
+
+      // A name the object inherits is bound as well: from a plain object, Object.prototype's constructor.
+      const shown = 'SELECT @constructor::text AS shown';
+      expect((await db.get<{ shown: string | null }>(shown, {}))?.shown).toMatch(/function Object/);
+      expect(await db.get(shown, Object.create(null))).toEqual({ shown: null });
+    });
+
+    it('keys a Date by the text pg binds for it when the call is made, which the time zone and pg.defaults decide', async () => {
+      const shown = 'SELECT ?::text AS shown';
+      const at = new Date(Date.UTC(2026, 0, 1));
+      const zone = process.env.TZ;
+      const asUtc = pg.defaults.parseInputDatesAsUTC;
+      try {
+        process.env.TZ = 'America/New_York';
+        pg.defaults.parseInputDatesAsUTC = false;
+        expect(await db.get(shown, [at])).toEqual({ shown: '2025-12-31T19:00:00.000-05:00' });
+        pg.defaults.parseInputDatesAsUTC = true;
+        expect(await db.get(shown, [at])).toEqual({ shown: '2026-01-01T00:00:00.000+00:00' });
+      } finally {
+        if (zone === undefined) delete process.env.TZ;
+        else process.env.TZ = zone;
+        pg.defaults.parseInputDatesAsUTC = asUtc;
+      }
+    });
+
+    it('reads a carriage return as the end of a -- comment, as PostgreSQL does', async () => {
+      // PostgreSQL ends a -- comment at \r as well as \n: this statement is the VALUES, which begins with a word
+      // other than SELECT and so runs each time. nextval() gives no transaction ID on most calls.
+      const ids = unique(`${table}_ids`);
+      await db.exec(`CREATE SEQUENCE ${ids}`);
+      try {
+        const next = `-- the next id\rVALUES (nextval('${ids}')) /*\nSELECT */`;
+        const drawn: number[] = [];
+        for (let call = 0; call < 5; call += 1) {
+          drawn.push(Number((await db.get<{ column1: string }>(next))?.column1));
+        }
+        expect(drawn).toEqual([1, 2, 3, 4, 5]);
+      } finally {
+        await db.exec(`DROP SEQUENCE ${ids}`);
+      }
+    });
+
+    it('rejects a read whose session the server ends while the read runs, and the process carries on', async () => {
+      const victim = await openAdapter({ cache: true });
+      const marker = unique('ended_read');
+      const reading = victim
+        .get(`SELECT pg_sleep(5) AS slept, '${marker}' AS marker`)
+        .catch((caught: unknown) => caught);
+      await endSessionRunning(marker);
+      const outcome = await reading;
+
+      expect(String((outcome as Error).message)).toMatch(/^Query failed: /);
+      expect((outcome as { code?: string }).code).toBe('57P01');
+      expect(await victim.get('SELECT 1 AS one')).toEqual({ one: 1 });
+    }, 15_000);
+
+    it('gives up a session whose cached read timed out, so the next statement does not run in its transaction', async () => {
+      const victim = await openAdapter({ cache: true, url: timingOutAfter(500) });
+      await db.run(`INSERT INTO ${table} (id, label) VALUES (?, ?)`, [25, 'before']);
+      const outcome = await victim.get('SELECT pg_sleep(1.5) AS slept').catch((caught: unknown) => caught);
+      expect(String((outcome as Error).message)).toMatch(/timeout/i);
+
+      await pause(1_500);
+      await victim.run(`UPDATE ${table} SET label = ? WHERE id = ?`, ['after', 25]);
+      expect(await admin.get(`SELECT label FROM ${table} WHERE id = ?`, [25])).toEqual({ label: 'after' });
+    }, 15_000);
   });
 });

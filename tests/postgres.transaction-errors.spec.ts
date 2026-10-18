@@ -159,4 +159,29 @@ describe.skipIf(!POSTGRES_TEST_URL)('PostgresAdapter when a transaction connecti
 
     expect(await other.all(`SELECT id FROM ${table} WHERE id = 20`)).toEqual([]);
   });
+
+  it('rejects a transaction that PostgreSQL rolled back at its COMMIT, as a statement in it failed', async () => {
+    // Each callback caught the duplicate's error and went on. PostgreSQL answers the COMMIT of an aborted
+    // transaction with ROLLBACK and no error, so the transaction resolved with nothing written.
+    const adapter = await openAdapter(1);
+    await other.run(`INSERT INTO ${table} (id, label) VALUES (30, 'taken')`);
+    const swallowing = async (trx: StorageAdapter, id: number): Promise<string> => {
+      await trx.run(`INSERT INTO ${table} (id, label) VALUES ($1, 'first')`, [id]);
+      await trx.run(`INSERT INTO ${table} (id, label) VALUES (30, 'again')`).catch(() => undefined);
+      return 'committed';
+    };
+
+    const outcome = await adapter.transaction((trx) => swallowing(trx, 31)).catch((caught: unknown) => caught);
+    expect(outcome).toBeInstanceOf(Error);
+    expect(String((outcome as Error).message)).toMatch(/rolled back/i);
+
+    const held = await adapter
+      .withConnection((connection) => connection.transaction((trx) => swallowing(trx, 32)))
+      .catch((caught: unknown) => caught);
+    expect(held).toBeInstanceOf(Error);
+    expect(String((held as Error).message)).toMatch(/rolled back/i);
+
+    expect(await other.all(`SELECT id FROM ${table} WHERE id IN (31, 32)`)).toEqual([]);
+    expect(await adapter.transaction(async (trx) => trx.get<{ one: number }>('SELECT 1 AS one'))).toEqual({ one: 1 });
+  });
 });
