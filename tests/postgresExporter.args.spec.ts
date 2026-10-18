@@ -320,7 +320,7 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     // pg reads these where the settings leave a value out, and takes the user
     // name from the operating system's; each spec that needs one sets it.
     // They are removed, not emptied: libpq refuses an empty PGSSLMODE.
-    for (const name of ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD', 'PGSSLMODE', 'USER', 'USERNAME']) {
+    for (const name of ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD', 'PGSSLMODE', 'PGSSLROOTCERT', 'USER', 'USERNAME']) {
       vi.stubEnv(name, undefined);
     }
     pgRead.as = null;
@@ -586,23 +586,58 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     expect(calls[0].env.PGPASSWORD).toBe('pool-secret');
   });
 
+  // pg's TLS is Node's, which checks the server's certificate against Node's
+  // certificate authorities, and its host name, unless rejectUnauthorized is
+  // false. libpq checks a certificate with verify-ca or verify-full alone, the
+  // host name with verify-full alone, and against a root certificate file or
+  // the system's (sslrootcert=system, libpq 16 and later); its require checks
+  // nothing without a root certificate file (fe-secure-openssl.c).
   it.each([
     ['ssl: true', true],
-    ['rejectUnauthorized: false', { rejectUnauthorized: false }],
     ['an empty ssl object', {}],
-  ])('asks pg_dump for TLS where the pool uses it, with %s', async (_name, ssl) => {
+    ['rejectUnauthorized: true', { rejectUnauthorized: true }],
+  ])("has pg_dump check the server's certificate and host name, as pg does, with %s", async (_name, ssl) => {
     await poolExporter({ host: 'db.example', database: 'app', user: 'app', ssl }).exportToBytes();
 
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=require');
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=verify-full&sslrootcert=system');
   });
 
-  it('keeps a PGSSLMODE that checks the server, where the pool asks for TLS', async () => {
-    vi.stubEnv('PGSSLMODE', 'verify-full');
+  // libpq reads PGSSLMODE where the URI names no sslmode; pg reads none once
+  // the settings set ssl.
+  it.each(['verify-full', 'verify-ca', 'require', 'prefer'])(
+    'has pg_dump check the server as pg does over a PGSSLMODE of %s, where the pool asks for TLS',
+    async (sslmode) => {
+      vi.stubEnv('PGSSLMODE', sslmode);
+
+      await poolExporter({ host: 'db.example', database: 'app', user: 'app', ssl: true }).exportToBytes();
+
+      expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=verify-full&sslrootcert=system');
+    },
+  );
+
+  // pg reads PGSSLMODE prefer, require, verify-ca and verify-full as ssl: true
+  // where the settings set no ssl (lib/connection-parameters.js,
+  // readSSLConfigFromEnvironment), and Node's TLS then checks the server.
+  it.each(['prefer', 'require', 'verify-ca', 'verify-full'])(
+    'has pg_dump check the server as pg does for a PGSSLMODE of %s, where the pool sets no ssl',
+    async (sslmode) => {
+      vi.stubEnv('PGSSLMODE', sslmode);
+
+      await poolExporter({ host: 'db.example', database: 'app', user: 'app' }).exportToBytes();
+
+      expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=verify-full&sslrootcert=system');
+    },
+  );
+
+  // PGSSLROOTCERT is libpq's alone: where it names a file, libpq checks the
+  // server against it, as psql does.
+  it('leaves the root certificate to PGSSLROOTCERT where it names one', async () => {
+    vi.stubEnv('PGSSLROOTCERT', '/etc/ssl/private-ca.pem');
 
     await poolExporter({ host: 'db.example', database: 'app', user: 'app', ssl: true }).exportToBytes();
 
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app');
-    expect(calls[0].env.PGSSLMODE).toBe('verify-full');
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=verify-full');
+    expect(calls[0].env.PGSSLROOTCERT).toBe('/etc/ssl/private-ca.pem');
   });
 
   // pg_dump reads TLS material from files alone, and sslmode=require in their
@@ -666,8 +701,9 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
       { connectionString: 'postgresql://app@db.example/app?uselibpqcompat=true&sslmode=prefer' },
       'verify-full',
     ],
+    ['rejectUnauthorized: false, with no PGSSLMODE', { ssl: { rejectUnauthorized: false } }, undefined],
   ])('asks pg_dump for TLS that checks no certificate where the pool checks none, with %s', async (_name, settings, sslmode) => {
-    vi.stubEnv('PGSSLMODE', sslmode);
+    if (sslmode !== undefined) vi.stubEnv('PGSSLMODE', sslmode);
 
     await poolExporter({ host: 'db.example', database: 'app', user: 'app', ...settings }).exportToBytes();
 
@@ -718,12 +754,14 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     await poolExporter({ connectionString: 'postgresql://app@db.example/app', ssl: { rejectUnauthorized: false } }).exportToBytes();
     expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=require');
 
+    // The string's sslmode makes pg's ssl anew, without the settings' ca
+    // (pg-connection-string index.js:77-79): Node's own authorities check it.
     calls.length = 0;
     await poolExporter({
       connectionString: 'postgresql://app@db.example/app?sslmode=verify-full',
       ssl: { ca: 'CA PEM' },
     }).exportToBytes();
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=verify-full');
+    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=verify-full&sslrootcert=system');
   });
 
   // pg reads a pool's connection string as a WHATWG URL (pg-connection-string),
@@ -748,7 +786,42 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     ['a fragment, which pg drops', 'postgresql://app@db.example/app#note', 'postgresql://app@db.example:5432/app', undefined],
     ['a % that starts no escape, which pg reads as itself', 'postgresql://app:50%off@db.example/app', 'postgresql://app@db.example:5432/app', '50%off'],
     ["pg's sslmode=no-verify, libpq's require", 'postgresql://app@db.example/app?sslmode=no-verify', 'postgresql://app@db.example:5432/app?sslmode=require', undefined],
-    ["pg's ssl=1", 'postgresql://app@db.example/app?ssl=1', 'postgresql://app@db.example:5432/app?sslmode=require', undefined],
+    ["pg's ssl=1", 'postgresql://app@db.example/app?ssl=1', 'postgresql://app@db.example:5432/app?sslmode=verify-full&sslrootcert=system', undefined],
+    // Without uselibpqcompat=true, pg-connection-string makes ssl {} of
+    // require, verify-ca and verify-full alike (index.js:139-152), and Node's
+    // TLS checks the certificate and the host name.
+    [
+      'sslmode=require, which pg reads as a check of the server',
+      'postgresql://app@db.example/app?sslmode=require',
+      'postgresql://app@db.example:5432/app?sslmode=verify-full&sslrootcert=system',
+      undefined,
+    ],
+    [
+      'sslmode=verify-ca, which pg reads as a check of the host name too',
+      'postgresql://app@db.example/app?sslmode=verify-ca',
+      'postgresql://app@db.example:5432/app?sslmode=verify-full&sslrootcert=system',
+      undefined,
+    ],
+    // With uselibpqcompat=true, verify-ca, and require beside a root
+    // certificate, check the certificate and no host name (index.js:116-133).
+    [
+      'uselibpqcompat=true with verify-ca and a root certificate',
+      'postgresql://app@db.example/app?uselibpqcompat=true&sslmode=verify-ca&sslrootcert=/etc/ssl/ca.pem',
+      'postgresql://app@db.example:5432/app?sslrootcert=%2Fetc%2Fssl%2Fca.pem&sslmode=verify-ca',
+      undefined,
+    ],
+    [
+      'uselibpqcompat=true with require beside a root certificate',
+      'postgresql://app@db.example/app?uselibpqcompat=true&sslmode=require&sslrootcert=/etc/ssl/ca.pem',
+      'postgresql://app@db.example:5432/app?sslrootcert=%2Fetc%2Fssl%2Fca.pem&sslmode=verify-ca',
+      undefined,
+    ],
+    [
+      'uselibpqcompat=true with verify-full and a root certificate',
+      'postgresql://app@db.example/app?uselibpqcompat=true&sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem',
+      'postgresql://app@db.example:5432/app?sslrootcert=%2Fetc%2Fssl%2Fca.pem&sslmode=verify-full',
+      undefined,
+    ],
     ["pg's ssl=0", 'postgresql://app@db.example/app?ssl=0', 'postgresql://app@db.example:5432/app?sslmode=disable', undefined],
     [
       "pg's uselibpqcompat and statement_timeout, which libpq does not know",
@@ -757,9 +830,9 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
       undefined,
     ],
     [
-      'a certificate file, which turns pg\'s TLS on',
+      'a certificate file, which turns pg\'s TLS on and is what it checks the server against',
       'postgresql://app@db.example/app?sslrootcert=/etc/ssl/ca.pem',
-      'postgresql://app@db.example:5432/app?sslrootcert=%2Fetc%2Fssl%2Fca.pem&sslmode=require',
+      'postgresql://app@db.example:5432/app?sslrootcert=%2Fetc%2Fssl%2Fca.pem&sslmode=verify-full',
       undefined,
     ],
     // pg-connection-string turns TLS on for a certificate file over ssl=0
@@ -767,14 +840,14 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
     [
       "pg's ssl=0 beside a certificate file, which turns pg's TLS on again",
       'postgresql://app@db.example/app?ssl=0&sslrootcert=/etc/ssl/ca.pem',
-      'postgresql://app@db.example:5432/app?sslrootcert=%2Fetc%2Fssl%2Fca.pem&sslmode=require',
+      'postgresql://app@db.example:5432/app?sslrootcert=%2Fetc%2Fssl%2Fca.pem&sslmode=verify-full',
       undefined,
     ],
     // pg uses TLS for any sslmode but disable; libpq refuses one it does not know.
     [
-      'an sslmode libpq does not know, with which pg uses TLS',
+      'an sslmode libpq does not know, with which pg uses TLS that checks the server',
       'postgresql://app@db.example/app?sslmode=sometimes',
-      'postgresql://app@db.example:5432/app?sslmode=require',
+      'postgresql://app@db.example:5432/app?sslmode=verify-full&sslrootcert=system',
       undefined,
     ],
     // pg decodes the URL's user name only where no user parameter is given.
