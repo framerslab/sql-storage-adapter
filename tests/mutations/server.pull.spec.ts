@@ -71,7 +71,9 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('the 
 
   it('cancels a stream whose reader stops reading once maxPullMs has passed, and its transaction ends', async () => {
     await rows(w, 5);
-    const server = new MutationServer({ ...w.options, maxPullMs: 50 });
+    // the deadline counts from the call, so it leaves a slow start of the transaction room to hand over the first chunk,
+    // and the wait for the end below stays well past it
+    const server = new MutationServer({ ...w.options, maxPullMs: 500 });
     const opening = await server.pull(w.context(), pullOf(w, A));
     if (opening.kind !== 'stream') throw new Error('no stream');
     const chunks = opening.chunks[Symbol.asyncIterator]();
