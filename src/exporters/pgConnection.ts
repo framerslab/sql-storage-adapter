@@ -16,6 +16,9 @@
  * @module sql-storage-adapter/exporters/pgConnection
  */
 
+import { getStorageLogger } from '../shared/logger.js';
+import { loadPg } from './pgModule.js';
+
 /** Connection settings, as the Postgres adapter's options and a pg `Pool`'s `options` hold them. */
 export interface PgConnectionSettings {
   connectionString?: string;
@@ -365,25 +368,69 @@ const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnectio
   };
 };
 
+/** Whether a pg of this version calls a password function with no arguments, as every pg before 8.19.0 does. */
+const callsPasswordWithNoArguments = (version: string): boolean => {
+  const match = /^(\d+)\.(\d+)\./.exec(version);
+  if (!match) return false;
+  const major = Number(match[1]);
+  return major < 8 || (major === 8 && Number(match[2]) < 19);
+};
+
+/** Whether the warning that the exporter could not read pg has been written; it is written once. */
+let toldPgUnread = false;
+
+/**
+ * The receiver and the arguments pg calls a pool's password function with for each connection the pool makes: a
+ * client made of the pool's settings (pg-pool `newClient`: `new this.Client(this.options)`), which pg calls the
+ * function as a method of, with no arguments before pg 8.19.0 and from 8.19.0 with the client's
+ * `ConnectionParameters` (node-postgres #3602; `lib/client.js` `_getPassword`:
+ * `this.password(this.connectionParameters)`). The client is of the pg this library loads, made without the
+ * settings' `stream`, a function pg calls to open the socket, and never connected. Where that pg cannot be read, the
+ * function gets no receiver and the connection's user, database, host and port, as pg 8.19.0 and later give it
+ * theirs, or nothing where the version read is older.
+ */
+const passwordCallOf = async (
+  connection: PgConnection,
+  settings: PgConnectionSettings,
+): Promise<{ self: unknown; args: unknown[] }> => {
+  const pg = await loadPg();
+  const noArguments = pg.version !== undefined && callsPasswordWithNoArguments(pg.version);
+  if (pg.version !== undefined && pg.Client !== undefined) {
+    // pg-pool keeps the settings' password from enumeration, so it is copied by name.
+    const client = new pg.Client({ ...settings, password: settings.password, stream: undefined });
+    return { self: client, args: noArguments ? [] : [client.connectionParameters] };
+  }
+  if (!toldPgUnread) {
+    toldPgUnread = true;
+    getStorageLogger().warn(
+      { scope: 'PostgresExporter', pgVersion: pg.version ?? null, pgClient: pg.Client !== undefined },
+      'PostgresExporter could not read the pg this library loads, so it calls a pool\'s password function on no ' +
+        `client, with ${noArguments ? 'no arguments' : "the connection's user, database, host and port"}.`,
+    );
+  }
+  return {
+    self: undefined,
+    args: noArguments
+      ? []
+      : [{ user: connection.user, database: connection.database, host: connection.host, port: Number(connection.port) }],
+  };
+};
+
 /**
  * The password pg sends for a connection: the settings' string, or the answer of the settings' function, which pg
- * calls with the connection's parameters. Undefined where neither gives one.
+ * calls on the connecting client, with its `ConnectionParameters` from pg 8.19.0. Undefined where neither gives one.
  *
  * @throws {Error} When the function fails or answers something other than a string or undefined.
  */
-const passwordOf = async (connection: PgConnection): Promise<string | undefined> => {
+const passwordOf = async (connection: PgConnection, settings: PgConnectionSettings): Promise<string | undefined> => {
   const { password } = connection;
   if (typeof password !== 'function') {
     return typeof password === 'string' ? password : undefined;
   }
+  const { self, args } = await passwordCallOf(connection, settings);
   let answer: unknown;
   try {
-    answer = await (password as (parameters: object) => unknown)({
-      user: connection.user,
-      database: connection.database,
-      host: connection.host,
-      port: Number(connection.port),
-    });
+    answer = await (password as (...parameters: unknown[]) => unknown).apply(self, args);
   } catch (error) {
     // The function's own error is kept as the cause, out of the message, which a log may show.
     const failure: Error & { cause?: unknown } = new Error(
@@ -420,7 +467,7 @@ export const libpqConnectionStringOf = async (settings: PgConnectionSettings): P
   if (connection === undefined) return connectionString;
   if (!connection.database) return undefined;
 
-  const password = await passwordOf(connection);
+  const password = await passwordOf(connection, settings);
   const parameters = [...connection.parameters];
   if (typeof connection.password === 'function' && !password) parameters.push(['password', '']);
   const user = connection.user ? encodeURIComponent(connection.user) : '';
