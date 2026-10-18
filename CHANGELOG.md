@@ -1,5 +1,8 @@
 ## [0.7.17] - 2026-10-17
 
+### Added
+- Mutation sync for named text rows (#65), exported from `./sync`: a push, pull and rebase protocol beside the cross-platform sync. `MutationServer` runs over a store port (`createSqlMutationStore` keeps it on the library's own tables); `MutationClient` keeps durable saves and a journal, rebases, joins, leaves and recovers across restore epochs; `createFetchMutationTransport`, `SyncLoop` with `attachSyncLoop`, `DrainGate`, the tab locks and `changeChannel` drive it. Nothing that exists changes.
+
 ### Security
 - `PostgresExporter` refuses, before `pg_dump` starts, a connection string whose password it cannot move to `PGPASSWORD`: a URI password that is not valid percent-encoding (`%zz`, a `%` at its end, bytes that are not UTF-8) or that decodes to a NUL, and a connection string that holds a NUL. 0.7.16 passed such a URI whole, its password in `--dbname`, where the process list shows it. The refusal never holds the connection string.
 - `PostgresExporter` moves the `password` of keyword=value settings (`host=db.example password='a b'`) to `PGPASSWORD` too, read as libpq reads them: a value runs to whitespace or sits in single quotes, a backslash takes the character after it, and the later of two passwords wins. An empty password goes to `PGPASSWORD` empty, as libpq reads an empty setting, so the environment's `PGPASSWORD` is never sent in its place. Settings libpq refuses (an unterminated quote, a setting with no `=`) are refused before `pg_dump` starts. 0.7.16 passed them whole on the command line.
