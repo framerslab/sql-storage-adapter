@@ -99,12 +99,6 @@ const LIBPQ_PARAMETERS = new Set([
   'sslkeylogfile',
 ]);
 
-/**
- * The `sslmode` values with which libpq always uses TLS. A pool that checks the server's certificate keeps one that
- * `PGSSLMODE` names.
- */
-const TLS_SSLMODES = new Set(['require', 'verify-ca', 'verify-full']);
-
 /** The `sslmode` values with which libpq connects without TLS to a server that offers none, as pg does with no `ssl`. */
 const PLAIN_SSLMODES = new Set(['disable', 'allow', 'prefer']);
 
@@ -164,30 +158,37 @@ const tlsOf = (ssl: unknown): PgTls => {
 };
 
 /**
- * The `sslmode` pg_dump gets so that libpq uses TLS as pg does, or undefined where libpq left to itself does.
- * - No TLS: `disable` where the pool's settings or its connection string chose it (pg reads no `PGSSLMODE` then,
- *   and libpq's `prefer` or `allow` would use TLS with a server that offers it). Where no TLS is pg's default,
+ * The libpq settings pg_dump gets so that libpq uses TLS as pg does and checks the server as pg does, none where
+ * libpq left to itself does.
+ * - No TLS: `sslmode=disable` where the pool's settings or its connection string chose it (pg reads no `PGSSLMODE`
+ *   then, and libpq's `prefer` or `allow` would use TLS with a server that offers it). Where no TLS is pg's default,
  *   libpq's own default (`prefer`) and a `PGSSLMODE` of `disable` or `allow` connect where pg connects, and stay;
  *   an empty `PGSSLMODE`, or one libpq does not know, which libpq refuses, gives way to `disable`.
- * - TLS that checks no certificate: `require`, over any `PGSSLMODE`, since `verify-ca` or `verify-full` would
- *   refuse the certificate pg accepts.
- * - TLS that checks the certificate: the connection string's `verify-ca` or `verify-full`, else any other `sslmode`
- *   it names as `require`, else a `PGSSLMODE` of `require`, `verify-ca` or `verify-full`, else `require`, which
- *   encrypts and checks no certificate: libpq checks one against files alone, where Node checks against its own
- *   certificate authorities.
+ * - TLS that checks no certificate: `sslmode=require`, over any `PGSSLMODE`, since `verify-ca` or `verify-full`
+ *   would refuse the certificate pg accepts.
+ * - TLS that checks the certificate: Node's TLS checks it against Node's certificate authorities, or the root
+ *   certificate the connection string names, and checks the host name, unless pg reads the string as libpq does
+ *   (`uselibpqcompat=true`) with `verify-ca`, or `require` beside a root certificate. libpq checks a certificate with
+ *   `verify-ca` and `verify-full` alone, the host name with `verify-full` alone, and against a root certificate file
+ *   or, with `sslrootcert=system` (libpq 16 and later), the system's certificate authorities; its `require` checks
+ *   nothing without a root certificate file (fe-secure-openssl.c). So `sslmode=verify-full`, or `verify-ca` where
+ *   pg checks no host name, over any `PGSSLMODE`, against the connection string's `sslrootcert`, else the file
+ *   `PGSSLROOTCERT` names, else `sslrootcert=system`.
  */
-const sslmodeFor = (
+const tlsSettingsFor = (
   tls: PgTls,
   chosen: boolean,
-  ofString: string | undefined,
-  pgsslmode: string | undefined,
-): string | undefined => {
+  hostNameChecked: boolean,
+  rootCertificateNamed: boolean,
+  env: Environment,
+): Array<[string, string]> => {
   if (tls === 'none') {
-    return chosen || (pgsslmode !== undefined && !PLAIN_SSLMODES.has(pgsslmode)) ? 'disable' : undefined;
+    const pgsslmode = env.PGSSLMODE;
+    return chosen || (pgsslmode !== undefined && !PLAIN_SSLMODES.has(pgsslmode)) ? [['sslmode', 'disable']] : [];
   }
-  if (tls === 'unchecked') return 'require';
-  if (ofString === 'verify-ca' || ofString === 'verify-full') return ofString;
-  return ofString === undefined && TLS_SSLMODES.has(pgsslmode ?? '') ? undefined : 'require';
+  if (tls === 'unchecked') return [['sslmode', 'require']];
+  const sslmode: [string, string] = ['sslmode', hostNameChecked ? 'verify-full' : 'verify-ca'];
+  return rootCertificateNamed || env.PGSSLROOTCERT ? [sslmode] : [sslmode, ['sslrootcert', 'system']];
 };
 
 /**
@@ -316,7 +317,10 @@ const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnectio
   // (lib/connection-parameters.js reads PGSSLMODE only where the merged settings hold no ssl).
   let ssl: unknown = settings.ssl;
   let source: 'string' | 'settings' | 'environment' = settings.ssl !== undefined ? 'settings' : 'environment';
-  let sslmodeOfString: string | undefined;
+  // Node's TLS checks the host name unless pg reads the string as libpq does with verify-ca, or require beside a root
+  // certificate (pg-connection-string index.js:116-133); the root certificate pg checks against, the string names.
+  let hostNameChecked = true;
+  let rootCertificateNamed = false;
 
   if (settings.connectionString) {
     const parsed = parseAsPg(settings.connectionString);
@@ -333,8 +337,12 @@ const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnectio
     if (fromString !== undefined) {
       ssl = fromString;
       source = 'string';
-      // An empty sslmode is none, to pg too.
-      sslmodeOfString = last('sslmode') || undefined;
+      const sslmode = last('sslmode');
+      rootCertificateNamed = Boolean(last('sslrootcert'));
+      hostNameChecked = !(
+        last('uselibpqcompat') === 'true' &&
+        (sslmode === 'verify-ca' || (sslmode === 'require' && rootCertificateNamed))
+      );
     }
     for (const [key, value] of parsed.parameters) {
       if (LIBPQ_PARAMETERS.has(key)) parameters.push([key, value]);
@@ -353,8 +361,7 @@ const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnectio
       );
     }
   }
-  const sslmode = sslmodeFor(tls, source !== 'environment', sslmodeOfString, env.PGSSLMODE);
-  if (sslmode !== undefined) parameters.push(['sslmode', sslmode]);
+  parameters.push(...tlsSettingsFor(tls, source !== 'environment', hostNameChecked, rootCertificateNamed, env));
 
   const osUser = typeof process !== 'undefined' && process.platform === 'win32' ? env.USERNAME : env.USER;
   const resolvedUser = user || env.PGUSER || osUser || undefined;
@@ -404,8 +411,8 @@ const passwordCallOf = async (
     toldPgUnread = true;
     getStorageLogger().warn(
       { scope: 'PostgresExporter', pgVersion: pg.version ?? null, pgClient: pg.Client !== undefined },
-      'PostgresExporter could not read the pg this library loads, so it calls a pool\'s password function on no ' +
-        `client, with ${noArguments ? 'no arguments' : "the connection's user, database, host and port"}.`,
+      "The pg this library loads could not be read, so a pool's password function is called on no client, with " +
+        `${noArguments ? 'no arguments' : "the connection's user, database, host and port"}.`,
     );
   }
   return {
