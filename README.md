@@ -96,8 +96,9 @@ import { createStorageFeatures, runSchemaMigrations, isUniqueViolation } from '@
 | `./authjs` | The Auth.js database adapter (also in `./core`) |
 | `./electron`, `./electron/renderer`, `./electron/preload` | The Electron adapters. `./electron/renderer` holds only what a window uses; `require('./electron/preload')` gives one bundled CommonJS file for a sandboxed preload |
 | `./sync`, `./kv`, `./types` | Cross-platform sync, the key-value store, the types |
+| `./browser` | What a page needs, in one entry: the IndexedDB adapter, the key-value module with its migration, the tab lock, and the mutation sync's client with its wire contract, transport, loop and change channel. Its modules import no Node built-in and no pg: the one package they import is sql.js |
 
-Every entry has an `import` and a `require` condition. The CommonJS build under `dist/cjs` is made from the ES module build file by file, so a class has one identity whichever entry a caller takes it from. It carries its own declarations, so a CommonJS TypeScript consumer under `node16` resolution type-checks against them. CI packs the package, installs it in a new project and checks each of these: `require()` of every entry, what each server entry bundles, and the preload.
+Every entry has an `import` and a `require` condition. The CommonJS build under `dist/cjs` is made from the ES module build file by file, so a class has one identity whichever entry a caller takes it from. It carries its own declarations, so a CommonJS TypeScript consumer under `node16` resolution type-checks against them. CI packs the package, installs it in a new project and checks each of these: `require()` of every entry, what each server entry and `./browser` bundle, and the preload.
 
 ## Quick Start
 

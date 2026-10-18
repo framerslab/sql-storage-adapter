@@ -131,6 +131,8 @@ jobs:
             openIndexedDbStore,
             type KeyValueStore,
           } from '@framers/sql-storage-adapter/kv';
+          import { MutationClient, IndexedDbAdapter, createTabLock } from '@framers/sql-storage-adapter/browser';
+          import { MutationServer, createSqlMutationStore, DrainGate } from '@framers/sql-storage-adapter/sync';
 
           declare const legacyDialect: Omit<SqlDialect, 'syncIdentitySequence'>;
           export const compatibleDialect: SqlDialect = legacyDialect;
@@ -147,6 +149,7 @@ jobs:
             namespaced(await createSqlKeyValueStore(adapter, { table: 'agentos_kv' }), 'user/');
           export const openBrowserKv = (): Promise<KeyValueStore> => openIndexedDbStore({ dbName: 'app', storeName: 'kv' });
           export const authAdapter = (adapter: StorageAdapter): Adapter => createAuthJsAdapter(adapter);
+          export const kinds = [MutationClient, IndexedDbAdapter, createTabLock, MutationServer, createSqlMutationStore, DrainGate].map((value) => typeof value);
           EOF
           tsc="$GITHUB_WORKSPACE/node_modules/.bin/tsc"
           "$tsc" --version
@@ -154,7 +157,7 @@ jobs:
 
       # The CommonJS build and the per-adapter entries, as a consumer installs
       # them: a CommonJS TypeScript consumer under node16 resolution, require()
-      # of every entry, what each server entry bundles, and the bundled preload.
+      # of every entry, what each entry bundles, and the bundled preload.
       - name: Check the packed package's CommonJS build and entries
         run: |
           consumer_dir="$RUNNER_TEMP/nodenext-consumer"
@@ -164,6 +167,8 @@ jobs:
           import { createPostgresAdapter } from '@framers/sql-storage-adapter/postgres';
           import { SqliteDialect, isUniqueViolation, runSchemaMigrations } from '@framers/sql-storage-adapter/core';
           import { createElectronRendererAdapter } from '@framers/sql-storage-adapter/electron/renderer';
+          import { MutationClient } from '@framers/sql-storage-adapter/browser';
+          import { MutationServer } from '@framers/sql-storage-adapter/sync';
 
           export const open = (): Promise<StorageAdapter> => createDatabase();
           export const openPostgres = (url: string): StorageAdapter => createPostgresAdapter(url);
@@ -171,6 +176,8 @@ jobs:
           export const migrate = runSchemaMigrations;
           export const unique = isUniqueViolation;
           export const renderer = createElectronRendererAdapter;
+          export const client = MutationClient;
+          export const server = MutationServer;
           EOF
           tsc="$GITHUB_WORKSPACE/node_modules/.bin/tsc"
           "$tsc" --module node16 --moduleResolution node16 --strict --skipLibCheck --noEmit cjs-consumer.cts
