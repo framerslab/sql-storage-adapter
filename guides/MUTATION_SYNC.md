@@ -39,10 +39,10 @@ Four mutations change rows. The server runs them inside each push's transaction,
 
 | Mutation | Arguments | Effect |
 | --- | --- | --- |
-| `create` | `id`, `value` | Writes the row when its id is unused. The same value already there is a no-op; beside a different live or unreadable row, the value is kept as a copy; a deleted id is refused `removed`. |
-| `edit` | `id`, `expected`, `value` | Replaces the row, an unreadable one included, when its revision is `expected`. At another revision, the same value is a no-op and a different one becomes a copy; a missing or deleted row is refused `removed`. |
+| `create` | `id`, `value` | Writes the row when its id is unused. A live row holding the same value makes it a no-op; beside a live row holding another value, or an unreadable row, the value is kept as a copy; a deleted id is refused `removed`. |
+| `edit` | `id`, `expected`, `value` | Replaces the row, an unreadable one included, when its revision is `expected`. At another revision, a live row holding the same value makes it a no-op, and the value is kept as a copy otherwise, beside an unreadable row too; a missing or deleted row is refused `removed`. |
 | `delete` | `id`, `expected` | Leaves a tombstone when the row's revision is `expected`, or when the row is missing; a tombstone already there is a no-op. At another revision it is refused `stale`, so a late delete never removes an edit its sender had not seen. |
-| `repair` | `id`, `expected`, `value` | Replaces an unreadable row at exactly `expected`, and is refused `stale` otherwise. |
+| `repair` | `id`, `expected`, `value` | Replaces an unreadable row at exactly `expected`. It is refused `stale` when the row is missing, live, deleted or at another revision. |
 
 A copy goes under an id every side derives alike, the first 32 hexadecimal characters of SHA-256 over `copy:v1:<group>:<client>:<mutation id>` (`copyIdOf`), with the value `policy.copyValue(value)`; when a row already holds that id, the mutation is a no-op. An edit or a delete whose `expected` names an earlier mutation with a recorded result acts where that result landed: on the copy it made, or at the revision its no-op found on the row. An edit that follows its earlier mutation to a copy keeps the copy's naming.
 
@@ -282,7 +282,7 @@ const outcome = await migrateIndexedDbKeyValue({
 });
 ```
 
-It opens the old database at `lockVersion`, above the `fromVersion` the old writers open it at, so their opens fail from then on and `openIndexedDbStore` at the old version answers from memory. It then copies the records under `prefix`, without it, into the store `into(trx)` makes, with a marker under `MIGRATION_MARKER`, in one transaction of the adapter; flushes an adapter that answers `flush()`; deletes the old records; and marks the move done. It answers `migrated`, `already`, `none` (nothing under the prefix) or `blocked` (a tab holds the old version open, and nothing moved: run it again once that tab closes). A reload resumes from the committed side, two moves at once copy once, and a store that keeps nothing past the page is refused before the old database is opened.
+It opens the old database at `lockVersion`, above the `fromVersion` the old writers open it at, so their opens fail from then on and `openIndexedDbStore` at the old version answers from memory. It then copies the records under `prefix`, without it, into the store `into(trx)` makes, with a marker under `MIGRATION_MARKER`, in one transaction of the adapter (a `namespaced` store, as here, puts its own prefix back on each key and on the marker, so each namespace moves under a marker of its own); flushes an adapter that answers `flush()`; deletes the old records; and marks the move done. It answers `migrated`, `already`, `none` (nothing under the prefix) or `blocked` (a tab holds the old version open, and nothing moved: run it again once that tab closes). A reload resumes from the committed side, two moves at once copy once, and a store that keeps nothing past the page is refused before the old database is opened.
 
 ## A server and its routes
 
@@ -324,13 +324,19 @@ export async function turnOff(scope: string): Promise<void> {
 Its routes, over the Fetch API's `Request` and `Response`. The application gives each one its context: the scope of the signed-in session, and the deployment's epoch.
 
 ```typescript
-import { parsePullRequest, type ScopeContext } from '@framers/sql-storage-adapter/sync';
+import { GateBlocked, WireError, parsePullRequest, type ScopeContext } from '@framers/sql-storage-adapter/sync';
 import { gate, server } from './sync-server';
 
 const headers = { 'content-type': 'application/json' };
-// A body the contract refuses throws SyntaxError or WireError: answer 400. A scope a deletion holds throws
-// GateBlocked: answer 503, and the client tries again later.
-export async function push(request: Request, context: ScopeContext): Promise<Response> {
+/** A body the contract refuses answers 400. A request a deletion turns away or cancels answers 503: the client tries again later. */
+const answered = (route: (request: Request, context: ScopeContext) => Promise<Response>) => (request: Request, context: ScopeContext) =>
+  route(request, context).catch((error: unknown) => {
+    if (error instanceof SyntaxError || error instanceof WireError) return new Response(null, { status: 400 });
+    if (error instanceof GateBlocked) return new Response(null, { status: 503 });
+    throw error;
+  });
+
+export const push = answered(async (request, context) => {
   const body = server.parsePush(await request.json());
   const cancel = new AbortController();
   const lease = gate.enter([context.scope], (reason) => cancel.abort(reason));
@@ -339,9 +345,9 @@ export async function push(request: Request, context: ScopeContext): Promise<Res
   } finally {
     lease.release();
   }
-}
+});
 
-export async function pull(request: Request, context: ScopeContext): Promise<Response> {
+export const pull = answered(async (request, context) => {
   const body = parsePullRequest(await request.json());
   const cancel = new AbortController();
   const lease = gate.enter([context.scope], (reason) => cancel.abort(reason));
@@ -362,7 +368,7 @@ export async function pull(request: Request, context: ScopeContext): Promise<Res
   } finally {
     if (!streaming) lease.release();
   }
-}
+});
 ```
 
 ## A page
