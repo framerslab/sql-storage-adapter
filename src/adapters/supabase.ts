@@ -645,8 +645,9 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
   /**
    * Writes the operations in one transaction, each under a savepoint: a failed statement aborts a PostgreSQL
    * transaction, so a failed operation rolls back to its savepoint and the batch goes on, as the PostgreSQL adapter's
-   * batch does. The operations that succeeded commit, and the result names each one that failed by its index. An
-   * operation of a type the batch does not know writes nothing and is not counted.
+   * batch does. The operations that succeeded commit, and the result names each one that failed by its index, one
+   * whose values could not be read (a getter or a proxy that throws) among them. An operation of a type the batch does
+   * not know writes nothing and is not counted.
    */
   async batchWrite(operations: ExtendedBatchOperation[]): Promise<BatchResult> {
     return this.transaction(async (trx) => {
@@ -655,7 +656,14 @@ export class SupabaseAdapter implements StorageAdapter, StorageAdapterExtensions
       const errors: Array<{ index: number; error: Error }> = [];
 
       for (let index = 0; index < operations.length; index++) {
-        const step = batchStatementOf(operations[index]);
+        let step: { query: string; params: unknown[] } | undefined;
+        try {
+          step = batchStatementOf(operations[index]);
+        } catch (error: unknown) {
+          failed++;
+          errors.push({ index, error: asError(error) });
+          continue;
+        }
         if (!step) continue;
         await trx.exec(`SAVEPOINT ${BATCH_SAVEPOINT}`);
         try {
