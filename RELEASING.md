@@ -27,7 +27,7 @@ Do not push a version tag by hand.
 
 ## Workflows never push to master
 
-`master`'s rules refuse a direct push, so no workflow pushes a commit to it: a step that changes the repository pushes a branch of its own and opens a pull request, or writes to a branch the rules leave open. The `build` job runs [`.github/scripts/check-workflow-pushes.mjs`](.github/scripts/check-workflow-pushes.mjs), which fails the pull request that adds such a push: a `git push` to `master`, or to the branch the run is on from a workflow that runs on `master`, an action that pushes there, or a semantic-release run while `release.config.js` lists `@semantic-release/git`.
+`master`'s rules refuse a direct push, so no workflow pushes a commit to it: a step that changes the repository pushes a branch of its own and opens a pull request, or writes to a branch the rules leave open. The `build` job runs [`.github/scripts/check-workflow-pushes.mjs`](.github/scripts/check-workflow-pushes.mjs), which fails the pull request that adds such a push: a `git push` to `master`, or to the branch the run is on from a workflow that runs on `master`, an action that pushes there, or a semantic-release run while `release.config.js` lists `@semantic-release/git`. It reads the YAML with [mikefarah's yq](https://github.com/mikefarah/yq) v4, which GitHub's Ubuntu runners carry; run it elsewhere with `yq` on the path, or `YQ` naming it: `node .github/scripts/check-workflow-pushes.mjs`.
 
 ## Required secrets
 
