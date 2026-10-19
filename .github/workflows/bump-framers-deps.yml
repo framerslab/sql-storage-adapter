@@ -81,9 +81,9 @@ jobs:
       - name: Bump @framers/* deps to latest published versions
         run: python3 .github/scripts/bump-framers-deps.py
 
-      # The lockfile needs no install script: the root prepare script builds
-      # dist, and better-sqlite3, electron and esbuild fetch or build native
-      # binaries, none of which the pull request carries.
+      # The lockfile needs no install script, so none runs: not the root
+      # prepare script, which builds dist (the pull request carries no dist),
+      # and not a dependency's, whatever onlyBuiltDependencies allows.
       - name: Refresh pnpm lockfile (when present)
         run: |
           if [ -f pnpm-lock.yaml ]; then
