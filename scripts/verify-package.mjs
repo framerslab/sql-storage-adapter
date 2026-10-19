@@ -12,6 +12,8 @@
 //    ./browser pulls in no pg, better-sqlite3 or @aws-sdk/client-s3.
 // 3. The bundled CommonJS preload loads alone, with only 'electron' outside
 //    it, and exposes its API through contextBridge.
+// 4. dist/cjs/package.json repeats the root's "browser" field, which webpack
+//    reads for the CommonJS files from that package.json, the nearest one.
 
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
@@ -92,6 +94,16 @@ const requires = [...preloadSource.matchAll(/require\((['"])([^'"]+)\1\)/g)].map
 check(
   requires.every((name) => name === 'electron'),
   `the bundled preload requires only electron: ${[...new Set(requires)].join(', ') || 'nothing'}`,
+);
+
+// 4. The browser field of the CommonJS build
+const packageDir = path.dirname(requireFromConsumer.resolve(`${PACKAGE}/package.json`));
+const readPackage = (relativePath) => JSON.parse(fs.readFileSync(path.join(packageDir, relativePath), 'utf8'));
+const rootBrowser = readPackage('package.json').browser;
+const cjsBrowser = readPackage('dist/cjs/package.json').browser;
+check(
+  rootBrowser !== undefined && JSON.stringify(cjsBrowser) === JSON.stringify(rootBrowser),
+  `dist/cjs/package.json repeats the root's browser field: ${JSON.stringify(cjsBrowser)}`,
 );
 
 if (failures.length) {

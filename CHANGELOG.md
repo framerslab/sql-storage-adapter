@@ -1,3 +1,8 @@
+## [0.8.1] - 2026-10-19
+
+### Fixed
+- A page that bundles the root entry no longer meets `async_hooks`. Since 0.6.12 the better-sqlite3 adapter loads Node's `AsyncLocalStorage` with `import('async_hooks')` when it opens, which it refuses to do in a browser, but a bundler resolves that import when it builds the page: webpack, which has no browser stand-in for `async_hooks`, failed the build with "Module not found: Can't resolve 'async_hooks'" (a Next.js static export of an app that imports the root entry did), and esbuild left an import in the page that a browser cannot load. The `browser` field of `package.json` maps `async_hooks` to an empty module, and `dist/cjs/package.json` repeats it, since webpack reads the field from the `package.json` nearest the importing file. On Node nothing changes: the adapter loads `async_hooks` as before. A spec bundles the root entry for a browser with esbuild and checks that `async_hooks` comes out as an empty module, and CI checks that the packed CommonJS build carries the field.
+
 ## [0.8.0] - 2026-10-18
 
 ### Added

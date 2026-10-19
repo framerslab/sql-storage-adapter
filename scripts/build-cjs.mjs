@@ -7,7 +7,10 @@
 //    subpath load one module per file, as the ES module build does: a class
 //    has one identity whichever entry a caller takes it from.
 // 2. dist/cjs/package.json says "type": "commonjs", so Node and TypeScript
-//    read the .js files and the declarations under it as CommonJS.
+//    read the .js files and the declarations under it as CommonJS. It repeats
+//    the root's "browser" field: webpack reads that field from the
+//    package.json nearest the importing file, which for these files is this
+//    one.
 // 3. The declarations are copied beside them, so a CommonJS TypeScript
 //    consumer under --moduleResolution node16 resolves types without
 //    importing an ES module.
@@ -68,7 +71,9 @@ for (const file of collect(distDir, ['.d.ts'])) {
   fs.copyFileSync(file, target);
 }
 
-fs.writeFileSync(path.join(cjsDir, 'package.json'), `${JSON.stringify({ type: 'commonjs' }, null, 2)}\n`);
+const { browser } = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+const cjsPackage = browser === undefined ? { type: 'commonjs' } : { type: 'commonjs', browser };
+fs.writeFileSync(path.join(cjsDir, 'package.json'), `${JSON.stringify(cjsPackage, null, 2)}\n`);
 
 await build({
   entryPoints: [path.join(root, 'src/adapters/electron/preload.ts')],
