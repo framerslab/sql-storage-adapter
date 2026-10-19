@@ -51,7 +51,7 @@ The SQL Storage Adapter provides a single, ergonomic interface over SQLite (nati
 - **🆕 Lifecycle Hooks** – Extensible hooks (`onBeforeQuery`, `onAfterQuery`, `onBeforeWrite`, `onAfterWrite`) for logging, analytics, caching, and custom extensions.
 - **Cloud backups & migrations** – built-in backup manager with compression, retention policies, and restore helpers plus migration utilities.
 - **Portable packaging** – optional native dependencies; falls back to pure TypeScript/WASM adapters when native modules are unavailable.
-- **Browser-friendly** – Dynamic imports prevent bundlers from including server-only dependencies (`pg`, `path`) in browser builds.
+- **Browser-friendly** – `./browser` imports no Node built-in and no pg, and the `browser` field of `package.json` maps `async_hooks`, which the better-sqlite3 adapter loads only when it opens on Node, to an empty module in a page that bundles the root entry.
 - **Mobile/Offline Parity** – Same APIs work across desktop, mobile (Capacitor), and browser with automatic sync support.
 - **🆕 SQL Dialect** – Write cross-platform SQL with `SqlDialect` interface. Automatically translates `INSERT OR IGNORE`, `json_extract`, `ifnull`, `PRAGMA` between SQLite and PostgreSQL.
 - **🆕 Full-Text Search** – `IFullTextSearch` interface abstracts FTS5 (SQLite) and tsvector/GIN (PostgreSQL) with unified `createIndex`, `matchClause`, `rankExpression`, and `rebuildCommand` APIs.
@@ -99,7 +99,7 @@ import { createStorageFeatures, runSchemaMigrations, isUniqueViolation } from '@
 | `./sync`, `./kv`, `./types` | Cross-platform sync and the mutation sync, the key-value store, the types |
 | `./browser` | What a page needs, in one entry: the IndexedDB adapter, the key-value module with its migration, the tab lock, and the mutation sync's client with its wire contract, transport, loop and change channel. Its modules import no Node built-in and no pg: the one package they import is sql.js |
 
-Every entry has an `import` and a `require` condition. The CommonJS build under `dist/cjs` is made from the ES module build file by file, so a class has one identity whichever entry a caller takes it from. It carries its own declarations, so a CommonJS TypeScript consumer under `node16` resolution type-checks against them. CI packs the package, installs it in a new project and checks each of these: `require()` of every entry, what each server entry and `./browser` bundle, and the preload.
+Every entry has an `import` and a `require` condition. The CommonJS build under `dist/cjs` is made from the ES module build file by file, so a class has one identity whichever entry a caller takes it from. It carries its own declarations, so a CommonJS TypeScript consumer under `node16` resolution type-checks against them. CI packs the package, installs it in a new project and checks each of these: `require()` of every entry, what each server entry and `./browser` bundle, the preload, and that the CommonJS build repeats the `browser` field.
 
 ## Quick Start
 

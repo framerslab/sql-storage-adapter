@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { builtinModules } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { build } from 'esbuild';
 import ts from 'typescript';
 
 // A page that imports '@framers/sql-storage-adapter/browser' must not pull a
@@ -121,5 +122,37 @@ describe('the browser entry', () => {
     ]) {
       expect(entry).toHaveProperty(name);
     }
+  });
+});
+
+// The better-sqlite3 adapter loads Node's AsyncLocalStorage with import('async_hooks') when it opens, which it refuses
+// to do in a browser. A browser bundler resolves that import all the same: webpack, with no browser stand-in for
+// async_hooks, fails the build of a page that imports the main entry, and esbuild leaves an import in the page that a
+// browser cannot load. The package's browser field maps async_hooks to an empty module. The case below bundles the main
+// entry as a browser bundler does, with every other package and Node built-in the entry reaches left outside, as a
+// page's bundler loads, polyfills or stubs them, so async_hooks alone goes through esbuild's resolver and that field.
+describe('a page that bundles the main entry', () => {
+  const ASYNC_HOOKS = ['async_hooks', 'node:async_hooks'];
+
+  it('gets async_hooks as an empty module, through the browser field', async () => {
+    const entry = path.join(SRC, 'index.ts');
+    const reached = [...bareImports(entry)];
+    // The bare spelling: the browser field's key names it, and webpack's browser build has no handler for node:.
+    expect(reached.filter((name) => ASYNC_HOOKS.includes(name))).toEqual(['async_hooks']);
+
+    const result = await build({
+      entryPoints: [entry],
+      bundle: true,
+      write: false,
+      metafile: true,
+      platform: 'browser',
+      format: 'esm',
+      logLevel: 'silent',
+      external: reached.filter((name) => !ASYNC_HOOKS.includes(name) && name !== '<computed>'),
+    });
+
+    const leftOutside = Object.values(result.metafile.outputs).flatMap((output) => output.imports.map((imported) => imported.path));
+    expect(leftOutside.filter((name) => ASYNC_HOOKS.includes(name))).toEqual([]);
+    expect(Object.keys(result.metafile.inputs).filter((input) => input.startsWith('(disabled):'))).toEqual(['(disabled):async_hooks']);
   });
 });
