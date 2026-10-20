@@ -745,8 +745,8 @@ export function shellCommands(src) {
         // A background job runs in a shell of its own.
         if (c === '&' && word === null && words.length === 0 && compoundEnded) out.push({ scope: 'unknown' });
         compoundEnded = false;
-        pipeNext = false;
         endCommand(false, c === '&');
+        pipeNext = false;
         endList();
         i++;
       } else if (c === '(') {
