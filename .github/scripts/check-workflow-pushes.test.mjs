@@ -581,6 +581,9 @@ describe('refused: a workflow that pushes to master', () => {
       - env:
           GIT_DIR: base/.git
         run: git push origin HEAD
+      - run: |
+          { cd base; }|cat
+          git push origin HEAD
     `) }, pushes([2, 3, 4, 5, 7, 8, 9, 11, 14]));
     // A master run with feature checked out at base: a shell of its own does not move the script.
     expectFindings({ '.github/workflows/w.yml': workflow(ON_MASTER, text`
@@ -613,7 +616,10 @@ describe('refused: a workflow that pushes to master', () => {
       - run: |
           h() { cd base; }
           git push origin HEAD
-    `) }, pushes([2, 3, 4, 5, 6, 7, 8, 9]));
+      - run: |
+          { cd base; }&
+          git push origin HEAD
+    `) }, pushes([2, 3, 4, 5, 6, 7, 8, 9, 10]));
   });
 
   test('a GIT_DIR in env: names the repository (the step\'s, else the job\'s, else the workflow\'s) beneath GIT_DIR= and --git-dir; env -i and env -u remove it, and sudo may drop it', () => {
