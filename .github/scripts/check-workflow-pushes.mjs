@@ -632,7 +632,7 @@ export function shellCommands(src) {
       // An empty command (the & of |&, a line break after |) leaves a pipe as it is.
       if (words.length > 0) {
         // A command of a pipeline or a background job runs in a shell of its own.
-        const own = pipe || background || piped !== null;
+        const own = pipe || background || pipeNext;
         if (own) out.push({ scope: 'open' });
         out.push(words);
         if (own) out.push({ scope: 'close' });
@@ -751,13 +751,15 @@ export function shellCommands(src) {
         i++;
       } else if (c === '(') {
         // A ( before a case's pattern is only punctuation, and <name>() begins a function's definition.
-        const name = word !== null && words.length === 0 ? word : word === null && words.length === 1 ? words[0] : null;
+        const name = word !== null && words.length === 0 ? word : word === null && words.length === 1 && !functionName ? words[0] : null;
         const close = /^\(\s*\)/.exec(src.slice(i));
-        if (!inPattern() && name !== null && !/[=$`]/.test(name) && close) {
+        if (!inPattern() && close && ((name !== null && !/[=$`]/.test(name)) || functionBody)) {
+          // function <name> () after its name was read leaves only the parens.
+          if (name !== null) out.push({ define: name });
           word = null;
           quoted = false;
           words = [];
-          out.push({ define: name });
+          functionName = false;
           functionBody = true;
           i += close[0].length;
         } else {
