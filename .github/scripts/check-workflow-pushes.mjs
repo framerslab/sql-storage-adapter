@@ -1002,6 +1002,9 @@ function gitConfig(args, state) {
   let all = false;
   let fixed = false;
   let shared = false;
+  // An option git refuses in the form given (--unset in git config unset, --all or --value without it) makes the
+  // command change nothing.
+  let refused = false;
   /** @type {string | undefined} */
   let pattern;
   // git config set and unset (git 2.46) name what they change; get, list and edit only read, and the section
@@ -1017,13 +1020,16 @@ function gitConfig(args, state) {
   const positional = [];
   for (; k < args.length; k++) {
     const a = args[k];
-    if (a === '--unset') unset = true;
-    else if (a === '--unset-all') unset = all = true;
-    else if (a === '--all') all = true;
-    else if (a === '--fixed-value') fixed = true;
+    if (a === '--unset' || a === '--unset-all') {
+      unset = true;
+      all ||= a === '--unset-all';
+      refused ||= subcommand;
+    } else if (a === '--all' || a === '--value' || a.startsWith('--value=')) {
+      if (a === '--all') all = true;
+      else pattern = a === '--value' ? args[++k] : a.slice('--value='.length);
+      refused ||= !subcommand;
+    } else if (a === '--fixed-value') fixed = true;
     else if (a === '--global' || a === '--system') shared = true;
-    else if (a === '--value') pattern = args[++k];
-    else if (a.startsWith('--value=')) pattern = a.slice('--value='.length);
     else if (reads.test(a)) return;
     else if (valued.has(a)) k++;
     else if (!a.startsWith('-')) positional.push(a);
@@ -1035,7 +1041,7 @@ function gitConfig(args, state) {
     // git config --unset <name> [<value-pattern>]; git config unset [--all] [--value=<pattern>] <name>. git refuses
     // --fixed-value with no pattern.
     if (!subcommand) pattern = positional[1];
-    if (fixed && pattern === undefined) return;
+    if (refused || (fixed && pattern === undefined)) return;
     if (setting === 'default') {
       if (valueMatches(settings.pushDefault, pattern, fixed)) settings.pushDefault = '';
       return;
