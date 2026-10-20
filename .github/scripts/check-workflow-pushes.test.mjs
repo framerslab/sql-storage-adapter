@@ -379,7 +379,7 @@ describe('refused: a workflow that pushes to master', () => {
 
   test('a checkout in another directory keeps a branch of its own: the root is pushed from the root, the other from its directory', () => {
     expectFindings({
-      // Codex on agentos-extensions#341: the root checkout is master, and the one at a path is not.
+      // From the review of agentos-extensions#341: the root checkout is master, and the one at a path is not.
       '.github/workflows/a.yml': workflow(ON_MASTER, text`
         - uses: actions/checkout@v5
         - uses: actions/checkout@v5
@@ -430,7 +430,7 @@ describe('refused: a workflow that pushes to master', () => {
 
   test('a local composite action reads the inputs its caller gives, else their defaults', () => {
     expectFindings({
-      // Codex on agentos-extensions#341: the caller names master, which the action checks out.
+      // From the review of agentos-extensions#341: the caller names master, which the action checks out.
       '.github/actions/to-branch/action.yml': text`
         name: to-branch
         inputs:
@@ -493,7 +493,7 @@ describe('refused: a workflow that pushes to master', () => {
 
   test('git config --unset with a value pattern removes only what it matches, and a checkout keeps settings of its own', () => {
     expectFindings({
-      // Codex on agentos-extensions#341: two refspecs set, and the feature one unset by its pattern.
+      // From the review of agentos-extensions#341: two refspecs set, and the feature one unset by its pattern.
       '.github/workflows/w.yml': workflow(ON_PULL_REQUEST, text`
         - run: |
             git switch -c feature
