@@ -490,6 +490,15 @@ const readAsPg = (
   };
 };
 
+/**
+ * A password file that does not exist, named where a pool's password function answers none. pg then connects with no
+ * password and reads no password file (`lib/client.js`, `_getPassword`), where libpq given an empty password reads its
+ * password file, `PGPASSFILE`'s or `~/.pgpass` (PostgreSQL 17 `fe-connect.c`, `connectOptions2`, line 1300), and takes
+ * a file it cannot stat as none, with no warning (`passwordFromFile`, line 7469). `/dev/null` would draw libpq's "not
+ * a plain file" warning.
+ */
+const NO_PASSWORD_FILE = '/nonexistent/sql-storage-adapter/no-password-file';
+
 /** Whether a pg of this version calls a password function with no arguments, as every pg before 8.19.0 does. */
 const callsPasswordWithNoArguments = (version: string): boolean => {
   const match = /^(\d+)\.(\d+)\./.exec(version);
@@ -671,8 +680,9 @@ const passwordOf = async (
  * A libpq connection URI that reaches what a pg pool with these settings reaches, with its password in the user
  * part, where `PostgresExporter` takes it out for `PGPASSWORD`. Where the pool has no password, the URI holds none
  * and libpq reads `PGPASSWORD`, then `~/.pgpass`, as pg does. Where its password function answers none, pg connects
- * with no password and reads no `PGPASSWORD` (`lib/client.js`, `_getPassword`): the URI holds an empty `password`
- * parameter, which becomes an empty `PGPASSWORD`, so libpq sends the environment's no more than pg does. A
+ * with no password and reads neither `PGPASSWORD` nor a password file (`lib/client.js`, `_getPassword`): the URI holds
+ * an empty `password` parameter, which becomes an empty `PGPASSWORD`, so libpq sends the environment's no more than pg
+ * does, and a `passfile` that does not exist, so libpq reads no `~/.pgpass` either. A
  * connection string pg cannot read as a URL (a keyword=value string) is given back as it is. Undefined when the
  * settings name no database pg would reach. `PoolClient` is the `Client` the pool makes its connections with, which
  * pg-pool keeps as the pool's `Client`: a password function is asked through it.
@@ -696,7 +706,9 @@ export const libpqConnectionStringOf = async (
 
   const password = await passwordOf(connection, settings, PoolClient);
   const parameters = [...connection.parameters];
-  if (typeof connection.password === 'function' && !password) parameters.push(['password', '']);
+  if (typeof connection.password === 'function' && !password) {
+    parameters.push(['password', ''], ['passfile', NO_PASSWORD_FILE]);
+  }
   const user = connection.user ? encodeURIComponent(connection.user) : '';
   const secret = password ? `:${encodeURIComponent(password)}` : '';
   const auth = user || secret ? `${user}${secret}@` : '';

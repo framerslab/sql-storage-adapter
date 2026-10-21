@@ -494,17 +494,23 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
   });
 
   // pg connects with no password where the password function answers none,
-  // and reads no PGPASSWORD then (lib/client.js, _getPassword). pg_dump gets
-  // an empty PGPASSWORD, so it sends the environment's no more than pg does.
+  // and reads neither PGPASSWORD nor a password file then (lib/client.js,
+  // _getPassword). pg_dump gets an empty PGPASSWORD, so it sends the
+  // environment's no more than pg does, and a passfile that does not exist,
+  // since libpq reads PGPASSFILE's file or ~/.pgpass for an empty password
+  // (fe-connect.c, connectOptions2) and takes a file it cannot stat as none.
   it.each([
     ['undefined', undefined],
     ['an empty string', ''],
-  ])("hands pg_dump an empty PGPASSWORD, not the environment's, when the password function answers %s", async (_name, answer) => {
+  ])("hands pg_dump an empty PGPASSWORD and no password file, not the environment's, when the password function answers %s", async (_name, answer) => {
     vi.stubEnv('PGPASSWORD', 'ambient-secret');
+    vi.stubEnv('PGPASSFILE', '/home/app/.pgpass');
 
     await poolExporter({ host: 'db.example', database: 'app', user: 'app', password: () => answer }).exportToBytes();
 
-    expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app');
+    expect(dbnameOf(calls[0].args)).toBe(
+      'postgresql://app@db.example:5432/app?passfile=%2Fnonexistent%2Fsql-storage-adapter%2Fno-password-file',
+    );
     expect(calls[0].env.PGPASSWORD).toBe('');
   });
 
