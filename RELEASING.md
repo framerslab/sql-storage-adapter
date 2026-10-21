@@ -31,7 +31,7 @@ npm trusted publishing is configured for this package and `release.yml`: the job
 
 ## Deprecating a version
 
-To deprecate a published version, such as one that fails on a runtime it accepts, run the [Deprecate a version](https://github.com/framerslab/sql-storage-adapter/blob/master/.github/workflows/deprecate.yml) workflow by hand with the version and a message that says why and which version to use instead; an empty message clears the mark. A published version is never unpublished, so every lockfile that names it stays installable.
+To deprecate a published version, such as one that fails on a runtime it accepts, run the [Deprecate a version](https://github.com/framerslab/sql-storage-adapter/blob/master/.github/workflows/deprecate.yml) workflow by hand with the version and a message that says why and which version to use instead. To remove a version's mark, run it with clear ticked and no message. A published version is never unpublished, so every lockfile that names it stays installable.
 
 ## Required secrets
 
