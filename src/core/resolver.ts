@@ -333,9 +333,9 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
             });
           }
         };
+      // 'sqljs' is not an AdapterKind, but the README lists it and hosts pass it;
+      // it builds what it has always built.
       case 'sqljs':
-      // Not an AdapterKind, but the README lists it and hosts pass it; it builds
-      // what it has always built.
       case 'memory':
         return {
           name: 'sqljs',

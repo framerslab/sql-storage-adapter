@@ -251,9 +251,6 @@ export class ElectronRendererAdapter implements StorageAdapter {
   public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
     this.assertOpen();
 
-    // Create a transaction proxy adapter
-    const trxAdapter = new TransactionProxyAdapter(this.getApi());
-
     return this.getApi().transaction(async (trx) => {
       // The trx object from preload provides run/get/all
       // We need to wrap it to match StorageAdapter interface
@@ -347,52 +344,6 @@ export class ElectronRendererAdapter implements StorageAdapter {
     const unsubscribe = this.getApi().onDatabaseChange(callback);
     this.eventUnsubscribers.push(unsubscribe);
     return unsubscribe;
-  }
-}
-
-// ============================================================================
-// Transaction Proxy Adapter
-// ============================================================================
-
-/**
- * Internal adapter used during transactions.
- */
-class TransactionProxyAdapter implements StorageAdapter {
-  public readonly kind = 'electron-renderer-transaction';
-  public readonly capabilities: ReadonlySet<StorageCapability> = new Set();
-
-  constructor(private readonly api: typeof window.sqlStorage) {}
-
-  public async open(): Promise<void> {
-    // No-op: Transaction doesn't need to be opened
-  }
-
-  public async close(): Promise<void> {
-    // No-op: Transaction is closed by commit/rollback
-  }
-
-  public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
-    return this.api.run(statement, parameters);
-  }
-
-  public async get<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T | null> {
-    return this.api.get<T>(statement, parameters);
-  }
-
-  public async all<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T[]> {
-    return this.api.all<T>(statement, parameters);
-  }
-
-  public async exec(_script: string): Promise<void> {
-    throw new Error('exec not supported within transactions from renderer');
-  }
-
-  public async transaction<T>(_fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
-    throw new Error('Nested transactions not supported');
-  }
-
-  public async batch(_operations: BatchOperation[]): Promise<BatchResult> {
-    throw new Error('Batch operations not supported within transactions from renderer');
   }
 }
 

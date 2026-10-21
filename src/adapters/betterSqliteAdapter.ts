@@ -90,7 +90,7 @@ const loadBetterSqlite = async (): Promise<LoadedBetterSqlite | null> => {
       // version comes from the package this require loaded.
       const require = createRequire(path.join(process.cwd(), 'noop.js'));
       return { module: require('better-sqlite3') as unknown as BetterSqliteModule, version: versionOf(require) };
-    } catch (error) {
+    } catch {
       // Intentionally silent — the resolver handles fallback logging.
       return null;
     }

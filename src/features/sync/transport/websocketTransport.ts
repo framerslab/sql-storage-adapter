@@ -453,7 +453,7 @@ export class WebSocketTransport extends BaseTransport {
    * Reject all pending requests.
    */
   private _rejectAllPending(error: Error): void {
-    for (const [id, pending] of this._pendingRequests) {
+    for (const pending of this._pendingRequests.values()) {
       clearTimeout(pending.timer);
       pending.reject(error);
     }
