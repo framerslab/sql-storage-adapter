@@ -160,12 +160,12 @@ export function encodeValue(value: unknown): string {
   // The runtime's own structured clone runs first, for what no inspection can
   // tell apart from what it copies: a proxy answers every check below as the
   // object it wraps would (an array proxy is an array to Array.isArray), and the
-  // structured clone, as IndexedDB's put, refuses it. The text is still written
-  // from the value itself, so what comes back does not change.
+  // structured clone, as IndexedDB's put, refuses it. The text is written from
+  // the copy the clone returns, which read each property of the value once, as
+  // IndexedDB's put reads it: a getter that answers differently on a second
+  // read is stored with its first answer, and the value is copied once.
   const runtimeClone = (globalThis as unknown as { structuredClone?: (input: unknown) => unknown }).structuredClone;
-  if (typeof runtimeClone === 'function') {
-    runtimeClone.call(globalThis, value);
-  }
+  const source = typeof runtimeClone === 'function' ? runtimeClone.call(globalThis, value) : value;
 
   /** Each object met so far, by the order it was met in, which the decoder repeats. */
   const ids = new Map<object, number>();
@@ -287,7 +287,7 @@ export function encodeValue(value: unknown): string {
     return node;
   };
 
-  return JSON.stringify([FORMAT, encode(value)]);
+  return JSON.stringify([FORMAT, encode(source)]);
 }
 
 /** Whether `object` is an error: one made by an error constructor, as the structured clone tells them. */

@@ -296,24 +296,85 @@ const IMAGE_PRAGMAS_WHEN_SET = new Set(['user_version', 'application_id', 'schem
 /** PRAGMAs that change the image in any form: incremental_vacuum frees pages, optimize may run ANALYZE. */
 const IMAGE_PRAGMAS_ALWAYS = new Set(['incremental_vacuum', 'optimize']);
 
-/** An identifier as SQLite reads one: bare, or in double quotes, brackets or backticks. */
-const SQL_IDENTIFIER = '(?:"(?:[^"]|"")*"|\\[[^\\]]*\\]|`(?:[^`]|``)*`|[A-Za-z_][A-Za-z0-9_$]*)';
+/** A token of a statement's head: a name, bare or quoted (a string in single quotes included), or one character of punctuation. */
+interface HeadToken {
+  text: string;
+  name: boolean;
+}
 
-/** `PRAGMA [schema.]name`, then `=` or `(` when the statement gives the pragma a value. */
-const PRAGMA_STATEMENT = new RegExp(`^PRAGMA\\s+(?:${SQL_IDENTIFIER}\\s*\\.\\s*)?(${SQL_IDENTIFIER})\\s*(=|\\()?`, 'i');
+/** The characters a bare name of SQLite's goes on with. */
+const NAME_PART = /[A-Za-z0-9_$]/;
+
+/**
+ * The first `count` tokens of a statement as SQLite's tokenizer reads them: a
+ * comment (`-- ...` to the end of its line, `/* ... *\/`) or whitespace
+ * separates two tokens and is no token itself, and a quoted name (in double
+ * quotes, brackets or backticks) needs no space before it. A string in single
+ * quotes is read as a name as well: SQLite's grammar takes one for a name where
+ * a PRAGMA's schema or name goes (parse.y, `nm ::= STRING`), and its tokenizer
+ * ends it as it ends a quoted name, at a quote not written twice (tokenize.c,
+ * `CC_QUOTE`).
+ */
+const headTokens = (statement: string, count: number): HeadToken[] => {
+  const tokens: HeadToken[] = [];
+  let at = 0;
+  while (at < statement.length && tokens.length < count) {
+    const char = statement[at];
+    if (/\s/.test(char)) {
+      at += 1;
+    } else if (statement.startsWith('--', at)) {
+      const end = statement.indexOf('\n', at + 2);
+      at = end < 0 ? statement.length : end + 1;
+    } else if (statement.startsWith('/*', at)) {
+      const end = statement.indexOf('*/', at + 2);
+      at = end < 0 ? statement.length : end + 2;
+    } else if (char === '"' || char === '`' || char === "'") {
+      // A quote character inside the name is written twice.
+      let text = '';
+      let end = at + 1;
+      while (end < statement.length) {
+        if (statement[end] === char) {
+          if (statement[end + 1] !== char) break;
+          end += 1;
+        }
+        text += statement[end];
+        end += 1;
+      }
+      tokens.push({ text, name: true });
+      at = end + 1;
+    } else if (char === '[') {
+      const end = statement.indexOf(']', at + 1);
+      tokens.push({ text: statement.slice(at + 1, end < 0 ? statement.length : end), name: true });
+      at = end < 0 ? statement.length : end + 1;
+    } else if (/[A-Za-z_]/.test(char)) {
+      let end = at + 1;
+      while (end < statement.length && NAME_PART.test(statement[end])) end += 1;
+      tokens.push({ text: statement.slice(at, end), name: true });
+      at = end;
+    } else {
+      tokens.push({ text: char, name: false });
+      at += 1;
+    }
+  }
+  return tokens;
+};
 
 /**
  * Whether a PRAGMA statement changes the database image although no row
  * changes: an assignment to a header field or a file setting, or a pragma that
  * rewrites pages. Reads (`PRAGMA table_info(t)`, `PRAGMA user_version`) and
- * connection settings (`PRAGMA foreign_keys = ON`) do not.
+ * connection settings (`PRAGMA foreign_keys = ON`) do not. The statement is
+ * read as SQLite reads it: `PRAGMA [schema.]name`, then `=` or `(` when it
+ * gives the pragma a value, with any comment between two of them.
  */
 const pragmaChangesImage = (statement: string): boolean => {
-  const match = PRAGMA_STATEMENT.exec(pastLeadingComments(statement));
-  if (!match) return false;
-  const quoted = /^["[`]/.test(match[1]);
-  const name = (quoted ? match[1].slice(1, -1) : match[1]).toLowerCase();
-  return IMAGE_PRAGMAS_ALWAYS.has(name) || (match[2] !== undefined && IMAGE_PRAGMAS_WHEN_SET.has(name));
+  const tokens = headTokens(statement, 5);
+  if (tokens[0]?.text.toUpperCase() !== 'PRAGMA' || tokens[1]?.name !== true) return false;
+  const qualified = tokens[2]?.text === '.' && tokens[2].name === false && tokens[3]?.name === true;
+  const name = (qualified ? tokens[3] : tokens[1]).text.toLowerCase();
+  const next = tokens[qualified ? 4 : 2];
+  const setsValue = next !== undefined && next.name === false && (next.text === '=' || next.text === '(');
+  return IMAGE_PRAGMAS_ALWAYS.has(name) || (setsValue && IMAGE_PRAGMAS_WHEN_SET.has(name));
 };
 
 /**

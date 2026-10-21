@@ -1,10 +1,12 @@
-import { describe, expect, it, afterAll, afterEach, beforeAll } from 'vitest';
+import { describe, expect, it, afterAll, afterEach, beforeAll, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import pg from 'pg';
 import { createPostgresAdapter, createStorageFeatures, type StorageAdapter } from '../src/index.js';
+import { ClientOfEarlierPg } from './fixtures/clientOfEarlierPg.js';
+import { clientOfPgBeforeDirectNegotiation } from './fixtures/clientOfPgBeforeDirectNegotiation.js';
 
 // The feature exporter runs pg_dump against the PostgreSQL that
 // POSTGRES_TEST_URL names (CI's service); the runner has the PostgreSQL client
@@ -50,10 +52,19 @@ describe.skipIf(!POSTGRES_TEST_URL)('the PostgreSQL exporter, through pg_dump', 
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     for (const adapter of opened.splice(0)) {
       await adapter.close().catch(() => undefined);
     }
   });
+
+  /** A database of its own for one spec, dropped after the suite. */
+  const newDatabase = async (): Promise<string> => {
+    const database = unique('export');
+    databases.push(database);
+    await admin.exec(`CREATE DATABASE ${database}`);
+    return database;
+  };
 
   afterAll(async () => {
     for (const schema of schemas) {
@@ -111,6 +122,284 @@ describe.skipIf(!POSTGRES_TEST_URL)('the PostgreSQL exporter, through pg_dump', 
     }
   });
 
+  // pg calls a pool's password function for each connection it makes; the
+  // export asks it too, and pg_dump logs in with its answer. CI's server asks
+  // a TCP connection for its password (scram-sha-256), and PGPASSWORD is empty.
+  it('exports through a pool of the caller whose password is a function, which it asks when the export runs', async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGPASSWORD', '');
+    let asked = 0;
+    const pool = new pg.Pool({
+      host: server.hostname,
+      port: Number(server.port || 5432),
+      database,
+      user: decodeURIComponent(server.username),
+      password: async () => {
+        asked += 1;
+        return decodeURIComponent(server.password);
+      },
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE function_items (id INTEGER PRIMARY KEY)');
+      const before = asked;
+
+      const file = path.join(dir, `${database}-function.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.function_items']);
+      expect(asked).toBe(before + 1);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg calls the function as a method of the client it connects, with no
+  // arguments before 8.19.0 and from 8.19.0 with the client's
+  // ConnectionParameters (lib/client.js, _getPassword). The export asks it as
+  // the pool's own pg asked it, whichever pg is installed.
+  it("asks a pool's password function as the pool's pg asks it: on a client, with that pg's arguments", async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGPASSWORD', '');
+    const asked: Array<{ self: unknown; args: unknown[] }> = [];
+    const pool = new pg.Pool({
+      host: server.hostname,
+      port: Number(server.port || 5432),
+      database,
+      user: decodeURIComponent(server.username),
+      application_name: 'exporter-spec',
+      password: async function (this: unknown, ...args: unknown[]) {
+        asked.push({ self: this, args });
+        return decodeURIComponent(server.password);
+      },
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE asked_items (id INTEGER PRIMARY KEY)');
+      const before = asked.length;
+      expect(before).toBeGreaterThan(0);
+
+      const file = path.join(dir, `${database}-asked.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.asked_items']);
+      expect(asked).toHaveLength(before + 1);
+      const [byPool] = asked;
+      const byExport = asked[before];
+      expect(byPool.self).toBeInstanceOf(pg.Client);
+      expect(byExport.self).toBeInstanceOf(pg.Client);
+      for (const field of ['user', 'database', 'host', 'port'] as const) {
+        expect((byExport.self as Record<string, unknown>)[field]).toEqual((byPool.self as Record<string, unknown>)[field]);
+      }
+      expect(byExport.args).toHaveLength(byPool.args.length);
+      expect(byExport.args).toEqual(byPool.args);
+      if (byPool.args.length > 0) {
+        expect(byExport.args[0]).toBeInstanceOf((byPool.args[0] as object).constructor);
+      }
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg reads a pool's connection string as a WHATWG URL, libpq by its own
+  // grammar: given this string as it was, pg_dump read the user part up to the
+  // @ in the query and the host y.
+  it('exports through a pool whose connection string libpq reads apart from pg, where pg reaches', async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGUSER', decodeURIComponent(server.username));
+    vi.stubEnv('PGPASSWORD', decodeURIComponent(server.password));
+    vi.stubEnv('PGDATABASE', database);
+    const pool = new pg.Pool({ connectionString: `postgresql://${server.host}?application_name=x@y` });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE parsed_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-parsed.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.parsed_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg-connection-string sets the database from the URL's path alone, and
+  // drops a database parameter (index.js:66-67): pg reaches PGDATABASE. The
+  // export reaches the database pg reaches, not the one the parameter names.
+  it("exports the database pg reaches for a connection string whose query names another, which pg drops", async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGDATABASE', database);
+    const pool = new pg.Pool({
+      connectionString: `postgresql://${server.username}:${server.password}@${server.host}/?database=${server.pathname.slice(1)}`,
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE query_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-query.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.query_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg reads an empty host parameter as none and keeps the URL's host
+  // (pg-connection-string index.js:54-56), never PGHOST.
+  it('exports through a pool whose connection string has an empty host parameter, where pg reaches', async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGHOST', 'unreachable.invalid');
+    const pool = new pg.Pool({
+      connectionString: `postgresql://${server.username}:${server.password}@${server.host}/${database}?host=`,
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE host_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-host.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.host_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg connects with no password where a pool's password function answers
+  // none (lib/client.js, _getPassword), which CI's server refuses over TCP.
+  // pg_dump gets an empty PGPASSWORD and is refused alike: with PGPASSWORD
+  // left as it was, it logged in with the environment's password, which the
+  // pool never sends. With no password and --no-password it fails at once.
+  // The pool itself never connects here: pg-pool keeps no client whose
+  // connection failed and never ends it, so the server would hold that
+  // half-done login until authentication_timeout, and DROP DATABASE waits on
+  // it (ProcSignalBarrier).
+  it("logs pg_dump in with no password where the pool's password function answers none, as the pool does", async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGPASSWORD', decodeURIComponent(server.password));
+    const pool = new pg.Pool({
+      host: server.hostname,
+      port: Number(server.port || 5432),
+      database,
+      user: decodeURIComponent(server.username),
+      password: async () => undefined,
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      const file = path.join(dir, `${database}-no-password.dump`);
+      await expect(createStorageFeatures(adapter).exporter.exportToFile(file)).rejects.toThrow(/pg_dump failed.*password/s);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg-pool makes each connection with the Client its options name (pg-pool
+  // 3.14.0, index.js:95 and 241). This pool's Client asks the password
+  // function as pg before 8.19.0 does, with no arguments, where the pg this
+  // library loads passes the client's ConnectionParameters, and the function
+  // answers the server's password to its pool's call alone. PGPASSWORD is
+  // empty, so pg_dump logs in with the function's answer or not at all.
+  it("logs pg_dump in with the password the pool's own Client asks its password function for", async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    vi.stubEnv('PGPASSWORD', '');
+    const pool = new pg.Pool({
+      Client: ClientOfEarlierPg,
+      host: server.hostname,
+      port: Number(server.port || 5432),
+      database,
+      user: decodeURIComponent(server.username),
+      password: async function (this: unknown, ...args: unknown[]) {
+        return args.length === 0 && this instanceof ClientOfEarlierPg ? decodeURIComponent(server.password) : 'not-the-password';
+      },
+    } as pg.PoolConfig);
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE client_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-client.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.client_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg reads no passfile parameter: with no password it reads the file
+  // PGPASSFILE names, else ~/.pgpass (pgpass 1.0.5, lib/helper.js:56-58),
+  // where libpq reads the passfile parameter first. Given the parameter,
+  // pg_dump read another file than the pool, and logged in with another
+  // password.
+  it('logs pg_dump in from the password file the pool reads, past a passfile parameter pg does not read', async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    // libpq and pgpass read a password file only when no one else may read it.
+    const passwordFile = (name: string, password: string): string => {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, `*:*:*:*:${password}\n`, { mode: 0o600 });
+      return file;
+    };
+    vi.stubEnv('PGPASSWORD', undefined);
+    vi.stubEnv('PGPASSFILE', passwordFile(`${database}-read.pgpass`, decodeURIComponent(server.password)));
+    const other = passwordFile(`${database}-other.pgpass`, 'not-the-password');
+    const pool = new pg.Pool({
+      connectionString: `postgresql://${server.username}@${server.host}/${database}?passfile=${encodeURIComponent(other)}`,
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE passfile_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-passfile.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.passfile_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
+  // pg reads a pool's port with parseInt (lib/connection-parameters.js:70),
+  // so 5432x is 5432 to pg, and libpq refused it as no number.
+  it('exports through a pool whose port pg reads with parseInt, where pg reaches', async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    const pool = new pg.Pool({
+      host: server.hostname,
+      port: `${server.port || 5432}x` as unknown as number,
+      database,
+      user: decodeURIComponent(server.username),
+      password: decodeURIComponent(server.password),
+    });
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE port_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-port.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.port_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
+  });
+
   // open({ connectionString }) gives the adapter a database its options do not
   // name: the exporter reads the pool the adapter runs on when an export runs.
   it('exports an adapter given its connection string at open(), from features made before it opened', async () => {
@@ -126,5 +415,33 @@ describe.skipIf(!POSTGRES_TEST_URL)('the PostgreSQL exporter, through pg_dump', 
     await exporter.exportToFile(file);
 
     expect(dumpedTables(file)).toEqual([`${segment}.opened_items`]);
+  });
+
+  // A pg before 8.22.0 reads no sslnegotiation, and under it a
+  // pg-connection-string before 2.14.0 makes no TLS of sslnegotiation=direct,
+  // so the pool connects to CI's server, which offers no TLS. pg_dump was
+  // given sslnegotiation=direct with verify-full, which this server cannot
+  // meet, and which a libpq before 17 refuses as a parameter it does not know.
+  it('exports through a pool whose pg reads nothing in sslnegotiation=direct, where the pool connects without TLS', async () => {
+    const database = await newDatabase();
+    const server = new URL(url);
+    server.pathname = `/${database}`;
+    server.searchParams.set('sslnegotiation', 'direct');
+    const pool = new pg.Pool({
+      connectionString: server.toString(),
+      Client: clientOfPgBeforeDirectNegotiation('reads-nothing'),
+    } as pg.PoolConfig);
+    const adapter = createPostgresAdapter({ pool });
+    try {
+      await adapter.exec('CREATE TABLE negotiation_items (id INTEGER PRIMARY KEY)');
+
+      const file = path.join(dir, `${database}-negotiation.dump`);
+      await createStorageFeatures(adapter).exporter.exportToFile(file);
+
+      expect(dumpedTables(file)).toEqual(['public.negotiation_items']);
+    } finally {
+      await adapter.close();
+      await pool.end();
+    }
   });
 });

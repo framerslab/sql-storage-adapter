@@ -16,7 +16,12 @@ describe('pgDumpInvocation', () => {
   it('passes the path and the connection string as single arguments and the password in PGPASSWORD alone', () => {
     const { file, args, env } = pgDumpInvocation('postgresql://dump_user:p%40ss%20word@db.example:5432/app?sslmode=require', HOSTILE_PATH);
     expect(file).toBe('pg_dump');
-    expect(args).toEqual(['--dbname=postgresql://dump_user@db.example:5432/app?sslmode=require', '--format=custom', `--file=${HOSTILE_PATH}`]);
+    expect(args).toEqual([
+      '--dbname=postgresql://dump_user@db.example:5432/app?sslmode=require',
+      '--format=custom',
+      '--no-password',
+      `--file=${HOSTILE_PATH}`,
+    ]);
     expect(env.PGPASSWORD).toBe('p@ss word');
     for (const arg of args) {
       expect(arg).not.toContain('p@ss');
@@ -28,7 +33,7 @@ describe('pgDumpInvocation', () => {
     const before = process.env.PGPASSWORD;
     expect(pgDumpInvocation('postgres://reader@db.example/app').env.PGPASSWORD).toBe(before);
     const keyword = 'host=db.example dbname=app user=reader';
-    expect(pgDumpInvocation(keyword).args).toEqual([`--dbname=${keyword}`, '--format=custom']);
+    expect(pgDumpInvocation(keyword).args).toEqual([`--dbname=${keyword}`, '--format=custom', '--no-password']);
   });
 });
 
@@ -120,5 +125,30 @@ describe.skipIf(!process.env.POSTGRES_TEST_URL || !hasPgDump())('PostgresExporte
     expect(fs.readFileSync(target).toString('latin1')).toContain('CREATE TABLE public.exported_rows');
     expect(fs.existsSync(path.join(process.cwd(), marker))).toBe(false);
     expect(fs.existsSync(path.join(process.cwd(), `${marker}-sub`))).toBe(false);
+  });
+
+  // After a closing quote libpq reads the next keyword at once, with no space
+  // between, and a later host replaces the earlier one (fe-connect.c,
+  // conninfo_parse and conninfo_storeval). pg_dump given the settings as they
+  // are reaches the server the later host names, and the export, which takes
+  // the quoted password out for PGPASSWORD, reaches the same one.
+  it('reaches, as libpq reads them, the host of a setting right after a quoted password', async () => {
+    const url = new URL(databaseUrl);
+    const quoted = decodeURIComponent(url.password).replace(/[\\']/g, '\\$&');
+    const settings =
+      `host=unreachable.invalid password='${quoted}'host=${url.hostname} port=${url.port || '5432'} ` +
+      `user=${decodeURIComponent(url.username)} dbname=${database}`;
+
+    const schema = execFileSync('pg_dump', [`--dbname=${settings}`, '--schema-only', '--no-password', '--table=exported_rows'], {
+      encoding: 'utf8',
+      env: { ...process.env, PGPASSWORD: '' },
+    });
+    expect(schema).toContain('CREATE TABLE public.exported_rows');
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-dump-'));
+    dirs.push(dir);
+    const target = path.join(dir, 'after-quote.custom');
+    await new PostgresExporter(settings).exportToFile(target);
+    expect(fs.readFileSync(target).toString('latin1')).toContain('CREATE TABLE public.exported_rows');
   });
 });
