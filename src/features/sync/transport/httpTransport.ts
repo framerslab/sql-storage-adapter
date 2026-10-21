@@ -506,7 +506,7 @@ export class HttpTransport extends BaseTransport {
    * Clear all pending requests.
    */
   private _clearPendingRequests(error: Error): void {
-    for (const [id, pending] of this._pendingRequests) {
+    for (const pending of this._pendingRequests.values()) {
       clearTimeout(pending.timer);
       pending.reject(error);
     }

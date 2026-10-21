@@ -1,3 +1,8 @@
+## [0.8.2] - 2026-10-21
+
+### Fixed
+- The Electron auto-migrator records the version Electron's app reports beside each migration it runs. With no `getAppVersion` of the caller's, it asked Electron through `require('electron')`, which the package's ES module build does not have, so it recorded the working directory's `package.json` version, or `0.0.0`, in an Electron app too. It asks through `createRequire(import.meta.url)` now, which both builds have. A spec stands in for Electron's app and checks the version recorded with it and without it.
+
 ## [0.8.1] - 2026-10-19
 
 ### Fixed

@@ -33,8 +33,8 @@
  */
 
 import path from 'path';
-import { BrowserWindow, app } from 'electron';
-import { BetterSqliteAdapter, createBetterSqliteAdapter } from '../betterSqliteAdapter';
+import { BrowserWindow } from 'electron';
+import { createBetterSqliteAdapter } from '../betterSqliteAdapter';
 import { initializeIpcProtocol, disposeIpcProtocol } from './ipc/protocol';
 import { BROADCAST_CHANNELS } from './ipc/channels';
 import { segmentFilePath } from '../../shared/segment';

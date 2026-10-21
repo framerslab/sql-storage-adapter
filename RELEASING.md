@@ -25,8 +25,12 @@ A push whose version npm already has publishes nothing.
 
 Do not push a version tag by hand.
 
+## How the publish authenticates
+
+npm trusted publishing is configured for this package and `release.yml`: the job's OIDC token (`permissions: id-token: write`) is exchanged with the registry for a publish token. npm makes that exchange from version 11.5.1, so the job installs npm 11.20.0 before it publishes. A version published this way names GitHub Actions as its publisher on npm and carries a provenance statement. See [npm's trusted publishers page](https://docs.npmjs.com/trusted-publishers).
+
 ## Required secrets
 
-- `NPM_TOKEN`: an npm token with publish access to `@framers/sql-storage-adapter`.
+- `NPM_TOKEN`: an npm token with publish access to `@framers/sql-storage-adapter`, which npm uses only when the exchange fails.
 
 `GITHUB_TOKEN`, which GitHub Actions provides, creates the tag and the release.
