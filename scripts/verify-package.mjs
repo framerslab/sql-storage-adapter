@@ -6,11 +6,14 @@
 // 1. require() loads the root and every subpath entry, and the CommonJS build
 //    runs: an in-memory sql.js database opened through the ./sqljs entry
 //    answers a query, and the root's class is the subpath's class.
-// 2. Server entries stay free of what they do not use: bundled with esbuild,
+// 2. Each entry stays free of what it does not use: bundled with esbuild,
 //    ./postgres, ./core and ./better-sqlite3 pull in no sql.js and no
-//    @aws-sdk/client-s3, and ./electron/renderer pulls in no better-sqlite3.
+//    @aws-sdk/client-s3, ./electron/renderer pulls in no better-sqlite3, and
+//    ./browser pulls in no pg, better-sqlite3 or @aws-sdk/client-s3.
 // 3. The bundled CommonJS preload loads alone, with only 'electron' outside
 //    it, and exposes its API through contextBridge.
+// 4. dist/cjs/package.json repeats the root's "browser" field, which webpack
+//    reads for the CommonJS files from that package.json, the nearest one.
 
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
@@ -27,7 +30,7 @@ const check = (ok, message) => {
 };
 
 // 1. CommonJS
-const entries = ['', '/core', '/postgres', '/better-sqlite3', '/sqljs', '/indexeddb', '/capacitor', '/backup', '/authjs', '/types', '/electron/renderer', '/sync', '/kv'];
+const entries = ['', '/core', '/postgres', '/better-sqlite3', '/sqljs', '/indexeddb', '/capacitor', '/backup', '/authjs', '/types', '/electron/renderer', '/sync', '/kv', '/browser'];
 for (const entry of entries) {
   try {
     const loaded = requireFromConsumer(`${PACKAGE}${entry}`);
@@ -45,7 +48,7 @@ const row = await db.get('SELECT $1 + 1 AS two', [1]);
 await db.close();
 check(row?.two === 2, `a CommonJS sql.js adapter answers a query: ${JSON.stringify(row)}`);
 
-// 2. What each server entry bundles. The drivers and optional peers stay
+// 2. What each entry bundles. The drivers and optional peers stay
 // outside the bundle, so each one an entry reaches is listed among its imports.
 const DRIVERS = ["sql.js", "better-sqlite3", "pg", "pg-native", "@aws-sdk/client-s3", "@capacitor-community/sqlite", "electron"];
 const reaches = (paths, name) => paths.some((p) => p === name || p.startsWith(`${name}/`) || p.includes(`node_modules/${name}/`));
@@ -55,6 +58,7 @@ const isolation = [
   { entry: "/authjs", forbidden: ["sql.js", "better-sqlite3", "pg", "@aws-sdk/client-s3"], files: [] },
   { entry: "/better-sqlite3", forbidden: ["sql.js", "pg", "@aws-sdk/client-s3"], files: [] },
   { entry: "/electron/renderer", forbidden: ["better-sqlite3", "sql.js"], files: ["betterSqliteAdapter", "electronMainAdapter"] },
+  { entry: "/browser", forbidden: ["pg", "better-sqlite3", "@aws-sdk/client-s3"], files: [] },
 ];
 for (const { entry, forbidden, files } of isolation) {
   const probe = path.join(consumer, `probe-${entry.replace(/\W+/g, "-")}.mjs`);
@@ -90,6 +94,16 @@ const requires = [...preloadSource.matchAll(/require\((['"])([^'"]+)\1\)/g)].map
 check(
   requires.every((name) => name === 'electron'),
   `the bundled preload requires only electron: ${[...new Set(requires)].join(', ') || 'nothing'}`,
+);
+
+// 4. The browser field of the CommonJS build
+const packageDir = path.dirname(requireFromConsumer.resolve(`${PACKAGE}/package.json`));
+const readPackage = (relativePath) => JSON.parse(fs.readFileSync(path.join(packageDir, relativePath), 'utf8'));
+const rootBrowser = readPackage('package.json').browser;
+const cjsBrowser = readPackage('dist/cjs/package.json').browser;
+check(
+  rootBrowser !== undefined && JSON.stringify(cjsBrowser) === JSON.stringify(rootBrowser),
+  `dist/cjs/package.json repeats the root's browser field: ${JSON.stringify(cjsBrowser)}`,
 );
 
 if (failures.length) {

@@ -157,3 +157,6 @@ export {
   type ChangeLogEntry as SyncLogChange,
   type ConflictEntry as SyncLogConflict,
 } from './tables/syncLogManager';
+
+// Mutation sync: ordered pushes, consistent pulls, rebase and restore epochs
+export * from './mutations';

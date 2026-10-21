@@ -8,9 +8,11 @@ A push to `master` that changes `package.json`, a file under `src/` or the workf
 
 ## What the workflow does
 
+Its runs go one at a time, in the order they began to wait: a run that starts while another runs waits for it, and up to 100 wait, so a newer run never replaces one still waiting.
+
 1. Installs the dependencies, runs the tests and builds the package.
-2. Reads the version in `package.json` and compares it with npm's latest version of the package.
-3. When they differ, publishes the package to npm.
+2. Reads the version in `package.json` and asks npm whether it holds that exact version.
+3. When npm does not, publishes the package to npm.
 4. Creates the GitHub release `v<version>`, with the notes of that version's `## [<version>]` section in `CHANGELOG.md`, unless a release with that tag exists. The release creates the tag.
 
 A push whose version npm already has publishes nothing.

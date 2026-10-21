@@ -29,6 +29,7 @@ The SQL Storage Adapter provides a single, ergonomic interface over SQLite (nati
 - [Adapter Matrix](#adapter-matrix)
 - [Electron Adapter](#electron-adapter)
 - [Cross-Platform Sync](#cross-platform-sync)
+- [Mutation Sync](#mutation-sync)
 - [Configuration & Resolution](#configuration--resolution)
 - [Segments](#segments)
 - [A PostgreSQL Pool of Your Own](#a-postgresql-pool-of-your-own)
@@ -50,7 +51,7 @@ The SQL Storage Adapter provides a single, ergonomic interface over SQLite (nati
 - **🆕 Lifecycle Hooks** – Extensible hooks (`onBeforeQuery`, `onAfterQuery`, `onBeforeWrite`, `onAfterWrite`) for logging, analytics, caching, and custom extensions.
 - **Cloud backups & migrations** – built-in backup manager with compression, retention policies, and restore helpers plus migration utilities.
 - **Portable packaging** – optional native dependencies; falls back to pure TypeScript/WASM adapters when native modules are unavailable.
-- **Browser-friendly** – Dynamic imports prevent bundlers from including server-only dependencies (`pg`, `path`) in browser builds.
+- **Browser-friendly** – `./browser` imports no Node built-in and no pg, and the `browser` field of `package.json` maps `async_hooks`, which the better-sqlite3 adapter loads only when it opens on Node, to an empty module in a page that bundles the root entry.
 - **Mobile/Offline Parity** – Same APIs work across desktop, mobile (Capacitor), and browser with automatic sync support.
 - **🆕 SQL Dialect** – Write cross-platform SQL with `SqlDialect` interface. Automatically translates `INSERT OR IGNORE`, `json_extract`, `ifnull`, `PRAGMA` between SQLite and PostgreSQL.
 - **🆕 Full-Text Search** – `IFullTextSearch` interface abstracts FTS5 (SQLite) and tsvector/GIN (PostgreSQL) with unified `createIndex`, `matchClause`, `rankExpression`, and `rebuildCommand` APIs.
@@ -95,9 +96,10 @@ import { createStorageFeatures, runSchemaMigrations, isUniqueViolation } from '@
 | `./backup` | S3-compatible backups (`@aws-sdk/client-s3`) |
 | `./authjs` | The Auth.js database adapter (also in `./core`) |
 | `./electron`, `./electron/renderer`, `./electron/preload` | The Electron adapters. `./electron/renderer` holds only what a window uses; `require('./electron/preload')` gives one bundled CommonJS file for a sandboxed preload |
-| `./sync`, `./kv`, `./types` | Cross-platform sync, the key-value store, the types |
+| `./sync`, `./kv`, `./types` | Cross-platform sync and the mutation sync, the key-value store, the types |
+| `./browser` | What a page needs, in one entry: the IndexedDB adapter, the key-value module with its migration, the tab lock, and the mutation sync's client with its wire contract, transport, loop and change channel. Its modules import no Node built-in and no pg: the one package they import is sql.js |
 
-Every entry has an `import` and a `require` condition. The CommonJS build under `dist/cjs` is made from the ES module build file by file, so a class has one identity whichever entry a caller takes it from. It carries its own declarations, so a CommonJS TypeScript consumer under `node16` resolution type-checks against them. CI packs the package, installs it in a new project and checks each of these: `require()` of every entry, what each server entry bundles, and the preload.
+Every entry has an `import` and a `require` condition. The CommonJS build under `dist/cjs` is made from the ES module build file by file, so a class has one identity whichever entry a caller takes it from. It carries its own declarations, so a CommonJS TypeScript consumer under `node16` resolution type-checks against them. CI packs the package, installs it in a new project and checks each of these: `require()` of every entry, what each server entry and `./browser` bundle, the preload, and that the CommonJS build repeats the `browser` field.
 
 ## Quick Start
 
@@ -262,6 +264,10 @@ await sync.connect();
 | `merge` | Field-level merge with custom mergers |
 | `manual` | Defer to UI hook for user decision |
 
+## Mutation Sync
+
+`@framers/sql-storage-adapter/sync` also holds a mutation sync for named text rows that a server and many browsers keep the same. A browser saves its rows with the mutations that make them in one transaction of its own database and never waits on the network. The server runs every client's mutations in one order, each push in one transaction that records the client's last mutation id, so a push sent again applies nothing twice, and settles each conflict by that order, keeping a differing value as a copy whose id every side derives alike. A pull streams the server's changes from one snapshot, and the browser replays what the server has not answered over them with the same functions the server runs. The protocol also recovers a browser after a restore of the server's database, keeps a value the server cannot read in the browser that has it, and checks that the server holds every row before a browser removes its own. The server's half (`MutationServer` over your own tables or the reference `createSqlMutationStore`, and `DrainGate`) is in `./sync`; the client's half (`MutationClient`, `createFetchMutationTransport`, `SyncLoop` and `createTabLock`) is in `./sync` and `./browser`. See [**guides/MUTATION_SYNC.md**](./guides/MUTATION_SYNC.md) for both halves, with an example server, its routes and a page.
+
 ## Configuration & Resolution
 
 - `resolveStorageAdapter` inspects:
@@ -290,7 +296,7 @@ await db.transaction(async (trx) => {
 
 The IndexedDB, Capacitor and better-sqlite3 adapters run every transaction on one connection, so they run transactions one at a time, and a statement from another caller waits until the open transaction ends: it neither joins the transaction (and vanishes in its rollback) nor reads what the transaction has not committed. A browser or a WebView has no async context to tell the callback's own statements apart, so on the IndexedDB and Capacitor adapters a statement the callback issues through the adapter itself, not through its handle, waits for the transaction too. The two then wait on each other, and the adapter logs a warning after 10 seconds. (On Node, better-sqlite3 tells them apart with `AsyncLocalStorage`.) Inside a callback, run every statement through the handle, and do not await work that itself needs the database.
 
-The PostgreSQL adapter runs each transaction on its own pooled connection, so transactions run side by side. When the connection breaks during a transaction and its ROLLBACK fails too, `transaction()` still throws the transaction's own error (the callback's, or COMMIT's), with the ROLLBACK error on it as a non-enumerable `rollbackError` property. The broken connection is closed, not returned to the pool. A connection the server closes while a callback holds it, between statements, does not end the process. Once a transaction has ended, its handle runs on the pool, as the adapter's own statements do, and its `transaction()` begins a new transaction.
+The PostgreSQL adapter runs each transaction on its own pooled connection, so transactions run side by side. When the connection breaks during a transaction and its ROLLBACK fails too, `transaction()` still throws the transaction's own error (the callback's, or COMMIT's), with the ROLLBACK error on it as a non-enumerable `rollbackError` property. An error aborts a PostgreSQL transaction, and PostgreSQL answers the COMMIT of an aborted transaction with ROLLBACK and no error of its own ([utility.c](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/utility.c#L633-L640)), so when a statement in the callback fails and the callback catches its error and goes on, nothing of the transaction is written, and `transaction()` rejects. A statement that may fail inside a transaction runs under a savepoint of its own, as `batch()` runs each operation. The broken connection is closed, not returned to the pool. A connection the server closes while a callback holds it, between statements, does not end the process. Once a transaction has ended, its handle runs on the pool, as the adapter's own statements do, and its `transaction()` begins a new transaction.
 
 ### Batches
 
@@ -692,7 +698,7 @@ await kv.set('notes/1', { title: 'One', saved: new Date() });
 const mine = namespaced(kv, 'user-42/');
 
 // In one IndexedDB object store, where a page already keeps its values
-const page = await openIndexedDbStore({ dbName: 'sayshere', storeName: 'kv' });
+const page = await openIndexedDbStore({ dbName: 'app', storeName: 'kv' });
 ```
 
 `KeyValueStore` has `get`, `set`, `delete`, `keys(prefix)` and `deletePrefix(prefix)`, and `memoryOnly`, true when nothing outlives the page or the process. `namespaced(store, prefix)` scopes a store to a prefix: end each prefix with a character no id holds (`ann/`, `anna/`), since the keys under `anna` are among those under `ann`.
