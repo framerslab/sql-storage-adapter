@@ -30,6 +30,8 @@ export interface PgConnectionSettings {
   password?: unknown;
   /** pg's `ssl`: `true`, `false`, or Node TLS options. */
   ssl?: unknown;
+  /** pg's `sslnegotiation`, `direct` or `postgres`, which pg reads from 8.22.0. */
+  sslnegotiation?: unknown;
 }
 
 /** The connection pg makes from a set of settings. */
@@ -54,9 +56,10 @@ const environment = (): Environment =>
  * The parameters of a connection string that pg reads and that libpq takes in a connection URI (PostgreSQL 18,
  * `fe-connect.c`, `PQconninfoOptions`): the settings pg sends when it connects (`options`, `application_name`,
  * `fallback_application_name`, `client_encoding`, `replication`; pg 8.23.1 `lib/connection-parameters.js:63-124`),
- * `sslnegotiation`, which pg reads from 8.22.0, and the certificate files pg-connection-string reads (`sslcert`,
- * `sslkey`, `sslrootcert`; `index.js:88-100`). The URI spells out the user, the host, the port and the database, and
- * `sslmode` is written for the TLS pg uses. libpq's other parameters pg does not read, and pg_dump given them would
+ * and the certificate files pg-connection-string reads (`sslcert`, `sslkey`, `sslrootcert`; `index.js:88-100`). The
+ * URI spells out the user, the host, the port and the database, `sslmode` is written for the TLS pg uses, and
+ * `sslnegotiation` is written as the pool's own pg reads it (`sslNegotiationOf`), not as the string gives it, since a
+ * pg before 8.22.0 reads none. libpq's other parameters pg does not read, and pg_dump given them would
  * read another password file than the pool (`passfile`), or refuse a server, an authentication or a session the pool
  * takes (`target_session_attrs`, `require_auth`, `channel_binding`, `gssencmode`, `sslcrl` and the rest), so they
  * are left out; so are pg's own (`statement_timeout`, `uselibpqcompat`), which libpq refuses in a URI, and
@@ -69,7 +72,6 @@ const PG_READ_PARAMETERS = new Set([
   'fallback_application_name',
   'client_encoding',
   'replication',
-  'sslnegotiation',
   'sslcert',
   'sslkey',
   'sslrootcert',
@@ -101,15 +103,17 @@ const sslFromEnvironment = (sslmode: string | undefined): unknown => {
  * last value of a repeated parameter counting, or undefined where it makes none, so that pg reads the settings'
  * `ssl`, then `PGSSLMODE`. A certificate file or an `sslmode` turns TLS on over `ssl=0`; `sslmode=disable` turns it
  * off; `sslmode=no-verify`, and with `uselibpqcompat=true` `sslmode=prefer`, or `require` with no root certificate,
- * check no certificate.
+ * check no certificate. `sslnegotiation=direct` turns TLS on where the string sets no other TLS, as
+ * pg-connection-string does from 2.14.0 (index.js:81-86); an earlier one reads nothing in it, which
+ * `directTurnsTlsOn` false stands for.
  */
-const sslOfParameters = (last: (name: string) => string | undefined): unknown => {
+const sslOfParameters = (last: (name: string) => string | undefined, directTurnsTlsOn: boolean): unknown => {
   let ssl: unknown = last('ssl');
   if (ssl === 'true' || ssl === '1') ssl = true;
   if (ssl === '0') ssl = false;
   const sslmode = last('sslmode');
   if (last('sslcert') || last('sslkey') || last('sslrootcert') || sslmode) ssl = {};
-  if (last('sslnegotiation') === 'direct' && ssl === undefined) ssl = true;
+  if (directTurnsTlsOn && last('sslnegotiation') === 'direct' && ssl === undefined) ssl = true;
   if (sslmode === 'disable') return false;
   const compatible = last('uselibpqcompat') === 'true';
   const checksNone = compatible
@@ -277,13 +281,127 @@ const tlsSettingsBeyondSslmode = (ssl: unknown): string[] =>
     : [];
 
 /**
+ * How the pool's pg reads `sslnegotiation`, which says how its connections start TLS. pg reads it from 8.22.0
+ * (`lib/connection-parameters.js:104-112`: the connection string's over the settings', an empty one as none, then
+ * `PGSSLNEGOTIATION`; a value but `direct` or `postgres`, or `direct` without TLS, it refuses) and with `direct`
+ * starts TLS at once; pg 8.13.1 to 8.21.x read none and start TLS with an SSLRequest. pg-connection-string turns TLS
+ * on for `sslnegotiation=direct` from 2.14.0 (`index.js:81-86`), and the caret ranges of pg before 8.22.0 admit a
+ * version either side of it.
+ */
+interface SslNegotiation {
+  /** Whether the pool's pg reads `sslnegotiation`. */
+  read: boolean;
+  /** What it reads: `direct` or `postgres`, or undefined for none. */
+  value?: string;
+  /** Whether its parse of a connection string turns TLS on for `sslnegotiation=direct`. */
+  directTurnsTlsOn: boolean;
+}
+
+/** Whether the warning that sslnegotiation was read without pg has been written; it is written once. */
+let toldNegotiationUnread = false;
+
+/**
+ * A connection string whose one TLS setting is `sslnegotiation=direct`, beside settings whose `ssl` is false, which
+ * the parse's TLS overrides and which keeps pg from reading `PGSSLMODE`: a client of it uses TLS exactly where its
+ * parse turns TLS on for `direct`.
+ */
+const DIRECT_PROBE = { connectionString: 'postgresql://probe@localhost/probe?sslnegotiation=direct', ssl: false };
+
+/** The `ConnectionParameters` of a pg client, where it has them. */
+const connectionParametersOf = (client: unknown): Record<string, unknown> | undefined => {
+  const parameters = (client as { connectionParameters?: unknown } | null | undefined)?.connectionParameters;
+  return parameters !== null && typeof parameters === 'object' ? (parameters as Record<string, unknown>) : undefined;
+};
+
+/**
+ * The refusal of an export whose pool's pg refuses its `sslnegotiation`, so that the pool makes no connection.
+ * pg's two refusals of it are named; any other error a client of the settings meets is left out of the message,
+ * which a log may show and which could hold the connection string.
+ */
+const negotiationRefusal = (error: unknown): Error => {
+  const said = error instanceof Error ? error.message : '';
+  const named = /sslnegotiation/i.test(said) && !/[@/]/.test(said) ? ` (${said})` : '';
+  return new Error(
+    `PostgresExporter: the pool's pg refuses its settings${named}, so the pool makes no connection, and pg_dump ` +
+      'makes none either.',
+  );
+};
+
+/**
+ * Reads `sslnegotiation` as the pool's own pg reads it, on a client of the pool's settings made with the pool's
+ * `Client` where the pool names one, as pg-pool keeps it, and otherwise with the pg this library loads; the client is
+ * made without the settings' `stream` and `connection` and never connected. A second client, of `DIRECT_PROBE`, shows
+ * whether that Client's parse turns TLS on for `direct`. Where that Client cannot be read, the reading is pg 8.22.0's
+ * and later's, which a warning says once. Nothing is read where neither the connection string, the settings nor
+ * `PGSSLNEGOTIATION` name an sslnegotiation.
+ *
+ * @throws {Error} When the pool's pg refuses the settings: an sslnegotiation it does not know, or `direct` without
+ *   TLS.
+ */
+const sslNegotiationOf = async (
+  settings: PgConnectionSettings,
+  PoolClient: unknown,
+  env: Environment,
+): Promise<SslNegotiation> => {
+  const fromString = settings.connectionString
+    ? parseAsPg(settings.connectionString)
+        ?.parameters.filter(([key]) => key === 'sslnegotiation')
+        .pop()?.[1]
+    : undefined;
+  if (fromString === undefined && settings.sslnegotiation === undefined && !env.PGSSLNEGOTIATION) {
+    return { read: true, directTurnsTlsOn: true };
+  }
+  const Client = typeof PoolClient === 'function' ? PoolClient : (await loadPg()).Client;
+  if (typeof Client === 'function') {
+    const Made = Client as new (config: object) => unknown;
+    let parameters: Record<string, unknown> | undefined;
+    try {
+      parameters = connectionParametersOf(
+        // pg-pool keeps the settings' password from enumeration, so it is copied by name.
+        new Made({ ...settings, password: settings.password, stream: undefined, connection: undefined }),
+      );
+    } catch (error) {
+      throw negotiationRefusal(error);
+    }
+    if (parameters !== undefined) {
+      let directTurnsTlsOn = false;
+      if (fromString === 'direct') {
+        try {
+          directTurnsTlsOn = Boolean(connectionParametersOf(new Made({ ...DIRECT_PROBE }))?.ssl);
+        } catch {
+          // A pg that reads direct without a parse that turns TLS on refuses the probe: its parse does not.
+        }
+      }
+      const read = 'sslnegotiation' in parameters;
+      const value = parameters.sslnegotiation;
+      return { read, value: read && typeof value === 'string' && value ? value : undefined, directTurnsTlsOn };
+    }
+  }
+  if (!toldNegotiationUnread) {
+    toldNegotiationUnread = true;
+    getStorageLogger().warn(
+      { scope: 'PostgresExporter', pgClient: typeof Client === 'function' },
+      "The pg the pool connects with could not be read, so sslnegotiation is read as pg 8.22.0 and later read it: " +
+        "the connection string's over the settings', then PGSSLNEGOTIATION.",
+    );
+  }
+  const given = fromString !== undefined ? fromString : settings.sslnegotiation;
+  const value = typeof given === 'string' && given ? given : env.PGSSLNEGOTIATION || undefined;
+  return { read: true, value, directTurnsTlsOn: true };
+};
+
+/**
  * Reads connection settings as pg reads them for each connection of a pool: a connection string's parts over the
  * settings', then the environment, then pg's defaults. Undefined where pg cannot read the connection string.
  *
  * @throws {Error} When the settings ask for TLS options libpq takes only from files, or the connection string for
  *   `verify-ca` read as libpq reads it with no root certificate, or a port pg reads no number in, which pg refuses.
  */
-const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnection | undefined => {
+const readAsPg = (
+  settings: PgConnectionSettings,
+  env: Environment,
+  negotiation: SslNegotiation,
+): PgConnection | undefined => {
   let user = settings.user;
   let password = settings.password;
   let host = settings.host;
@@ -311,7 +429,7 @@ const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnectio
     if ('port' in parsed) port = parsed.port;
     const last = (name: string): string | undefined =>
       parsed.parameters.filter(([key]) => key === name).pop()?.[1];
-    const fromString = sslOfParameters(last);
+    const fromString = sslOfParameters(last, negotiation.directTurnsTlsOn);
     if (fromString !== undefined) {
       ssl = fromString;
       source = 'string';
@@ -332,6 +450,9 @@ const readAsPg = (settings: PgConnectionSettings, env: Environment): PgConnectio
       if (PG_READ_PARAMETERS.has(key)) parameters.push([key, value]);
     }
   }
+  // The sslnegotiation the pool's pg reads, which libpq takes from 17 on; an earlier libpq refuses the parameter, and
+  // PostgresExporter says so.
+  if (negotiation.read && negotiation.value) parameters.push(['sslnegotiation', negotiation.value]);
   if (source === 'environment') ssl = sslFromEnvironment(env.PGSSLMODE);
 
   const tls = tlsOf(ssl);
@@ -568,7 +689,8 @@ export const libpqConnectionStringOf = async (
     return connectionString;
   }
   const env = environment();
-  const connection = readAsPg(settings, env);
+  if (connectionString && parseAsPg(connectionString) === undefined) return connectionString;
+  const connection = readAsPg(settings, env, await sslNegotiationOf(settings, PoolClient, env));
   if (connection === undefined) return connectionString;
   if (!connection.database) return undefined;
 

@@ -13,6 +13,14 @@ export interface PostgresExporterOptions {
    * pg_dump needs one.
    */
   missingConnection?: string;
+  /**
+   * libpq variables left out of pg_dump's environment. The exporter of a
+   * PostgreSQL adapter leaves out `PGSSLNEGOTIATION`: the connection URI it
+   * hands pg_dump holds the `sslnegotiation` the pool's own pg reads, which is
+   * none for a pg before 8.22.0, where libpq 17 and later would read the
+   * variable and start TLS otherwise than the pool. Default: none.
+   */
+  unsetEnvironment?: readonly string[];
 }
 
 /** How `pg_dump` is started: the program, its arguments and its environment. */
@@ -36,6 +44,17 @@ const SYSTEM_ROOTS_ADVICE =
   " libpq reads sslrootcert=system as the system's certificate authorities from PostgreSQL 16 on, and an older " +
   'libpq looks for a file named system: run a pg_dump of PostgreSQL 16 or later, or name the root certificate file ' +
   "in the connection string's sslrootcert parameter or in PGSSLROOTCERT.";
+
+/**
+ * What libpq older than PostgreSQL 17 says of `sslnegotiation`, a URI parameter it does not know (fe-connect.c,
+ * conninfo_uri_parse_params); libpq 17 and later read it, and `PGSSLNEGOTIATION`.
+ */
+const NO_SSL_NEGOTIATION = /invalid URI query parameter: "sslnegotiation"/;
+
+/** What to do where pg_dump's libpq does not know `sslnegotiation`. */
+const SSL_NEGOTIATION_ADVICE =
+  ' The connection names an sslnegotiation, which libpq reads from PostgreSQL 17 on: run a pg_dump of PostgreSQL 17 ' +
+  'or later.';
 
 /**
  * The scheme of a connection URI, at the very start. libpq knows it in lower
@@ -233,7 +252,8 @@ const connectionOf = (connectionString: string): { dbname: string; env: Record<s
  * `PGPASSWORD` empty, so libpq sends no password of the environment's. pg_dump
  * runs with `--no-password`: it never asks for one, on a terminal or on its
  * standard input, which `execFile` leaves open. With `schema`, the dump holds
- * that schema alone.
+ * that schema alone. The variables `unsetEnvironment` names are left out of
+ * its environment.
  *
  * @throws {Error} Before pg_dump starts, when the connection string holds a
  *   NUL character, a password that is not valid percent-encoding or decodes
@@ -243,7 +263,7 @@ const connectionOf = (connectionString: string): { dbname: string; env: Record<s
 export function pgDumpInvocation(
   connectionString: string,
   outputPath?: string,
-  options: Pick<PostgresExporterOptions, 'schema'> = {},
+  options: Pick<PostgresExporterOptions, 'schema' | 'unsetEnvironment'> = {},
 ): PgDumpInvocation {
   const { dbname, env } = connectionOf(connectionString);
   // Without a password, to a server that asks for one, pg_dump would ask for it on the terminal, or with no
@@ -254,7 +274,9 @@ export function pgDumpInvocation(
     args.push(`--schema="${options.schema.replace(/"/g, '""')}"`);
   }
   if (outputPath !== undefined) args.push(`--file=${outputPath}`);
-  return { file: 'pg_dump', args, env: { ...(typeof process !== 'undefined' ? process.env : {}), ...env } };
+  const inherited: NodeJS.ProcessEnv = { ...(typeof process !== 'undefined' ? process.env : {}) };
+  for (const name of options.unsetEnvironment ?? []) delete inherited[name];
+  return { file: 'pg_dump', args, env: { ...inherited, ...env } };
 }
 
 /**
@@ -302,7 +324,10 @@ export class PostgresExporter implements IDatabaseExporter {
     if (!connectionString) {
       throw new Error(this.options.missingConnection ?? 'PostgresExporter requires a connection string for pg_dump.');
     }
-    const { file, args, env } = pgDumpInvocation(connectionString, outputPath, { schema: this.options.schema });
+    const { file, args, env } = pgDumpInvocation(connectionString, outputPath, {
+      schema: this.options.schema,
+      unsetEnvironment: this.options.unsetEnvironment,
+    });
 
     const { execFile } = await import('node:child_process');
     return new Promise<Buffer>((resolve, reject) => {
@@ -323,7 +348,11 @@ export class PostgresExporter implements IDatabaseExporter {
         // pg_dump's own words. The error's message repeats the command
         // line, which can hold a password, so it is left out.
         const said = stderr ? stderr.toString('utf8').trim() : '';
-        const advice = NO_SYSTEM_ROOTS.test(said) ? SYSTEM_ROOTS_ADVICE : '';
+        const advice = NO_SYSTEM_ROOTS.test(said)
+          ? SYSTEM_ROOTS_ADVICE
+          : NO_SSL_NEGOTIATION.test(said)
+            ? SSL_NEGOTIATION_ADVICE
+            : '';
         reject(
           new Error(
             `PostgresExporter: pg_dump failed${typeof code === 'number' ? ` (exit code ${code})` : ''}${said ? `: ${said}` : '.'}${advice}`,

@@ -69,6 +69,8 @@ function postgresExporterOf(adapter: StorageAdapter): PostgresExporter {
   const options = postgres.options;
   const exportOptions: PostgresExporterOptions = {
     ...(options?.segment ? { schema: options.segment } : {}),
+    // The URI holds the sslnegotiation the pool's pg reads, none where it reads none; libpq 17 would read this too.
+    unsetEnvironment: ['PGSSLNEGOTIATION'],
     missingConnection: options?.pool
       ? 'PostgresExporter: the adapter runs on a pool its caller made, and the pool keeps no connection settings ' +
         'for pg_dump to reach. Make the pool with a connectionString, or with host, database, user and password.'

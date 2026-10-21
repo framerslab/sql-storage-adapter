@@ -347,6 +347,23 @@ describe('PostgresExporter', () => {
     expect(failure?.message).toMatch(/PostgreSQL 16 or later/);
     expect(failure?.message).toMatch(/sslrootcert parameter.*PGSSLROOTCERT/s);
   });
+
+  // libpq takes sslnegotiation from PostgreSQL 17 on. An older libpq refuses
+  // it as a URI parameter it does not know (REL_16_STABLE fe-connect.c,
+  // conninfo_uri_parse_params), in these words.
+  it('says what to do where the libpq of pg_dump is older than 17 and does not know sslnegotiation', async () => {
+    outcome.error = Object.assign(new Error('Command failed: pg_dump'), { code: 1 });
+    outcome.stderr = 'pg_dump: error: invalid URI query parameter: "sslnegotiation"';
+
+    const failure = await refusal(
+      new PostgresExporter(
+        'postgresql://app@db.example/app?sslnegotiation=direct&sslmode=verify-full&sslrootcert=system',
+      ).exportToBytes(),
+    );
+
+    expect(failure?.message).toMatch(/invalid URI query parameter: "sslnegotiation"/);
+    expect(failure?.message).toMatch(/PostgreSQL 17 or later/);
+  });
 });
 
 describe('createStorageFeatures exporter on PostgreSQL', () => {
@@ -1389,6 +1406,42 @@ describe('createStorageFeatures exporter on PostgreSQL', () => {
       expect(warn).toHaveBeenCalledTimes(1);
       expect(warn.mock.calls[0][0]).toMatchObject({ scope: 'PostgresExporter' });
       expect(warn.mock.calls[0][1]).toMatch(/sslnegotiation/);
+    });
+
+    // libpq 17 and later read PGSSLNEGOTIATION too. The URI holds the
+    // sslnegotiation the pool's pg reads, so pg_dump's environment drops the
+    // variable: a pool whose pg reads none would otherwise see pg_dump start
+    // TLS at once where the pool sends an SSLRequest.
+    it("leaves PGSSLNEGOTIATION out of pg_dump's environment where the pool's pg before 8.22.0 reads none", async () => {
+      vi.stubEnv('PGSSLNEGOTIATION', 'direct');
+      const options = { connectionString: 'postgresql://app@db.example/app?sslmode=require' };
+
+      await clientPoolExporter(options, clientOfPgBeforeDirectNegotiation('turns-tls-on')).exportToBytes();
+
+      expect(dbnameOf(calls[0].args)).toBe('postgresql://app@db.example:5432/app?sslmode=verify-full&sslrootcert=system');
+      expect(Object.keys(calls[0].env)).not.toContain('PGSSLNEGOTIATION');
+    });
+
+    it("writes the PGSSLNEGOTIATION a pool's pg reads into the URI, and leaves the variable out of pg_dump's environment", async () => {
+      vi.stubEnv('PGSSLNEGOTIATION', 'direct');
+      const settings = { connectionString: 'postgresql://app@db.example/app?sslmode=require' };
+
+      await poolExporter(settings).exportToBytes();
+
+      expect(new ConnectionParameters(settings).sslnegotiation).toBe('direct');
+      expect(dbnameOf(calls[0].args)).toBe(
+        'postgresql://app@db.example:5432/app?sslnegotiation=direct&sslmode=verify-full&sslrootcert=system',
+      );
+      expect(Object.keys(calls[0].env)).not.toContain('PGSSLNEGOTIATION');
+    });
+
+    it("refuses the export where the pool's pg refuses its sslnegotiation, and names it", async () => {
+      const failure = await refusal(
+        poolExporter({ host: 'db.example', database: 'app', user: 'app', ssl: true, sslnegotiation: 'fast' }).exportToBytes(),
+      );
+
+      expect(failure?.message).toMatch(/refuses its settings \(Invalid sslnegotiation value: "fast"/);
+      expect(calls).toHaveLength(0);
     });
   });
 });
