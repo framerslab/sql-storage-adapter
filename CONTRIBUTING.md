@@ -38,6 +38,8 @@ By participating in this project, you agree to abide by our code of conduct: be 
 8. Push to your fork
 9. Open a Pull Request
 
+On a pull request from a branch of this repository (not a fork), the Review comments workflow posts ESLint's findings on the lines the pull request adds under `src/` as review comments. Each run also deletes its earlier comments whose finding is gone, unless someone has replied to the comment. The workflow never fails the pull request.
+
 ## Development Setup
 
 ### Prerequisites

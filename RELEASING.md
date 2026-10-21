@@ -29,8 +29,12 @@ Do not push a version tag by hand.
 
 npm trusted publishing is configured for this package and `release.yml`: the job's OIDC token (`permissions: id-token: write`) is exchanged with the registry for a publish token. npm makes that exchange from version 11.5.1, so the job installs npm 11.20.0 before it publishes. A version published this way names GitHub Actions as its publisher on npm and carries a provenance statement. See [npm's trusted publishers page](https://docs.npmjs.com/trusted-publishers).
 
+## Deprecating a version
+
+To deprecate a published version, such as one that fails on a runtime it accepts, run the [Deprecate a version](https://github.com/framerslab/sql-storage-adapter/blob/master/.github/workflows/deprecate.yml) workflow by hand with the version and a message that says why and which version to use instead. To remove a version's mark, run it with clear ticked and no message. A published version is never unpublished, so every lockfile that names it stays installable.
+
 ## Required secrets
 
-- `NPM_TOKEN`: an npm token with publish access to `@framers/sql-storage-adapter`, which npm uses only when the exchange fails.
+- `NPM_TOKEN`: an npm token with publish access to `@framers/sql-storage-adapter`. The release uses it only when the exchange fails; the Deprecate a version workflow uses it on every run, since the exchange covers `npm publish` alone ([npm's trusted publishers page](https://docs.npmjs.com/trusted-publishers)).
 
 `GITHUB_TOKEN`, which GitHub Actions provides, creates the tag and the release.
