@@ -617,6 +617,7 @@ import { SqlJsAdapter } from '@framers/sql-storage-adapter';
 
 const db = new SqlJsAdapter();
 await db.open({ filePath: './data/app.sqlite3' });                 // loads the file, and saves to it
+await db.exec('CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)');
 await db.run('INSERT INTO notes (text) VALUES (?)', ['kept']);     // in the file when this resolves
 ```
 
@@ -670,7 +671,7 @@ await adapter.flush();                                              // stores ev
 - ✅ Several tabs on one database (`crossTab`)
 - ✅ A database of its own per segment (`segment`)
 
-**Durability.** With `durability: 'interval'`, the default, the auto-save tick stores the writes made since the last save every `saveIntervalMs`, and a write can be lost when the page goes before the next tick. With `durability: 'commit'`, `run()`, `exec()`, a write through `all()` or `get()` (`INSERT ... RETURNING`, or a PRAGMA that sets `user_version`, `application_id`, `schema_version`, `page_size`, `auto_vacuum` or `encoding`, read as SQLite reads it, a comment between two of its words or a name in single quotes included), `transaction()` and `importDatabase()` resolve once their write is in IndexedDB, committed there (the IndexedDB transaction's `complete` event, not the put request's success), and reject when IndexedDB refuses or aborts it; the write stays in the database and the next save stores it, unless `crossTab`'s `rollbackRefusedSaves` gives it up (below). Each save writes the whole database image, so batch many writes in one `transaction()`. While a transaction begun with `BEGIN` is open nothing can be saved: its statements resolve at once, and its rows are stored when its `COMMIT` resolves. `flush()` stores every write made so far in either mode: it waits for an open `transaction()`, and rejects while a transaction begun with `BEGIN` is open, which sql.js's export would end.
+**Durability.** With `durability: 'interval'`, the default, the auto-save tick stores the writes made since the last save every `saveIntervalMs`, and a write can be lost when the page goes before the next tick. With `durability: 'commit'`, `run()`, `exec()`, a write through `all()` or `get()` (`INSERT ... RETURNING`, or a PRAGMA that sets `user_version`, `application_id`, `schema_version`, `default_cache_size`, `page_size`, `auto_vacuum` or `encoding`, read as SQLite reads it, a comment between two of its words or a name in single quotes included), `transaction()` and `importDatabase()` resolve once their write is in IndexedDB, committed there (the IndexedDB transaction's `complete` event, not the put request's success), and reject when IndexedDB refuses or aborts it; the write stays in the database and the next save stores it, unless `crossTab`'s `rollbackRefusedSaves` gives it up (below). Each save writes the whole database image, so batch many writes in one `transaction()`. While a transaction begun with `BEGIN` is open nothing can be saved: its statements resolve at once, and its rows are stored when its `COMMIT` resolves. `flush()` stores every write made so far in either mode: it waits for an open `transaction()`, and rejects while a transaction begun with `BEGIN` is open, which sql.js's export would end.
 
 **Several tabs.** Each tab holds the whole database in memory and writes it back whole, so without coordination the tab that saves last overwrites the other's writes. With `crossTab`, every statement and transaction runs under a [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) on the database, on the newest stored image (a tab reloads it when a version stamp stored beside the image says another tab has saved), and is stored before the lock is let go: `durability` is `'commit'` whatever it says, and a tab reads what another tab stored. A transaction holds the other tabs' statements until it commits or rolls back. A transaction begun with `BEGIN` through `run()` or `exec()` cannot be held across tabs: it is rolled back and refused, so use `transaction()`. Web Locks need a secure context and are in Chrome 69, Firefox 96 and Safari 15.4 and later (on WebKit the feature is on by default and off in Lockdown Mode). Where there are none, the version stamp alone keeps both tabs' writes: a statement that finds another tab saved first runs again on that tab's image, and a `transaction()` another tab saved over is refused with `IndexedDbConflictError`, storing nothing of it, for its caller to run again. The adapter says once when it runs without Web Locks. A tab running a version of this package before 0.7 writes no stamp, so a tab with `crossTab` does not see its saves.
 
@@ -690,9 +691,9 @@ await adapter.flush();                                              // stores ev
 | Feature | IndexedDB Adapter | sql.js Adapter |
 |---------|------------------|----------------|
 | **SQL Engine** | sql.js (WASM) | sql.js (WASM) |
-| **Persistence** | ✅ **Automatic** (saves to IndexedDB after writes) | ⚠️ **Manual** (you must call `db.export()` and save yourself) |
-| **Data survives refresh** | ✅ Yes | ❌ No (unless you manually saved) |
-| **Use Case** | Production PWAs, offline-first apps | Edge functions, temporary data, prototyping |
+| **Persistence** | ✅ **Automatic** (saves to IndexedDB after writes) | ⚠️ **Manual** in a browser (call `db.export()` and save it yourself); ✅ **Automatic** on Node with a `filePath` (see [sql.js Saves to a File](#sqljs-saves-to-a-file)) |
+| **Data survives refresh** | ✅ Yes | ❌ No in a browser (unless you saved the export); on Node, a reopened `filePath` holds every save |
+| **Use Case** | Production PWAs, offline-first apps | Edge functions, temporary data, prototyping; a file-backed database on Node without native modules |
 
 **Is IndexedDB Adapter Necessary?**
 
