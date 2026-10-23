@@ -429,6 +429,25 @@ describe('CapacitorSqliteAdapter open() and close() on @capacitor-community/sqli
     expect(await adapter.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
   });
 
+  it('closes once when close() is called twice at once, and either call resolves only once the plugin connection is closed', async () => {
+    const adapter = await openAdapter('close-twice', { enableWal: false });
+    await adapter.exec('CREATE TABLE notes (body TEXT NOT NULL)');
+    await adapter.run('INSERT INTO notes (body) VALUES (?)', ['kept']);
+    const callsBefore = plugin.calls.length;
+
+    const first = adapter.close();
+    const second = adapter.close();
+    await second;
+
+    // A caller that awaited the second call alone can open the database again at once.
+    expect(plugin.connections.has('RW_close-twice')).toBe(false);
+    const again = await openAdapter('close-twice', { enableWal: false });
+    expect(await again.all('SELECT body FROM notes')).toEqual([{ body: 'kept' }]);
+
+    await first;
+    expect(plugin.calls.slice(callsBefore).filter((call) => call === 'closeConnection')).toHaveLength(1);
+  });
+
   it('closes its native connection, so the database opens again with its rows', async () => {
     const first = await openAdapter('reopen');
     await first.exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)');
