@@ -271,6 +271,48 @@ describe('SqlJsAdapter saves to its file', () => {
       expect(await adapter.get('PRAGMA secure_delete')).toEqual({ secure_delete: 2 });
     });
 
+    it('leaves PRAGMA defer_foreign_keys as SQLite leaves it: on inside the transaction that set it, off after any statement outside one', async () => {
+      // The save's probe for an open transaction runs BEGIN and, outside a
+      // transaction, ROLLBACK. SQLite clears defer_foreign_keys at every
+      // COMMIT and ROLLBACK, the one that ends each statement run outside a
+      // transaction included (sqlite3VdbeHalt in vdbeaux.c), so the flag is
+      // off before any save when set outside a transaction, and inside one
+      // the probe's BEGIN fails and nothing is rolled back.
+      const file = tempFile();
+      const adapter = await openAt(file, true);
+      await adapter.exec(
+        'CREATE TABLE parent (id INTEGER PRIMARY KEY);' +
+          'CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parent (id));',
+      );
+
+      await adapter.run('PRAGMA defer_foreign_keys = ON');
+      expect(await adapter.get('PRAGMA defer_foreign_keys')).toEqual({ defer_foreign_keys: 0 });
+
+      // Without the flag, SQLite checks the child row at its INSERT.
+      await adapter.run('BEGIN');
+      await expect(adapter.run('INSERT INTO child (parent_id) VALUES (?)', [1])).rejects.toThrow(
+        /FOREIGN KEY constraint failed/,
+      );
+      await adapter.run('ROLLBACK');
+
+      // Set inside the transaction, the flag holds through the statements that follow, which each ask SQLite whether a transaction is open.
+      await adapter.run('BEGIN');
+      await adapter.run('PRAGMA defer_foreign_keys = ON');
+      await adapter.run('INSERT INTO child (parent_id) VALUES (?)', [1]);
+      expect(await adapter.get('PRAGMA defer_foreign_keys')).toEqual({ defer_foreign_keys: 1 });
+      await adapter.run('INSERT INTO parent (id) VALUES (?)', [1]);
+      await adapter.run('COMMIT');
+
+      expect(await adapter.get('PRAGMA defer_foreign_keys')).toEqual({ defer_foreign_keys: 0 });
+      const SQL = await initSqlJs();
+      const saved = new SQL.Database(fs.readFileSync(file));
+      try {
+        expect(saved.exec('SELECT parent_id FROM child')[0].values).toEqual([[1]]);
+      } finally {
+        saved.close();
+      }
+    });
+
     it('warns once, through the host logger, that a save dropped TEMP tables', async () => {
       const warn = vi.fn();
       const logger: StorageLogger = { info: vi.fn(), warn, error: vi.fn() };

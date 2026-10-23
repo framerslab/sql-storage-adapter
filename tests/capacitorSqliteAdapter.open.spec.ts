@@ -440,19 +440,32 @@ describe('CapacitorSqliteAdapter open() and close() on @capacitor-community/sqli
     expect(await second.all('SELECT body FROM notes')).toEqual([{ body: 'kept' }]);
   });
 
-  it('opens a database whose native connection a reload of the page left open', async () => {
-    // The page before the reload opened it, and the plugin's native side kept the connection.
+  it('refuses a database whose connection the plugin holds for something else, and leaves that connection as it is', async () => {
+    // Another part of the app opened it through the plugin, or a page before a
+    // reload did and the plugin's native side kept the connection. The adapter
+    // cannot tell the two apart, and closing the connection would end a
+    // transaction its holder has open, so it closes nothing.
     const native = plugin.module.CapacitorSQLite;
-    await native.createConnection({ database: 'reloaded', readonly: false });
-    await native.open({ database: 'reloaded', readonly: false });
+    await native.createConnection({ database: 'held', readonly: false });
+    await native.open({ database: 'held', readonly: false });
     await native.execute({
-      database: 'reloaded',
-      statements: "CREATE TABLE notes (body TEXT NOT NULL); INSERT INTO notes (body) VALUES ('before the reload');",
+      database: 'held',
+      statements: "CREATE TABLE notes (body TEXT NOT NULL); INSERT INTO notes (body) VALUES ('held outside the adapter');",
+    });
+    const callsBefore = plugin.calls.length;
+
+    await expect(openAdapter('held')).rejects.toThrow(/already has a connection to database "held"/);
+
+    expect(plugin.calls.slice(callsBefore)).not.toContain('closeConnection');
+    expect(plugin.connections.get('RW_held')?.file).toBeTruthy();
+    expect(await native.query({ database: 'held', statement: 'SELECT body FROM notes', readonly: false })).toEqual({
+      values: [{ body: 'held outside the adapter' }],
     });
 
-    const adapter = await openAdapter('reloaded');
-
-    expect(await adapter.all('SELECT body FROM notes')).toEqual([{ body: 'before the reload' }]);
+    // Closed where it was opened, the database opens through an adapter.
+    await native.closeConnection({ database: 'held', readonly: false });
+    const adapter = await openAdapter('held');
+    expect(await adapter.all('SELECT body FROM notes')).toEqual([{ body: 'held outside the adapter' }]);
   });
 
   it('refuses a second adapter on a database another adapter has open, and the first keeps working', async () => {
