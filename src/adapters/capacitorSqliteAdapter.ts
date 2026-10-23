@@ -109,19 +109,24 @@ const connectionName = (database: string): string => (database.endsWith('.db') ?
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /**
- * Creates the connection to a database. The plugin's native side keeps its
- * connections until they are closed, across reloads of the page, so one can be
- * left from before a reload, and createConnection then fails with "Connection
- * <name> already exists". No adapter of this page holds that one (an adapter
- * holding it is refused before this), so it is closed and made again.
+ * Creates the connection to a database. The plugin's native side keeps a
+ * connection until it is closed, across reloads of the page, and refuses to
+ * create one it holds ("Connection <name> already exists"). An adapter of this
+ * page holding it is refused before this; one held by anything else, another
+ * part of the app or a page before a reload, is refused here by name. The
+ * adapter cannot tell those two apart, and closing the connection would end a
+ * transaction its holder has open, so it closes no connection it did not open.
  */
 const createConnection = async (sqlite: SQLiteConnection, database: string): Promise<SQLiteDBConnection> => {
   try {
     return await sqlite.createConnection(database, false, 'no-encryption', 1, false);
   } catch (error) {
     if (!/already exists/i.test(messageOf(error))) throw error;
-    await sqlite.closeConnection(database, false);
-    return sqlite.createConnection(database, false, 'no-encryption', 1, false);
+    throw new Error(
+      `Capacitor SQLite: the plugin already has a connection to database "${database}" that no adapter opened: ` +
+        'another part of the app holds it, or a page before a reload left it. The adapter closes no connection it did not open. ' +
+        "Close it where it was opened, or call the plugin's checkConnectionsConsistency() when the app starts, before open().",
+    );
   }
 };
 
@@ -187,9 +192,11 @@ const toRunResult = (answer: unknown): StorageRunResult => {
  * It opens its database through the plugin's SQLiteConnection, one for every
  * adapter in the page, and close() closes the plugin's connection too, so the
  * database can be opened again. One adapter at a time holds a database: a
- * second open() of the same database fails while the first adapter has it.
- * The plugin drops a trailing ".db" from a name, so `notes.db` and `notes`
- * are one database.
+ * second open() of the same database fails while the first adapter has it,
+ * and so does an open() of a database whose connection the plugin holds for
+ * anything else; the adapter closes no connection it did not open. The plugin
+ * drops a trailing ".db" from a name, so `notes.db` and `notes` are one
+ * database.
  *
  * Transactions use the plugin's beginTransaction, commitTransaction and
  * rollbackTransaction (plugin 5.0.7 and later). The plugin runs every other

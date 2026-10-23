@@ -198,7 +198,7 @@ const db = new SQL.Database(new Uint8Array(saved));
 
 **Limitations**:
 - The adapter opens databases unencrypted
-- One adapter at a time holds a database
+- One adapter at a time holds a database, and a database whose connection the plugin holds for something else is refused: the adapter closes no connection it did not open
 - Mobile platform restrictions apply
 - Database location varies by platform (iOS: Documents, Android: internal storage)
 - Limited debugging tools
