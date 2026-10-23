@@ -11,6 +11,9 @@ import {
   createSharedConnectionTransactionAdapter,
 } from '../shared/serializedTransaction';
 import { namesInMemoryDatabase, segmentFilePath, validateSegment } from '../shared/segment';
+import { queryWrites } from '../shared/queryWrites';
+import { exportKeepingSettings } from '../shared/sqlJsConnectionSettings';
+import { getStorageLogger } from '../shared/logger';
 
 /** sql.js's own configuration (`locateFile` and the rest), and the adapter's segment. */
 export type SqlJsAdapterOptions = SqlJsConfig & {
@@ -21,6 +24,8 @@ export type SqlJsAdapterOptions = SqlJsConfig & {
    */
   segment?: string;
 };
+
+const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 const normaliseRowId = (value: unknown): string | number | null => {
   if (typeof value === 'number' || typeof value === 'string') {
@@ -42,6 +47,21 @@ const hasFsAccess = (): boolean => {
 
 /**
  * Storage adapter backed by sql.js (WebAssembly) for environments without native SQLite bindings.
+ *
+ * With a `filePath`, the adapter writes the database image to the file after
+ * each write, once SQLite has no transaction open: a statement through run(),
+ * a script through exec() (the statements before a failure included), a
+ * statement through all() or get() that can write (see queryWrites, which the
+ * IndexedDB adapter reads too), and the end of a transaction(). It does not
+ * save while SQLite has a transaction open, whatever began it (transaction(),
+ * BEGIN or SAVEPOINT through run(), or a script), since sql.js's export()
+ * closes and reopens the connection, which would roll the transaction back;
+ * the save after its COMMIT or RELEASE writes it. The connection's PRAGMA
+ * settings are read before each export and set again after it, and the
+ * functions registerFunction() made are registered again. TEMP tables,
+ * attached databases and functions registered on the sql.js database itself
+ * do not survive a save; the adapter warns once, through the host logger, when
+ * a save drops TEMP objects.
  */
 export class SqlJsAdapter implements StorageAdapter {
   public readonly kind = 'sqljs';
@@ -50,28 +70,22 @@ export class SqlJsAdapter implements StorageAdapter {
   private SQL: SqlJsStatic | null = null;
   private db: SqlJsDatabase | null = null;
   private filePath?: string;
-  /** Foreign-key enforcement as open() was asked for it (undefined: the engine default); sql.js forgets the PRAGMA when export() reopens the connection. */
+  /** Foreign-key enforcement as open() was asked for it (undefined: the engine default), set on the connection open() makes. */
   private foreignKeys: boolean | undefined;
   /** The functions registerFunction made callable from SQL, registered again after each reopening. */
   private readonly sqlFunctions = new Map<string, SqlFunction>();
   private readonly runSerializedTransaction = createSerializedTransactionRunner();
   /**
-   * Open transaction depth. > 0 means a SQLite-level transaction is in
-   * flight on this connection and {@link persistIfNeeded} MUST be
-   * skipped until the outermost commit / rollback returns.
-   *
-   * Why this exists: sql.js's `db.export()` (called by persistIfNeeded
-   * to flush state to disk) ends any open transaction as a side
-   * effect. Persisting mid-transaction therefore SILENTLY closes the
-   * tx, making subsequent COMMIT / ROLLBACK throw "no transaction is
-   * active" and — worse — leaking partial writes onto disk that the
-   * matching rollback can no longer undo. Counter is bumped on
-   * BEGIN/SAVEPOINT and decremented on COMMIT/RELEASE/ROLLBACK
-   * regardless of whether the statement is issued via {@link run}
-   * (caller-managed transactions) or {@link transaction} (helper-
-   * managed). One source of truth for the in-tx flag.
+   * 1 while a transaction() callback runs. SQLite has a transaction open then,
+   * so a save is skipped without asking SQLite.
    */
-  private transactionDepth = 0;
+  private transactionRunning = 0;
+  /** Set while close() runs: no statement starts. */
+  private closing = false;
+  /** The close() in progress, which a second call waits for. */
+  private closeRun: Promise<void> | null = null;
+  /** Whether a save that dropped TEMP objects has been reported. */
+  private tempDropReported = false;
   private readonly sqlJsConfig: SqlJsConfig;
   private readonly segment: string | undefined;
 
@@ -107,20 +121,15 @@ export class SqlJsAdapter implements StorageAdapter {
     this.applyConnectionSettings();
   }
 
+  /**
+   * Runs one statement. With a `filePath`, the database is saved to the file
+   * after it unless SQLite has a transaction open; a transaction's statements
+   * are saved by the save after its COMMIT.
+   */
   public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
     ({ statement, parameters } = toSqliteStatement(statement, parameters));
-    // Detect caller-managed transaction control (BEGIN / SAVEPOINT /
-    // COMMIT / ROLLBACK / RELEASE) so we can keep the tx depth in
-    // sync regardless of whether the caller uses {@link transaction}
-    // or issues control statements directly. Bump BEFORE execute on
-    // BEGIN-shaped statements; decrement AFTER on COMMIT-shaped ones
-    // so the persist gate in the finally block sees the correct
-    // post-statement depth.
-    const txKind = classifyTransactionControl(statement);
-    if (txKind === 'begin') {
-      this.transactionDepth += 1;
-    }
     const stmt = this.prepareInternal(statement);
+    let result: StorageRunResult;
     try {
       const { named, positional } = normaliseParameters(parameters);
       if (named) {
@@ -129,33 +138,18 @@ export class SqlJsAdapter implements StorageAdapter {
         stmt.bind(positional);
       }
       stmt.step();
+      // Read before the save, whose export reopens the connection.
       const rowIdResult = this.db!.exec('SELECT last_insert_rowid() AS id');
       const rawRowId = rowIdResult[0]?.values?.[0]?.[0];
-      return {
+      result = {
         changes: this.db!.getRowsModified(),
         lastInsertRowid: normaliseRowId(rawRowId)
       };
-    } catch (err) {
-      // If the BEGIN-shaped statement itself failed (e.g. nested
-      // BEGIN in single-tx mode), undo the depth bump so the
-      // adapter doesn't get stuck thinking it's in a tx.
-      if (txKind === 'begin') {
-        this.transactionDepth = Math.max(0, this.transactionDepth - 1);
-      }
-      throw err;
     } finally {
       stmt.free();
-      if (txKind === 'end' && this.transactionDepth > 0) {
-        this.transactionDepth -= 1;
-      }
-      // Persist only when we are NOT inside an open transaction. This
-      // is the load-bearing rule: a mid-tx db.export() would close
-      // the tx at the SQLite level and silently lose every
-      // uncommitted write up to that point.
-      if (this.transactionDepth === 0) {
-        await this.persistIfNeeded();
-      }
     }
+    await this.persistIfNeeded();
+    return result;
   }
 
   public async get<T>(statement: string, parameters?: StorageParameters): Promise<T | null> {
@@ -163,9 +157,17 @@ export class SqlJsAdapter implements StorageAdapter {
     return rows.length > 0 ? rows[0] : null;
   }
 
+  /**
+   * Runs a statement and returns its rows. A statement that writes (`INSERT
+   * ... RETURNING`, a `PRAGMA` that sets a header field such as
+   * `user_version`) is saved to the file as a run() is; see {@link queryWrites}.
+   */
   public async all<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
     ({ statement, parameters } = toSqliteStatement(statement, parameters));
+    const writes = queryWrites(statement);
     const stmt = this.prepareInternal(statement);
+    const changesBefore = writes === 'if-rows-changed' ? this.totalChanges() : 0;
+    const results: T[] = [];
     try {
       const { named, positional } = normaliseParameters(parameters);
       if (named) {
@@ -174,7 +176,6 @@ export class SqlJsAdapter implements StorageAdapter {
         stmt.bind(positional);
       }
 
-      const results: T[] = [];
       while (stmt.step()) {
         const row: Record<string, unknown> = {};
         stmt.getColumnNames().forEach((column: string, index: number) => {
@@ -182,94 +183,114 @@ export class SqlJsAdapter implements StorageAdapter {
         });
         results.push(row as T);
       }
-      return results;
     } finally {
       stmt.free();
     }
+    if (writes === 'yes' || (writes === 'if-rows-changed' && this.totalChanges() !== changesBefore)) {
+      await this.persistIfNeeded();
+    }
+    return results;
   }
 
+  /**
+   * Runs a script of one or more statements. With a `filePath`, the database
+   * is saved after it unless SQLite has a transaction open, which a script
+   * can begin (`BEGIN; INSERT ...`) or end (`INSERT ...; COMMIT`). A script
+   * that fails part way keeps the statements before the failure, and they are
+   * saved as a script's that succeeds are; the script's error is the one
+   * thrown.
+   */
   public async exec(script: string): Promise<void> {
     this.ensureOpen();
-    // `exec()` accepts multi-statement scripts so we can't reliably
-    // classify the transactional intent the way {@link run} does.
-    // Keep the original "skip persist on transaction-control" guard
-    // for single-statement BEGIN/COMMIT calls AND additionally skip
-    // when we're already known to be in a tx (depth > 0) — that case
-    // covers `exec('CREATE TABLE …')` inside a {@link transaction}
-    // block where the script itself isn't transaction-control but
-    // persisting would still close the open tx.
-    const isControl = isTransactionControlStatement(script);
-    const txKind = isControl ? classifyTransactionControl(script) : 'none';
-    if (txKind === 'begin') {
-      this.transactionDepth += 1;
-    }
     try {
       this.db!.exec(script);
-    } catch (err) {
-      if (txKind === 'begin') {
-        this.transactionDepth = Math.max(0, this.transactionDepth - 1);
-      }
-      throw err;
+    } catch (error) {
+      await this.persistQuietly();
+      throw error;
     }
-    if (txKind === 'end' && this.transactionDepth > 0) {
-      this.transactionDepth -= 1;
-    }
-    if (!isControl && this.transactionDepth === 0) {
-      await this.persistIfNeeded();
-    } else if (txKind === 'end' && this.transactionDepth === 0) {
-      // Just exited the outermost transaction — flush to disk.
-      await this.persistIfNeeded();
-    }
+    await this.persistIfNeeded();
   }
 
+  /**
+   * Runs `fn` in a transaction: COMMIT when it resolves, ROLLBACK when it
+   * throws. Callbacks run one at a time, since they share the connection, and
+   * the database is saved to the file once the transaction has ended. A nested
+   * transaction() on the handle runs in the open transaction.
+   */
   public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
     this.ensureOpen();
     return this.runSerializedTransaction(async () => {
       this.ensureOpen();
-      // BEGIN goes through raw sql.js (`this.db!.run`) to avoid the
-      // adapter-level run() pre-bump + persist-skip machinery. The FIFO
-      // runner is required because every callback shares this connection.
+      // BEGIN goes to sql.js directly. The FIFO runner is required because
+      // every callback shares this connection.
       this.db!.run('BEGIN TRANSACTION;');
-      this.transactionDepth += 1;
+      this.transactionRunning += 1;
       const transactionAdapter = createSharedConnectionTransactionAdapter(this);
-      let committed = false;
+      let result: T;
       try {
-        const result = await fn(transactionAdapter);
+        result = await fn(transactionAdapter);
+        this.ensureOpen();
         this.db!.run('COMMIT;');
-        committed = true;
-        return result;
       } catch (error) {
-        if (!committed) {
+        this.transactionRunning -= 1;
+        // A close() during the callback has rolled the transaction back and
+        // closed the database; the callback's error is the one to report.
+        if (this.db && this.sqliteTransactionOpen()) {
           try {
-            this.db!.run('ROLLBACK;');
+            this.db.run('ROLLBACK;');
           } catch (rollbackError) {
-            const message =
-              rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
-            // SQL.js may auto-close the transaction during certain DDL
-            // failures. Preserve the original error rather than mask it
-            // with a rollback hiccup.
-            if (!message.includes('no transaction is active')) {
+            // sql.js can end the transaction itself on some DDL failures.
+            // Keep the original error rather than mask it with the rollback's.
+            if (!messageOf(rollbackError).includes('no transaction is active')) {
               throw rollbackError;
             }
           }
         }
+        await this.persistQuietly();
         throw error;
-      } finally {
-        this.transactionDepth = Math.max(0, this.transactionDepth - 1);
-        // Only the outermost transaction triggers a flush to disk. Nested
-        // callbacks reuse the scoped view and do not change this depth.
-        if (this.transactionDepth === 0) {
-          await this.persistIfNeeded();
-        }
       }
+      this.transactionRunning -= 1;
+      await this.persistIfNeeded();
+      return result;
     });
   }
 
-  public async close(): Promise<void> {
-    if (this.db) {
-      await this.persistIfNeeded();
+  /**
+   * Saves the committed state to the file and closes the database. A
+   * transaction still open is rolled back first, as closing a SQLite
+   * connection does, so the save holds committed writes only. A call made
+   * while a close is running waits for that close. The adapter can be opened
+   * again.
+   */
+  public close(): Promise<void> {
+    if (!this.closeRun) {
+      this.closeRun = this.closeNow().finally(() => {
+        this.closeRun = null;
+      });
+    }
+    return this.closeRun;
+  }
+
+  private async closeNow(): Promise<void> {
+    if (!this.db) {
+      return;
+    }
+    // From here no statement starts: a transaction() callback still running
+    // fails at its next statement.
+    this.closing = true;
+    try {
+      if (this.sqliteTransactionOpen()) {
+        try {
+          this.db.run('ROLLBACK');
+        } catch {
+          // The transaction ended already.
+        }
+      }
+      await this.saveToFile();
       this.db.close();
       this.db = null;
+    } finally {
+      this.closing = false;
     }
   }
 
@@ -279,16 +300,26 @@ export class SqlJsAdapter implements StorageAdapter {
   }
 
   private ensureOpen(): void {
-    if (!this.db) {
+    if (!this.db || this.closing) {
       throw new Error('Storage adapter not opened. Call open() first.');
     }
   }
 
-  /** Applies the connection settings open() was asked for: sql.js loses them whenever export() reopens the connection. */
+  /**
+   * Applies the connection settings open() was asked for (foreignKeys), on the
+   * connection open() makes, and registers the functions registerFunction()
+   * keeps. A save to the file keeps the connection's settings from then on
+   * (see saveToFile()), a PRAGMA the caller ran after open() included.
+   */
   private applyConnectionSettings(): void {
     if (this.foreignKeys !== undefined) {
       this.db!.run(`PRAGMA foreign_keys = ${this.foreignKeys ? 'ON' : 'OFF'};`);
     }
+    this.applyFunctions();
+  }
+
+  /** Registers the functions registerFunction keeps: sql.js drops them when export() reopens the connection. */
+  private applyFunctions(): void {
     for (const [name, fn] of this.sqlFunctions) {
       this.db!.create_function(name, fn);
     }
@@ -304,18 +335,97 @@ export class SqlJsAdapter implements StorageAdapter {
     if (this.db) this.db.create_function(name, fn);
   }
 
+  /**
+   * Saves the database to the file unless a transaction is open; inside a
+   * transaction() callback without asking SQLite (see saveToFile()).
+   */
   private async persistIfNeeded(): Promise<void> {
-    if (!this.filePath || !hasFsAccess()) {
+    if (this.transactionRunning > 0) {
+      return;
+    }
+    await this.saveToFile();
+  }
+
+  /**
+   * Writes the database image to the file. Skipped while SQLite has a
+   * transaction open, whatever began it: sql.js's export() closes and reopens
+   * the connection, which would roll the transaction back. The save after its
+   * COMMIT writes it. The connection's PRAGMA settings are read before the
+   * export and set again after it, and the registered functions with them.
+   */
+  private async saveToFile(): Promise<void> {
+    if (!this.db || !this.filePath || !hasFsAccess()) {
+      return;
+    }
+    if (this.sqliteTransactionOpen()) {
       return;
     }
     const dir = path.dirname(this.filePath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    const data = this.db!.export();
-    // export() closed and reopened the connection, which reset its PRAGMAs.
-    this.applyConnectionSettings();
+    const data = exportKeepingSettings(this.db, {
+      onRefused: (name, value, error) => {
+        getStorageLogger().warn(
+          { scope: this.kind, pragma: name, error: messageOf(error) },
+          `Could not set PRAGMA ${name} = ${value} again on the connection sql.js reopened to save the database.`,
+        );
+      },
+      onTempObjectsDropped: (count) => {
+        if (this.tempDropReported) return;
+        this.tempDropReported = true;
+        getStorageLogger().warn(
+          { scope: this.kind, file: this.filePath, tempObjects: count },
+          `A save to ${this.filePath} dropped the connection's TEMP tables, views, indexes and triggers (${count}): ` +
+            'sql.js reopens its connection to read the database image, and TEMP objects do not survive that. ' +
+            'Keep such state in the main database.',
+        );
+      },
+    });
+    // export() dropped the functions with the connection it closed.
+    this.applyFunctions();
     fs.writeFileSync(this.filePath, Buffer.from(data));
+  }
+
+  /**
+   * persistIfNeeded() for a path that is already failing: a save that fails
+   * too is logged, and the next save writes what it held.
+   */
+  private async persistQuietly(): Promise<void> {
+    try {
+      await this.persistIfNeeded();
+    } catch (error) {
+      getStorageLogger().warn(
+        { scope: this.kind, file: this.filePath, error: messageOf(error) },
+        'Saving the database to its file failed after a failed statement; the next save writes it.',
+      );
+    }
+  }
+
+  /**
+   * Whether SQLite has a transaction open on the connection: one transaction()
+   * or the caller began, a savepoint, or one a script began. sql.js does not
+   * export sqlite3_get_autocommit, so the adapter asks SQLite: BEGIN fails
+   * inside a transaction, and outside one it is rolled back at once. A probe
+   * that fails for any reason counts as open, so the adapter does not export.
+   */
+  private sqliteTransactionOpen(): boolean {
+    try {
+      this.db!.run('BEGIN');
+    } catch {
+      return true;
+    }
+    try {
+      this.db!.run('ROLLBACK');
+    } catch {
+      return true;
+    }
+    return false;
+  }
+
+  /** SQLite's count of the rows changed since the connection opened. */
+  private totalChanges(): number {
+    return Number(this.db!.exec('SELECT total_changes()')[0]?.values?.[0]?.[0] ?? 0);
   }
 }
 
@@ -326,52 +436,3 @@ export class SqlJsAdapter implements StorageAdapter {
  * @throws {Error} When `segment` is not a name a segment can take.
  */
 export const createSqlJsAdapter = (options?: SqlJsAdapterOptions): StorageAdapter => new SqlJsAdapter(options);
-
-/**
- * Return true when `script` is purely a transaction-control statement
- * (BEGIN, SAVEPOINT, COMMIT, ROLLBACK, RELEASE). Used by `exec()` to
- * skip persistence on BEGIN/SAVEPOINT — `db.export()` ends any open
- * transaction in sql.js, so writing the snapshot mid-transaction
- * makes the matching COMMIT throw "no transaction is active". Callers
- * that COMMIT or ROLLBACK explicitly are still safe because the
- * subsequent write or close-time persistence runs `export()` after the
- * transaction has already closed.
- *
- * Pattern: tolerate leading whitespace, an optional trailing
- * semicolon, and statement-modifying keywords (BEGIN DEFERRED,
- * BEGIN IMMEDIATE, BEGIN EXCLUSIVE, BEGIN TRANSACTION, RELEASE
- * SAVEPOINT, ROLLBACK TO SAVEPOINT). Anything more complex falls
- * through to normal persistence.
- */
-function isTransactionControlStatement(script: string): boolean {
-  return classifyTransactionControl(script) !== 'none';
-}
-
-/**
- * Narrow classification of transaction-control SQL into the three
- * categories the persistence gate needs to react to:
- *
- *   - `'begin'` — BEGIN / BEGIN DEFERRED|IMMEDIATE|EXCLUSIVE / BEGIN
- *     TRANSACTION / SAVEPOINT <name>. Bumps depth before execution.
- *   - `'end'`   — COMMIT / ROLLBACK / ROLLBACK TO [SAVEPOINT] <name> /
- *     RELEASE [SAVEPOINT] <name>. Decrements depth after execution.
- *   - `'none'`  — any other statement; depth is unaffected.
- *
- * Pattern tolerates leading whitespace, an optional trailing
- * semicolon, and the SQLite-specific modifiers
- * (`BEGIN DEFERRED|IMMEDIATE|EXCLUSIVE`, `BEGIN TRANSACTION`,
- * `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT`). Anything more
- * complex falls through to `'none'` — callers issuing multi-statement
- * scripts via {@link exec} are responsible for not mixing
- * transaction-control with other DML in a single call.
- */
-function classifyTransactionControl(script: string): 'begin' | 'end' | 'none' {
-  const trimmed = script.trim().replace(/;\s*$/, '').toUpperCase();
-  if (trimmed === 'BEGIN') return 'begin';
-  if (trimmed === 'COMMIT' || trimmed === 'ROLLBACK') return 'end';
-  if (/^BEGIN\s+(DEFERRED|IMMEDIATE|EXCLUSIVE|TRANSACTION)$/.test(trimmed)) return 'begin';
-  if (/^SAVEPOINT\s+\S+$/.test(trimmed)) return 'begin';
-  if (/^RELEASE(\s+SAVEPOINT)?\s+\S+$/.test(trimmed)) return 'end';
-  if (/^ROLLBACK(\s+TO(\s+SAVEPOINT)?)?\s+\S+$/.test(trimmed)) return 'end';
-  return 'none';
-}
