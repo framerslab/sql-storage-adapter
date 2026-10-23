@@ -149,6 +149,15 @@ describe('IndexedDbAdapter durability', () => {
       expect(await storedPragma('commit-pragma-header', 'user_version')).toBe(4);
     });
 
+    it('stores PRAGMA default_cache_size, which lives in the database header, set through get() before it resolves', async () => {
+      // The deprecated pragma writes the suggested cache size at offset 48 of the header; total_changes() counts no row.
+      const adapter = await openWithItems('commit-pragma-cache-size');
+
+      await adapter.get('PRAGMA default_cache_size = 2000');
+
+      expect(await storedPragma('commit-pragma-cache-size', 'default_cache_size')).toBe(2000);
+    });
+
     // SQLite reads a comment as whitespace between two tokens, a quoted name
     // needs no space before it (sqlite.org/lang_comment.html), and a string in
     // single quotes stands for a name where a PRAGMA's goes (parse.y:

@@ -70,6 +70,13 @@ import {
 } from '../shared/serializedTransaction';
 import { createConnectionGate, whenAdmitted, type LongWaitWatch } from '../shared/connectionGate';
 import { segmentName } from '../shared/segment';
+import { queryWrites } from '../shared/queryWrites';
+import {
+  exportKeepingSettings,
+  readConnectionSettings,
+  restoreConnectionSettings,
+  type KeepSettingsReport,
+} from '../shared/sqlJsConnectionSettings';
 
 /** How long a statement waits for an open transaction or the cross-tab lock before the adapter warns. */
 const LONG_WAIT_MS = 10_000;
@@ -87,28 +94,11 @@ const STAMP_KEY = 'db:stamp';
 /** How often a statement runs again after another tab saved first, without Web Locks. */
 const MAX_CONFLICT_RETRIES = 50;
 
-/**
- * Connection settings sql.js's export drops: `export()` closes the
- * connection and opens it again, which resets every per-connection PRAGMA. A
- * save reads these before it exports and sets again the ones a caller changed.
- */
-const CONNECTION_PRAGMAS = [
-  'foreign_keys',
-  'recursive_triggers',
-  'automatic_index',
-  'cache_size',
-  'cache_spill',
-  'cell_size_check',
-  'ignore_check_constraints',
-  'legacy_alter_table',
-  'query_only',
-  'reverse_unordered_selects',
-  'secure_delete',
-  'synchronous',
-  'temp_store',
-  'trusted_schema',
-  'busy_timeout',
-] as const;
+/** The 16 bytes a SQLite database file starts with: "SQLite format 3" and a NUL. */
+const SQLITE_HEADER = [0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00];
+
+const hasSqliteHeader = (data: Uint8Array): boolean =>
+  data.length >= SQLITE_HEADER.length && SQLITE_HEADER.every((byte, index) => data[index] === byte);
 
 // ============================================================================
 // GLOBAL SQL.JS SINGLETON
@@ -277,106 +267,6 @@ interface SaveWaiter {
   discarded: boolean;
 }
 
-/** A statement past its leading comments and whitespace. */
-const pastLeadingComments = (statement: string): string =>
-  statement.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/, '');
-
-/** The first keyword of a statement, past its leading comments and whitespace. */
-const firstKeyword = (statement: string): string =>
-  (/^[A-Za-z]+/.exec(pastLeadingComments(statement))?.[0] ?? '').toUpperCase();
-
-/**
- * PRAGMAs whose assignment changes the database image: the header's
- * user_version, application_id and schema_version, and the settings a new
- * database or a VACUUM writes (page_size, auto_vacuum, encoding). SQLite's
- * change counter, `total_changes()`, counts none of them.
- */
-const IMAGE_PRAGMAS_WHEN_SET = new Set(['user_version', 'application_id', 'schema_version', 'page_size', 'auto_vacuum', 'encoding']);
-
-/** PRAGMAs that change the image in any form: incremental_vacuum frees pages, optimize may run ANALYZE. */
-const IMAGE_PRAGMAS_ALWAYS = new Set(['incremental_vacuum', 'optimize']);
-
-/** A token of a statement's head: a name, bare or quoted (a string in single quotes included), or one character of punctuation. */
-interface HeadToken {
-  text: string;
-  name: boolean;
-}
-
-/** The characters a bare name of SQLite's goes on with. */
-const NAME_PART = /[A-Za-z0-9_$]/;
-
-/**
- * The first `count` tokens of a statement as SQLite's tokenizer reads them: a
- * comment (`-- ...` to the end of its line, `/* ... *\/`) or whitespace
- * separates two tokens and is no token itself, and a quoted name (in double
- * quotes, brackets or backticks) needs no space before it. A string in single
- * quotes is read as a name as well: SQLite's grammar takes one for a name where
- * a PRAGMA's schema or name goes (parse.y, `nm ::= STRING`), and its tokenizer
- * ends it as it ends a quoted name, at a quote not written twice (tokenize.c,
- * `CC_QUOTE`).
- */
-const headTokens = (statement: string, count: number): HeadToken[] => {
-  const tokens: HeadToken[] = [];
-  let at = 0;
-  while (at < statement.length && tokens.length < count) {
-    const char = statement[at];
-    if (/\s/.test(char)) {
-      at += 1;
-    } else if (statement.startsWith('--', at)) {
-      const end = statement.indexOf('\n', at + 2);
-      at = end < 0 ? statement.length : end + 1;
-    } else if (statement.startsWith('/*', at)) {
-      const end = statement.indexOf('*/', at + 2);
-      at = end < 0 ? statement.length : end + 2;
-    } else if (char === '"' || char === '`' || char === "'") {
-      // A quote character inside the name is written twice.
-      let text = '';
-      let end = at + 1;
-      while (end < statement.length) {
-        if (statement[end] === char) {
-          if (statement[end + 1] !== char) break;
-          end += 1;
-        }
-        text += statement[end];
-        end += 1;
-      }
-      tokens.push({ text, name: true });
-      at = end + 1;
-    } else if (char === '[') {
-      const end = statement.indexOf(']', at + 1);
-      tokens.push({ text: statement.slice(at + 1, end < 0 ? statement.length : end), name: true });
-      at = end < 0 ? statement.length : end + 1;
-    } else if (/[A-Za-z_]/.test(char)) {
-      let end = at + 1;
-      while (end < statement.length && NAME_PART.test(statement[end])) end += 1;
-      tokens.push({ text: statement.slice(at, end), name: true });
-      at = end;
-    } else {
-      tokens.push({ text: char, name: false });
-      at += 1;
-    }
-  }
-  return tokens;
-};
-
-/**
- * Whether a PRAGMA statement changes the database image although no row
- * changes: an assignment to a header field or a file setting, or a pragma that
- * rewrites pages. Reads (`PRAGMA table_info(t)`, `PRAGMA user_version`) and
- * connection settings (`PRAGMA foreign_keys = ON`) do not. The statement is
- * read as SQLite reads it: `PRAGMA [schema.]name`, then `=` or `(` when it
- * gives the pragma a value, with any comment between two of them.
- */
-const pragmaChangesImage = (statement: string): boolean => {
-  const tokens = headTokens(statement, 5);
-  if (tokens[0]?.text.toUpperCase() !== 'PRAGMA' || tokens[1]?.name !== true) return false;
-  const qualified = tokens[2]?.text === '.' && tokens[2].name === false && tokens[3]?.name === true;
-  const name = (qualified ? tokens[3] : tokens[1]).text.toLowerCase();
-  const next = tokens[qualified ? 4 : 2];
-  const setsValue = next !== undefined && next.name === false && (next.text === '=' || next.text === '(');
-  return IMAGE_PRAGMAS_ALWAYS.has(name) || (setsValue && IMAGE_PRAGMAS_WHEN_SET.has(name));
-};
-
 /**
  * Storage adapter using IndexedDB + sql.js for client-side SQL persistence.
  *
@@ -401,6 +291,23 @@ const pragmaChangesImage = (statement: string): boolean => {
  *    (the default), before each write resolves (`durability: 'commit'`), or
  *    under a cross-tab lock (`crossTab`)
  *
+ * **What a save keeps:** each save, `exportDatabase()` and `importDatabase()`
+ * goes through sql.js's `export()`, which closes and reopens the connection.
+ * The adapter reads the connection's PRAGMA settings first and sets them again
+ * on the reopened connection (foreign_keys, recursive_triggers,
+ * ignore_check_constraints, legacy_alter_table, reverse_unordered_selects,
+ * trusted_schema, automatic_index, cell_size_check, secure_delete,
+ * cache_size, cache_spill, temp_store, synchronous, journal_mode,
+ * busy_timeout and query_only), so each holds as it would on a connection
+ * that is never reopened, whether `open()` set it (`foreignKeys`) or a
+ * statement did later, and registers the functions `registerFunction()` made
+ * again. The rest of the connection's state does not survive a save: PRAGMA
+ * settings outside that list, TEMP tables, views and triggers (the adapter
+ * warns once when a save drops some), attached databases, functions
+ * registered on the underlying sql.js database itself, and
+ * `PRAGMA case_sensitive_like`, which cannot be read back. Keep such state in
+ * the main database, or create it again where it is used.
+ *
  * **Capabilities:**
  * - ✅ Transactions (via sql.js)
  * - ✅ Persistence (via IndexedDB - automatic!)
@@ -422,7 +329,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 
   private SQL: SqlJsStatic | null = null;
   private db: SqlJsDatabase | null = null;
-  /** Foreign-key enforcement as open() was asked for it (undefined: the engine default); sql.js forgets the PRAGMA when export() reopens the connection. */
+  /** Foreign-key enforcement as open() was asked for it (undefined: the engine default), set on the connection open() makes. */
   private foreignKeys: boolean | undefined;
   /** The functions registerFunction made callable from SQL, registered again after each reopening. */
   private readonly sqlFunctions = new Map<string, SqlFunction>();
@@ -464,8 +371,8 @@ export class IndexedDbAdapter implements StorageAdapter {
   private holdsRefusedWrites = false;
   /** How many stamps this adapter has made, which keeps two of its stamps apart. */
   private stampCount = 0;
-  /** The connection settings a fresh connection has, which a save need not set again. */
-  private pragmaDefaults = new Map<string, unknown>();
+  /** Whether a save that dropped TEMP objects has been reported. */
+  private tempDropReported = false;
   /**
    * With `crossTab`, the lock manager, or null for the version stamp alone;
    * undefined without `crossTab`.
@@ -553,9 +460,7 @@ export class IndexedDbAdapter implements StorageAdapter {
     this.SQL = await getGlobalSQL(this.sqlJsConfig);
 
     if (this.memoryOnly) {
-      const db = new this.SQL.Database();
-      this.pragmaDefaults = readPragmas(db);
-      this.db = db;
+      this.db = new this.SQL.Database();
       this.applyConnectionSettings();
       return;
     }
@@ -565,12 +470,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 
     // Load existing database from IndexedDB or create new
     const stored = await this.loadFromIndexedDb();
-    const db = stored.image ? new this.SQL.Database(stored.image) : new this.SQL.Database();
-    // What a fresh connection has, and export() returns to. Read before the
-    // settings open() was asked for, so a save carries those like any other a
-    // caller made.
-    this.pragmaDefaults = readPragmas(db);
-    this.db = db;
+    this.db = stored.image ? new this.SQL.Database(stored.image) : new this.SQL.Database();
     this.loadedStamp = stored.stamp;
     this.applyConnectionSettings();
 
@@ -652,7 +552,8 @@ export class IndexedDbAdapter implements StorageAdapter {
 
   /**
    * Executes a SQL query and returns all matching rows. A statement that
-   * writes (`INSERT ... RETURNING`) is saved like a `run()`.
+   * writes (`INSERT ... RETURNING`, a `PRAGMA` that sets a header field such
+   * as `user_version`) is saved like a `run()`; see {@link queryWrites}.
    * @param statement SELECT statement
    * @param parameters Query parameters
    * @returns Array of result rows as objects
@@ -677,15 +578,10 @@ export class IndexedDbAdapter implements StorageAdapter {
     ({ statement, parameters } = toSqliteStatement(statement, parameters));
     this.ensureOpen();
     // A statement that is not a plain read can write (INSERT ... RETURNING,
-    // WITH ... DELETE): it marks the database unsaved when it changed rows,
-    // and a statement that can only write marks it whatever it changed. A
-    // PRAGMA that sets a header field (user_version) changes no row, so it
-    // marks the database unsaved by its name.
-    const keyword = firstKeyword(statement);
-    const reads = keyword === 'SELECT' || keyword === 'EXPLAIN' || keyword === 'VALUES';
-    const mayWrite = keyword === 'WITH' || keyword === 'PRAGMA';
-    const setsImage = keyword === 'PRAGMA' && pragmaChangesImage(statement);
-    const changesBefore = mayWrite ? this.totalChanges() : 0;
+    // WITH ... DELETE, PRAGMA user_version = 3): see queryWrites(), which the
+    // sql.js adapter reads too.
+    const writes = queryWrites(statement);
+    const changesBefore = writes === 'if-rows-changed' ? this.totalChanges() : 0;
     const stmt = this.db!.prepare(statement);
     try {
       const { named, positional } = normaliseParameters(parameters);
@@ -708,7 +604,7 @@ export class IndexedDbAdapter implements StorageAdapter {
         results.push(obj as T);
       }
 
-      if (!reads && (!mayWrite || setsImage || this.totalChanges() !== changesBefore)) {
+      if (writes === 'yes' || (writes === 'if-rows-changed' && this.totalChanges() !== changesBefore)) {
         this.writeGeneration += 1;
       }
       return results;
@@ -1045,10 +941,11 @@ export class IndexedDbAdapter implements StorageAdapter {
   }
 
   /**
-   * Applies the connection settings open() was asked for. sql.js loses them
-   * whenever export() reopens the connection; a save, an export, an import
-   * and a reload set them again with the other settings a caller changed
-   * (exportImage, replaceDatabase).
+   * Applies the connection settings open() was asked for (foreignKeys), on the
+   * connection open() makes. sql.js loses them whenever export() reopens the
+   * connection; a save, an export, an import and a reload set them again with
+   * the other settings the connection had (exportImage, replaceDatabase), a
+   * PRAGMA the caller ran after open() included.
    */
   private applyConnectionSettings(): void {
     if (this.foreignKeys !== undefined) {
@@ -1076,56 +973,98 @@ export class IndexedDbAdapter implements StorageAdapter {
 
   /**
    * Imports a database from a Uint8Array (SQLite file).
-   * Replaces the current database once any open transaction() has ended, and
-   * saves it to IndexedDB before it resolves; with `crossTab`, in place of
-   * what every tab stored. Bytes that are not a SQLite database are refused,
-   * and the adapter keeps its database.
+   *
+   * The image is checked before anything is replaced: it must start with the
+   * SQLite header (an empty image is an empty database) and pass SQLite's
+   * quick_check. sql.js's `new Database(bytes)` takes any bytes, since SQLite
+   * reads the file only when a statement needs it, and a damaged page is read
+   * only by a statement that reaches it, so without the check a file of
+   * another kind or a damaged image would replace the database and be saved
+   * over the stored one. A refused image leaves the adapter on its database,
+   * in memory and in IndexedDB, and the call throws.
+   *
+   * The imported database replaces the current one once any open
+   * transaction() has ended and a save already running has finished, takes
+   * the connection's PRAGMA settings, and is saved to IndexedDB before the
+   * call resolves; with `crossTab`, in place of what every tab stored.
    * @param data SQLite database file
    */
   public async importDatabase(data: Uint8Array): Promise<void> {
     this.ensureOpen();
-    if (this.crossTab) {
-      await this.withCoordination(async () => {
-        this.swapIn(data);
-        await this.coordinatedSave(undefined);
-      });
-      return;
-    }
-    await whenAdmitted(
-      this.gate,
-      () => {
-        this.swapIn(data);
-        // The save exports in this turn, so no transaction can open between
-        // the swap and the export and hold the save back.
-        return this.startSave();
-      },
-      undefined,
-      this.longWait,
-    );
-  }
-
-  /** Replaces the database with an image, once sql.js has read it as a SQLite database. */
-  private swapIn(data: Uint8Array): void {
-    this.ensureOpen();
-    const imported = new this.SQL!.Database(data);
+    let imported: SqlJsDatabase | null = this.openImage(data);
     try {
-      // sqlite3_open reads nothing; the first statement reads the header.
-      imported.exec('SELECT count(*) FROM sqlite_master');
-    } catch (error) {
-      imported.close();
-      const reason = error instanceof Error ? error.message : String(error);
-      throw new Error(`IndexedDbAdapter: the image to import is not a SQLite database that sql.js can read (${reason}).`);
+      if (this.crossTab) {
+        // Every save runs under the coordination, so none is running here.
+        await this.withCoordination(async () => {
+          this.ensureOpen();
+          this.replaceDatabase(imported!);
+          imported = null;
+          this.writeGeneration += 1;
+          await this.coordinatedSave(undefined);
+        });
+        return;
+      }
+      for (;;) {
+        // A save already running stores the image it exported; the import's
+        // save starts after it, so that older image is never the last stored.
+        await this.settleSave();
+        const outcome = await whenAdmitted<'busy' | void>(
+          this.gate,
+          () => {
+            this.ensureOpen();
+            // A save started while this call waited for the gate.
+            if (this.saving) return 'busy';
+            this.replaceDatabase(imported!);
+            imported = null;
+            this.writeGeneration += 1;
+            // The save exports in this turn, so no transaction can open between
+            // the swap and the export and hold the save back.
+            return this.startSave();
+          },
+          undefined,
+          this.longWait,
+        );
+        if (outcome !== 'busy') return;
+      }
+    } finally {
+      // An image that never replaced the database.
+      imported?.close();
     }
-    this.replaceDatabase(imported);
-    this.writeGeneration += 1;
   }
 
-  /** Puts `next` in place of the database, with the connection settings the current one has. */
+  /**
+   * Opens an image for importDatabase() and checks it, before anything is
+   * replaced; throws on an image that is not a sound SQLite database.
+   */
+  private openImage(data: Uint8Array): SqlJsDatabase {
+    if (data.length > 0 && !hasSqliteHeader(data)) {
+      throw new Error(
+        'IndexedDbAdapter: importDatabase() was given bytes that are not a SQLite database: they do not start with the SQLite header.',
+      );
+    }
+    const imported = new this.SQL!.Database(data);
+    let problem: string | null = null;
+    try {
+      const rows = imported.exec('PRAGMA quick_check')[0]?.values ?? [];
+      if (rows.length !== 1 || rows[0][0] !== 'ok') {
+        problem = rows.map((row) => String(row[0])).join('; ') || 'quick_check answered nothing';
+      }
+    } catch (error) {
+      problem = error instanceof Error ? error.message : String(error);
+    }
+    if (problem !== null) {
+      imported.close();
+      throw new Error(`IndexedDbAdapter: importDatabase() was given a damaged SQLite database (${problem}).`);
+    }
+    return imported;
+  }
+
+  /** Puts `next` in place of the database, with the connection settings the current one has and its functions. */
   private replaceDatabase(next: SqlJsDatabase): void {
-    const settings = this.changedPragmas();
+    const settings = readConnectionSettings(this.db!);
     this.db!.close();
     this.db = next;
-    this.applyPragmas(settings);
+    restoreConnectionSettings(next, settings, this.settingsReport.onRefused);
     this.applyFunctions();
   }
 
@@ -1331,38 +1270,36 @@ export class IndexedDbAdapter implements StorageAdapter {
   // ==========================================================================
 
   /**
-   * Exports the database for a save, keeping the connection settings a
-   * caller made: sql.js's export() closes the connection and opens it again.
+   * Exports the database for a save, keeping the connection's settings:
+   * sql.js's export() closes the connection and opens it again, which sets
+   * every PRAGMA back to its default. The settings are read before the export
+   * and set again after it, whether open() made them or a statement did later,
+   * and the registered functions with them.
    */
   private exportImage(): Uint8Array {
-    const settings = this.changedPragmas();
-    const image = this.db!.export();
-    this.applyPragmas(settings);
+    const image = exportKeepingSettings(this.db!, this.settingsReport);
     this.applyFunctions();
     return image;
   }
 
-  /** The connection settings that differ from a fresh connection's. */
-  private changedPragmas(): Map<string, unknown> {
-    const changed = new Map<string, unknown>();
-    if (!this.db) return changed;
-    for (const [name, value] of readPragmas(this.db)) {
-      if (this.pragmaDefaults.get(name) !== value) changed.set(name, value);
-    }
-    return changed;
-  }
-
-  /** Sets connection settings on the database, after a save or a reload. */
-  private applyPragmas(settings: Map<string, unknown>): void {
-    for (const [name, value] of settings) {
-      const literal = typeof value === 'number' ? String(value) : `'${String(value).replace(/'/g, "''")}'`;
-      try {
-        this.db!.exec(`PRAGMA ${name} = ${literal}`);
-      } catch {
-        // A setting this build of SQLite does not take is left as it is.
-      }
-    }
-  }
+  /** How a save reports a setting it could not set again and the TEMP objects it dropped. */
+  private readonly settingsReport: KeepSettingsReport = {
+    onRefused: (name, value, error) => {
+      console.warn(
+        `[IndexedDbAdapter] Could not set PRAGMA ${name} = ${value} again on the connection of "${this.dbName}" after sql.js reopened it.`,
+        error,
+      );
+    },
+    onTempObjectsDropped: (count) => {
+      if (this.tempDropReported) return;
+      this.tempDropReported = true;
+      console.warn(
+        `[IndexedDbAdapter] A save of "${this.dbName}" dropped the connection's TEMP tables, views, indexes and triggers (${count}): ` +
+          'sql.js reopens its connection to read the database image, and TEMP objects do not survive that. ' +
+          'Keep such state in the main database.',
+      );
+    },
+  };
 
   /**
    * Opens or creates the IndexedDB database.
@@ -1695,17 +1632,3 @@ export class IndexedDbAdapter implements StorageAdapter {
     return null;
   }
 }
-
-/** The connection settings of `db`, by name. A setting this build does not have is left out. */
-const readPragmas = (db: SqlJsDatabase): Map<string, unknown> => {
-  const values = new Map<string, unknown>();
-  for (const name of CONNECTION_PRAGMAS) {
-    try {
-      const value = db.exec(`PRAGMA ${name}`)[0]?.values?.[0]?.[0];
-      if (value !== undefined) values.set(name, value);
-    } catch {
-      // Not in this build of SQLite.
-    }
-  }
-  return values;
-};

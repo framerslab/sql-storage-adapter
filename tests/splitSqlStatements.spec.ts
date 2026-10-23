@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { splitSqlStatements } from '../src/shared/splitSqlStatements.js';
+import { splitSqlStatements, sqliteStatementSpans } from '../src/shared/splitSqlStatements.js';
 
 describe('splitSqlStatements', () => {
   it('returns an empty array for empty or whitespace-only input', () => {
@@ -169,6 +169,43 @@ describe('splitSqlStatements', () => {
     expect(splitSqlStatements(script)).toEqual([
       "SELECT '$' || ' literal'",
       'SELECT 1',
+    ]);
+  });
+});
+
+describe('sqliteStatementSpans', () => {
+  const texts = (script: string): string[] => sqliteStatementSpans(script).map(({ start, end }) => script.slice(start, end));
+
+  it('cuts a script at the semicolons outside strings, quoted names and comments, and leaves the whitespace out', () => {
+    const script =
+      'PRAGMA foreign_keys = OFF;\n' +
+      'CREATE TABLE [a;b] (id INTEGER PRIMARY KEY, "x;y" TEXT, `p;q` TEXT);\n' +
+      "INSERT INTO [a;b] VALUES (1, 'it''s; fine', 'two'); -- a comment; with a semicolon\n" +
+      '/* a block; comment */ PRAGMA foreign_keys = ON;';
+    expect(texts(script)).toEqual([
+      'PRAGMA foreign_keys = OFF',
+      'CREATE TABLE [a;b] (id INTEGER PRIMARY KEY, "x;y" TEXT, `p;q` TEXT)',
+      "INSERT INTO [a;b] VALUES (1, 'it''s; fine', 'two')",
+      '-- a comment; with a semicolon\n/* a block; comment */ PRAGMA foreign_keys = ON',
+    ]);
+  });
+
+  it('answers no span for an empty script, and one for a script with no semicolon', () => {
+    expect(sqliteStatementSpans('')).toEqual([]);
+    expect(sqliteStatementSpans(' ;; \n')).toEqual([]);
+    expect(texts('SELECT 1')).toEqual(['SELECT 1']);
+  });
+
+  it('runs an unterminated quote or comment to the end of the script', () => {
+    expect(texts("SELECT 'open; still the string")).toEqual(["SELECT 'open; still the string"]);
+    expect(texts('SELECT 1; -- trailing; comment')).toEqual(['SELECT 1', '-- trailing; comment']);
+  });
+
+  it('gives offsets that slice the script', () => {
+    const script = '  SELECT 1 ;SELECT 2';
+    expect(sqliteStatementSpans(script)).toEqual([
+      { start: 2, end: 10 },
+      { start: 12, end: 20 },
     ]);
   });
 });

@@ -188,3 +188,71 @@ export const splitSqlStatements = (script: string): string[] => {
   pushBuffer();
   return statements;
 };
+
+/** A statement's place in a script: offsets into the script, with the whitespace around the statement left out. */
+export interface StatementSpan {
+  start: number;
+  end: number;
+}
+
+/**
+ * The statements of a SQLite script, as offsets into it: the script is cut at
+ * the semicolons outside SQLite's strings, quoted names and comments (`'...'`,
+ * `"..."`, `` `...` ``, `[...]`, `--` to the end of the line, `/* ... *\/`), and
+ * each statement's whitespace is left out of its span. A caller that must hand
+ * a part of the script on as written (the Capacitor adapter's exec(), whose
+ * plugin splits the script itself) slices the script by these spans and never
+ * rejoins statements. SQLite has no dollar quoting: `$name` is a parameter.
+ *
+ * @param script - A script of one or more SQLite statements.
+ * @returns The spans of the statements that hold anything but whitespace, in order.
+ */
+export const sqliteStatementSpans = (script: string): StatementSpan[] => {
+  const spans: StatementSpan[] = [];
+  const length = script.length;
+  let from = 0;
+  const push = (to: number): void => {
+    let start = from;
+    let end = to;
+    while (start < end && /\s/.test(script[start])) start += 1;
+    while (end > start && /\s/.test(script[end - 1])) end -= 1;
+    if (end > start) spans.push({ start, end });
+    from = to + 1;
+  };
+  let i = 0;
+  while (i < length) {
+    const ch = script[i];
+    const next = script[i + 1];
+    if (ch === '-' && next === '-') {
+      const end = script.indexOf('\n', i + 2);
+      i = end < 0 ? length : end + 1;
+    } else if (ch === '/' && next === '*') {
+      const end = script.indexOf('*/', i + 2);
+      i = end < 0 ? length : end + 2;
+    } else if (ch === "'" || ch === '"' || ch === '`') {
+      // The quote character inside is written twice.
+      i += 1;
+      while (i < length) {
+        if (script[i] === ch) {
+          if (script[i + 1] === ch) {
+            i += 2;
+            continue;
+          }
+          break;
+        }
+        i += 1;
+      }
+      i += 1;
+    } else if (ch === '[') {
+      const end = script.indexOf(']', i + 1);
+      i = end < 0 ? length : end + 1;
+    } else if (ch === ';') {
+      push(i);
+      i += 1;
+    } else {
+      i += 1;
+    }
+  }
+  push(length);
+  return spans;
+};
