@@ -109,4 +109,53 @@ describe('createDatabase - adapter priority', () => {
     await createDatabase({ url: POSTGRES_URL, type: 'sqlite' });
     expect(last().priority).toEqual(['better-sqlite3']);
   });
+
+  it('keeps the local default on Node for a connection string that is not a PostgreSQL URL', async () => {
+    // DATABASE_URL holds such strings in projects that run SQLite through
+    // Prisma (file:./dev.db) or name another database.
+    for (const url of ['file:./dev.db', 'sqlite:///var/data/app.db', 'mysql://app@db.internal/app']) {
+      await createDatabase({ url });
+      expect(last().priority, url).toEqual(['better-sqlite3', 'sqljs']);
+    }
+
+    await createDatabase({ postgres: { connectionString: 'file:./dev.db', max: 4 } });
+    expect(last().priority).toEqual(['better-sqlite3', 'sqljs']);
+  });
+
+  it('chooses Postgres for postgres:// and postgresql:// URLs, in any case', async () => {
+    for (const url of ['postgres://app@db.internal/app', 'POSTGRESQL://app@db.internal/app']) {
+      await createDatabase({ url });
+      expect(last().priority, url).toEqual(['postgres']);
+    }
+  });
+});
+
+describe('connectDatabase', () => {
+  const last = (): StorageResolutionOptions => handedOver[handedOver.length - 1];
+
+  afterEach(() => {
+    handedOver.length = 0;
+    vi.unstubAllGlobals();
+  });
+
+  it('refuses a configuration that names no server, before it opens anything', async () => {
+    // connectDatabase(process.env.DATABASE_URL) or connectDatabase({ connectionString:
+    // process.env.DATABASE_URL }) with the variable unset.
+    for (const config of [{ connectionString: undefined }, { connectionString: '' }, {}]) {
+      await expect(connectDatabase(config)).rejects.toThrow(/no PostgreSQL server/);
+    }
+    await expect(connectDatabase('')).rejects.toThrow(/no PostgreSQL server/);
+    await expect(connectDatabase(undefined as unknown as string)).rejects.toThrow(/no PostgreSQL server/);
+
+    expect(handedOver).toEqual([]);
+  });
+
+  it('asks for PostgreSQL alone for any connection string, in any runtime', async () => {
+    await connectDatabase('socket:/var/run/postgresql?db=app');
+    expect(last().priority).toEqual(['postgres']);
+
+    vi.stubGlobal('window', { document: {} });
+    await connectDatabase(POSTGRES_URL);
+    expect(last().priority).toEqual(['postgres']);
+  });
 });
