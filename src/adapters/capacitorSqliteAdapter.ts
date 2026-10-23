@@ -124,8 +124,9 @@ const createConnection = async (sqlite: SQLiteConnection, database: string): Pro
     if (!/already exists/i.test(messageOf(error))) throw error;
     throw new Error(
       `Capacitor SQLite: the plugin already has a connection to database "${database}" that no adapter opened: ` +
-        'another part of the app holds it, or a page before a reload left it. The adapter closes no connection it did not open. ' +
-        "Close it where it was opened, or call the plugin's checkConnectionsConsistency() when the app starts, before open().",
+        'another part of the app holds it, or a page before a reload left it. The adapter closes no connection it did not open; ' +
+        "close it where it was opened. For a connection a reload left behind, the plugin's checkConnectionsConsistency() on a fresh " +
+        'SQLiteConnection when the app starts closes every connection the native side holds, so call it only in an app where nothing else holds one.',
     );
   }
 };
