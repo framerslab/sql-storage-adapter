@@ -398,6 +398,37 @@ describe('CapacitorSqliteAdapter open() and close() on @capacitor-community/sqli
     expect(await adapter.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 0 });
   });
 
+  it('opens once when open() is called twice at once, and works after both resolve', async () => {
+    const adapter = new CapacitorSqliteAdapter({ database: 'twice', enableWal: false });
+    adapters.push(adapter);
+
+    await Promise.all([adapter.open(), adapter.open()]);
+
+    expect(plugin.connections.has('RW_twice')).toBe(true);
+    await adapter.exec('CREATE TABLE notes (body TEXT NOT NULL)');
+    await adapter.run('INSERT INTO notes (body) VALUES (?)', ['once']);
+    expect(await adapter.all('SELECT body FROM notes')).toEqual([{ body: 'once' }]);
+  });
+
+  it("hands execute() the script's own text between its edge PRAGMAs, so a quoted name with a semicolon inside reaches the plugin as written", async () => {
+    const adapter = await openAdapter('quoted-names', { enableWal: false });
+    const native = plugin.module.CapacitorSQLite;
+    const scripts: string[] = [];
+    // The plugin's own execute() splits a script on semicolons itself; the
+    // adapter's part is to hand it the script as the caller wrote it.
+    vi.spyOn(native, 'execute').mockImplementation(async (options: unknown) => {
+      scripts.push((options as { statements: string }).statements);
+      return { changes: { changes: 0 } };
+    });
+
+    await adapter.exec(
+      'PRAGMA foreign_keys = OFF;\nCREATE TABLE [a;b] (id INTEGER PRIMARY KEY);\nINSERT INTO `c;d` (v) VALUES (\';\');\nPRAGMA foreign_keys = ON;',
+    );
+
+    expect(scripts).toEqual(["CREATE TABLE [a;b] (id INTEGER PRIMARY KEY);\nINSERT INTO `c;d` (v) VALUES (';')"]);
+    expect(await adapter.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
+  });
+
   it('closes its native connection, so the database opens again with its rows', async () => {
     const first = await openAdapter('reopen');
     await first.exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)');

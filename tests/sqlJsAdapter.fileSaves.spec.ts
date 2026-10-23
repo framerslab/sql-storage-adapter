@@ -114,6 +114,28 @@ describe('SqlJsAdapter saves to its file', () => {
 
       expect(await filePragma(file, 'user_version')).toBe(7);
     });
+
+    it('saves PRAGMA default_cache_size, which lives in the database header, run through get()', async () => {
+      // The deprecated pragma writes the suggested cache size at offset 48 of the header; total_changes() counts no row.
+      const file = tempFile();
+      const adapter = await openWithItems(file);
+
+      await adapter.get('PRAGMA default_cache_size = 2000');
+
+      expect(await filePragma(file, 'default_cache_size')).toBe(2000);
+    });
+
+    it('saves the rows an INSERT OR FAIL inserted before the row that failed, which SQLite keeps', async () => {
+      const file = tempFile();
+      const adapter = await openWithItems(file);
+
+      await expect(
+        adapter.run("INSERT OR FAIL INTO items (id, label) VALUES (1, 'first'), (2, 'second'), (1, 'taken')"),
+      ).rejects.toThrow(/constraint failed/i);
+
+      expect(await labels(adapter)).toEqual(['first', 'second']);
+      expect(await fileLabels(file)).toEqual(['first', 'second']);
+    });
   });
 
   describe('exec() scripts', () => {
