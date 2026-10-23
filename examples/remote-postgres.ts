@@ -5,7 +5,7 @@
  * with the same API as local SQLite databases.
  */
 
-import { createDatabase, connectDatabase, openDatabase } from '@framers/sql-storage-adapter';
+import { createDatabase, connectDatabase } from '@framers/sql-storage-adapter';
 import type { StorageAdapter } from '@framers/sql-storage-adapter';
 
 // Environment configuration
@@ -18,9 +18,10 @@ const DATABASE_URL = process.env.DATABASE_URL ||
 async function basicConnection() {
   console.log('\n=== Example 1: Basic Remote Connection ===\n');
 
-  // Connect to remote PostgreSQL - auto-detects from DATABASE_URL
-  const db = await createDatabase();
-  await db.open();
+  // PostgreSQL alone, from DATABASE_URL: connectDatabase() opens it and has
+  // no local fallback. createDatabase() with no options opens a local SQLite
+  // file; it does not read DATABASE_URL.
+  const db = await connectDatabase(DATABASE_URL);
 
   console.log('✅ Connected to PostgreSQL');
   console.log('Adapter:', db.kind);
