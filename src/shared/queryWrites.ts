@@ -23,11 +23,20 @@ export const firstKeyword = (statement: string): string =>
 
 /**
  * PRAGMAs whose assignment changes the database image: the header's
- * user_version, application_id and schema_version, and the settings a new
- * database or a VACUUM writes (page_size, auto_vacuum, encoding). SQLite's
- * change counter, `total_changes()`, counts none of them.
+ * user_version, application_id, schema_version and default_cache_size (the
+ * deprecated suggested cache size, at offset 48 of the header), and the
+ * settings a new database or a VACUUM writes (page_size, auto_vacuum,
+ * encoding). SQLite's change counter, `total_changes()`, counts none of them.
  */
-const IMAGE_PRAGMAS_WHEN_SET = new Set(['user_version', 'application_id', 'schema_version', 'page_size', 'auto_vacuum', 'encoding']);
+const IMAGE_PRAGMAS_WHEN_SET = new Set([
+  'user_version',
+  'application_id',
+  'schema_version',
+  'default_cache_size',
+  'page_size',
+  'auto_vacuum',
+  'encoding',
+]);
 
 /** PRAGMAs that change the image in any form: incremental_vacuum frees pages, optimize may run ANALYZE. */
 const IMAGE_PRAGMAS_ALWAYS = new Set(['incremental_vacuum', 'optimize']);
@@ -126,7 +135,8 @@ export const pragmaChangesImage = (statement: string): boolean => {
  * - `'yes'`: any other statement. `INSERT`, `UPDATE`, `DELETE` and `REPLACE`
  *   with `RETURNING`, a schema change, and a `PRAGMA` that writes the image
  *   although no row changes (`PRAGMA user_version = 3`,
- *   `PRAGMA application_id(42)`, `PRAGMA incremental_vacuum`).
+ *   `PRAGMA application_id(42)`, `PRAGMA default_cache_size = 2000`,
+ *   `PRAGMA incremental_vacuum`).
  */
 export type QueryWrite = 'no' | 'if-rows-changed' | 'yes';
 

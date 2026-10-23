@@ -11,7 +11,7 @@ import {
   createSharedConnectionTransactionAdapter,
 } from '../shared/serializedTransaction';
 import { namesInMemoryDatabase, segmentFilePath, validateSegment } from '../shared/segment';
-import { queryWrites } from '../shared/queryWrites';
+import { queryWrites, type QueryWrite } from '../shared/queryWrites';
 import { exportKeepingSettings } from '../shared/sqlJsConnectionSettings';
 import { getStorageLogger } from '../shared/logger';
 
@@ -124,7 +124,9 @@ export class SqlJsAdapter implements StorageAdapter {
   /**
    * Runs one statement. With a `filePath`, the database is saved to the file
    * after it unless SQLite has a transaction open; a transaction's statements
-   * are saved by the save after its COMMIT.
+   * are saved by the save after its COMMIT. A statement that fails part way
+   * (`INSERT OR FAIL`, `UPDATE OR FAIL`) keeps the rows it changed before the
+   * failure, as SQLite's FAIL resolution does, and they are saved too.
    */
   public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
     ({ statement, parameters } = toSqliteStatement(statement, parameters));
@@ -145,9 +147,13 @@ export class SqlJsAdapter implements StorageAdapter {
         changes: this.db!.getRowsModified(),
         lastInsertRowid: normaliseRowId(rawRowId)
       };
-    } finally {
+    } catch (error) {
+      // Freed before the save, whose export frees every statement it finds.
       stmt.free();
+      await this.persistQuietly();
+      throw error;
     }
+    stmt.free();
     await this.persistIfNeeded();
     return result;
   }
@@ -183,13 +189,23 @@ export class SqlJsAdapter implements StorageAdapter {
         });
         results.push(row as T);
       }
-    } finally {
+    } catch (error) {
       stmt.free();
+      // The rows a statement changed before it failed (INSERT OR FAIL ...
+      // RETURNING) stay, and are saved as a failed script's statements are.
+      if (this.wrote(writes, changesBefore)) await this.persistQuietly();
+      throw error;
     }
-    if (writes === 'yes' || (writes === 'if-rows-changed' && this.totalChanges() !== changesBefore)) {
+    stmt.free();
+    if (this.wrote(writes, changesBefore)) {
       await this.persistIfNeeded();
     }
     return results;
+  }
+
+  /** Whether a statement all() or get() ran can have changed the database; see {@link queryWrites}. */
+  private wrote(writes: QueryWrite, changesBefore: number): boolean {
+    return writes === 'yes' || (writes === 'if-rows-changed' && this.totalChanges() !== changesBefore);
   }
 
   /**

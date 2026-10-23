@@ -13,7 +13,7 @@ import {
 } from '../shared/serializedTransaction';
 import { createConnectionGate, whenAdmitted, type LongWaitWatch } from '../shared/connectionGate';
 import { firstKeyword } from '../shared/queryWrites';
-import { splitSqlStatements } from '../shared/splitSqlStatements';
+import { sqliteStatementSpans, type StatementSpan } from '../shared/splitSqlStatements';
 import { segmentName, validateSegment } from '../shared/segment';
 
 import type { CapacitorSQLitePlugin, SQLiteConnection, SQLiteDBConnection } from '@capacitor-community/sqlite';
@@ -128,34 +128,38 @@ const createConnection = async (sqlite: SQLiteConnection, database: string): Pro
 const isPragma = (statement: string): boolean => firstKeyword(statement) === 'PRAGMA';
 
 /**
- * A script's PRAGMA statements at its start and at its end, and the statements
- * between them; null when it has none there.
+ * A script's PRAGMA statements at its start and at its end, and the script's
+ * own text between them; null when it has none there.
  *
  * The plugin runs execute() and run() inside a transaction of its own, where
  * SQLite ignores PRAGMA foreign_keys and refuses to change the journal mode,
- * and on Android through execSQL, which fails on a statement that answers a
- * row, as PRAGMA journal_mode = WAL does. The adapter sends these PRAGMA
- * statements through query(), which runs a statement as it is: the ones before
- * the rest of the script first, the rest in one execute() call as before, the
- * ones after it last. That is SQLite's procedure for changing a table: foreign
- * keys off, rebuild the table, foreign keys on. A PRAGMA between two other
- * statements stays in the script.
+ * and on Android through SQLCipher's execSQL, which fails on a statement that
+ * answers a row, as PRAGMA journal_mode = WAL does. The adapter sends these
+ * PRAGMA statements through query(), which runs a statement as it is: the
+ * ones before the rest of the script first, the rest in one execute() call,
+ * the ones after it last. That is SQLite's procedure for changing a table:
+ * foreign keys off, rebuild the table, foreign keys on. A PRAGMA between two
+ * other statements stays in the script.
+ *
+ * The script is cut by sqliteStatementSpans(), which knows SQLite's strings,
+ * quoted names and comments, and the body is the script's text as written,
+ * separators included: the plugin splits it itself, as it does a script
+ * without an edge PRAGMA, and a quoted name or a string with a semicolon
+ * inside reaches it unchanged.
  */
 const pragmaEdges = (script: string): { before: string[]; body: string | null; after: string[] } | null => {
   if (!/pragma/i.test(script)) return null;
-  const statements = splitSqlStatements(script);
+  const spans = sqliteStatementSpans(script);
+  const text = (span: StatementSpan): string => script.slice(span.start, span.end);
   let start = 0;
-  while (start < statements.length && isPragma(statements[start])) start += 1;
-  let end = statements.length;
-  while (end > start && isPragma(statements[end - 1])) end -= 1;
-  if (start === 0 && end === statements.length) return null;
-  const body = statements.slice(start, end);
+  while (start < spans.length && isPragma(text(spans[start]))) start += 1;
+  let end = spans.length;
+  while (end > start && isPragma(text(spans[end - 1]))) end -= 1;
+  if (start === 0 && end === spans.length) return null;
   return {
-    before: statements.slice(0, start),
-    // Separators on lines of their own, so a statement's trailing -- comment
-    // cannot swallow one.
-    body: body.length > 0 ? body.join('\n;\n') : null,
-    after: statements.slice(end),
+    before: spans.slice(0, start).map(text),
+    body: end > start ? script.slice(spans[start].start, spans[end - 1].end) : null,
+    after: spans.slice(end).map(text),
   };
 };
 
@@ -212,6 +216,8 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
   /** The name of the database this adapter has open. */
   private openName: string | null = null;
   private connection: SQLiteDBConnection | null = null;
+  /** The open() in progress, which a second call waits for. */
+  private opening: Promise<void> | null = null;
   private dbName: string;
   /** The connection is shared, so transaction() runs one callback at a time. */
   private readonly runSerializedTransaction = createSerializedTransactionRunner();
@@ -237,11 +243,23 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
     this.segment = options.segment === undefined ? undefined : validateSegment(options.segment);
   }
 
-  public async open(options?: StorageOpenOptions): Promise<void> {
+  /**
+   * Opens the database. A second call while the first is still opening waits
+   * for it, and a call on an open adapter returns at once.
+   */
+  public open(options?: StorageOpenOptions): Promise<void> {
     if (this.connection) {
-      return;
+      return Promise.resolve();
     }
+    if (!this.opening) {
+      this.opening = this.openNow(options).finally(() => {
+        this.opening = null;
+      });
+    }
+    return this.opening;
+  }
 
+  private async openNow(options?: StorageOpenOptions): Promise<void> {
     const adapterOptions = options?.adapterOptions as { database?: unknown } | undefined;
     const requestedName = typeof adapterOptions?.database === 'string' ? adapterOptions.database : undefined;
     const name = connectionName(segmentName(requestedName ?? this.options.database ?? this.dbName, this.segment));
