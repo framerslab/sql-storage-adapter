@@ -226,6 +226,8 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
   private connection: SQLiteDBConnection | null = null;
   /** The open() in progress, which a second call waits for. */
   private opening: Promise<void> | null = null;
+  /** The close() in progress, which a second call waits for. */
+  private closeRun: Promise<void> | null = null;
   private dbName: string;
   /** The connection is shared, so transaction() runs one callback at a time. */
   private readonly runSerializedTransaction = createSerializedTransactionRunner();
@@ -374,9 +376,20 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
 
   /**
    * Closes the database and the plugin's connection to it, so the database can
-   * be opened again, by this adapter or another one.
+   * be opened again, by this adapter or another one. A call made while a close
+   * is running waits for that close, so a caller that awaited either call can
+   * open the database again at once.
    */
-  public async close(): Promise<void> {
+  public close(): Promise<void> {
+    if (!this.closeRun) {
+      this.closeRun = this.closeNow().finally(() => {
+        this.closeRun = null;
+      });
+    }
+    return this.closeRun;
+  }
+
+  private async closeNow(): Promise<void> {
     const connection = this.connection;
     if (!connection) {
       return;
