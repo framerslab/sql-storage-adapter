@@ -15,6 +15,7 @@ declare module '@capacitor-community/sqlite' {
     values?: T[];
   }
 
+  /** A connection SQLiteConnection made, to one database. */
   export interface SQLiteDBConnection {
     open(): Promise<void>;
     close(): Promise<void>;
@@ -22,6 +23,7 @@ declare module '@capacitor-community/sqlite' {
     execute(statements: string, transaction?: boolean): Promise<SQLiteChangesResult>;
     /** With `transaction` true, the default, the plugin runs the statement in a transaction of its own. */
     run(statement: string, values?: unknown[], transaction?: boolean): Promise<SQLiteChangesResult>;
+    /** Runs the statement as it is, outside any transaction of the plugin's own, and answers its rows. */
     query<T = unknown>(statement: string, values?: unknown[]): Promise<SQLiteQueryResult<T>>;
     /** Plugin 5.0.7 and later. */
     beginTransaction(): Promise<SQLiteChangesResult>;
@@ -31,17 +33,33 @@ declare module '@capacitor-community/sqlite' {
     rollbackTransaction(): Promise<SQLiteChangesResult>;
   }
 
+  /**
+   * The native plugin. Each of its methods takes one options object; the
+   * adapter reaches it through SQLiteConnection.
+   */
   export interface CapacitorSQLitePlugin {
+    createConnection(options: {
+      database?: string;
+      version?: number;
+      encrypted?: boolean;
+      mode?: string;
+      readonly?: boolean;
+    }): Promise<void>;
+    closeConnection(options: { database?: string; readonly?: boolean }): Promise<void>;
+  }
+
+  /** The plugin's JavaScript side over CapacitorSQLite: it makes the connections and holds them. */
+  export class SQLiteConnection {
+    constructor(sqlite: CapacitorSQLitePlugin);
     createConnection(
       database: string,
       encrypted: boolean,
       mode: string,
       version: number,
-      readonly: boolean
+      readonly: boolean,
     ): Promise<SQLiteDBConnection>;
+    closeConnection(database: string, readonly: boolean): Promise<void>;
   }
 
   export const CapacitorSQLite: CapacitorSQLitePlugin;
-  const plugin: CapacitorSQLitePlugin;
-  export default plugin;
 }

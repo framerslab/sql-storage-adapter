@@ -12,9 +12,11 @@ import {
   createSharedConnectionTransactionAdapter,
 } from '../shared/serializedTransaction';
 import { createConnectionGate, whenAdmitted, type LongWaitWatch } from '../shared/connectionGate';
+import { firstKeyword } from '../shared/queryWrites';
+import { splitSqlStatements } from '../shared/splitSqlStatements';
 import { segmentName, validateSegment } from '../shared/segment';
 
-import type { CapacitorSQLitePlugin, SQLiteDBConnection } from '@capacitor-community/sqlite';
+import type { CapacitorSQLitePlugin, SQLiteConnection, SQLiteDBConnection } from '@capacitor-community/sqlite';
 
 /** How long a statement waits for an open transaction before the adapter warns. */
 const LONG_WAIT_MS = 10_000;
@@ -25,7 +27,8 @@ export interface CapacitorAdapterOptions {
    */
   database?: string;
   /**
-   * Whether to enable WAL when platform supports it.
+   * Whether to turn on WAL (write-ahead logging) when the adapter opens.
+   * Default: true.
    */
   enableWal?: boolean;
   /**
@@ -36,41 +39,124 @@ export interface CapacitorAdapterOptions {
   segment?: string;
 }
 
-const isCapacitorPlugin = (value: unknown): value is CapacitorSQLitePlugin => {
-  if (!value || typeof value !== 'object') {
-    return false;
-  }
-  const candidate = value as { createConnection?: unknown };
-  return typeof candidate.createConnection === 'function';
+/** The exports of @capacitor-community/sqlite the adapter uses. */
+interface PluginExports {
+  CapacitorSQLite: CapacitorSQLitePlugin;
+  SQLiteConnection: new (plugin: CapacitorSQLitePlugin) => SQLiteConnection;
+}
+
+const pluginExports = (value: unknown): PluginExports | null => {
+  if (!value || typeof value !== 'object') return null;
+  if (!('SQLiteConnection' in value) || !('CapacitorSQLite' in value)) return null;
+  const candidate = value as { SQLiteConnection: unknown; CapacitorSQLite: unknown };
+  if (typeof candidate.SQLiteConnection !== 'function' || !candidate.CapacitorSQLite) return null;
+  return candidate as PluginExports;
 };
 
-const loadCapacitorSqlite = async (): Promise<CapacitorSQLitePlugin | null> => {
+/**
+ * Loads @capacitor-community/sqlite and makes the plugin's SQLiteConnection
+ * over its native plugin, CapacitorSQLite. SQLiteConnection makes the
+ * connections: `createConnection(database, encrypted, mode, version, readonly)`
+ * answers a SQLiteDBConnection. CapacitorSQLite's own methods take one options
+ * object and answer nothing a statement can run on.
+ */
+const importSqliteConnection = async (): Promise<SQLiteConnection | null> => {
+  let mod: unknown;
   try {
-    const mod: unknown = await import('@capacitor-community/sqlite');
-
-    if (isCapacitorPlugin(mod)) {
-      return mod;
-    }
-
-    if (mod && typeof mod === 'object') {
-      const { default: defaultExport, CapacitorSQLite } = mod as {
-        default?: unknown;
-        CapacitorSQLite?: unknown;
-      };
-
-      if (isCapacitorPlugin(defaultExport)) {
-        return defaultExport;
-      }
-      if (isCapacitorPlugin(CapacitorSQLite)) {
-        return CapacitorSQLite;
-      }
-    }
-
-    return null;
+    mod = await import('@capacitor-community/sqlite');
   } catch (error) {
     console.warn('[StorageAdapter] @capacitor-community/sqlite module not available.', error);
     return null;
   }
+  // An ES module names its exports; a CommonJS build behind a bundler's
+  // interop can hold them on default.
+  const plugin =
+    pluginExports(mod) ??
+    (mod && typeof mod === 'object' && 'default' in mod ? pluginExports((mod as { default?: unknown }).default) : null);
+  if (!plugin) {
+    console.warn('[StorageAdapter] @capacitor-community/sqlite does not export SQLiteConnection and CapacitorSQLite.');
+    return null;
+  }
+  return new plugin.SQLiteConnection(plugin.CapacitorSQLite);
+};
+
+/**
+ * One SQLiteConnection for every adapter in the page. A load that fails is
+ * tried again by the next open().
+ */
+let sharedSqliteConnection: Promise<SQLiteConnection | null> | null = null;
+
+const loadSqliteConnection = (): Promise<SQLiteConnection | null> => {
+  if (!sharedSqliteConnection) {
+    sharedSqliteConnection = importSqliteConnection().then((made) => {
+      if (!made) sharedSqliteConnection = null;
+      return made;
+    });
+  }
+  return sharedSqliteConnection;
+};
+
+/** The databases an adapter of this page has open, or is opening, by connectionName(). */
+const openDatabases = new Set<string>();
+
+/**
+ * The name the plugin keeps a database's connection under: its
+ * SQLiteConnection drops a trailing ".db", so "notes.db" and "notes" are one
+ * connection, and one database file.
+ */
+const connectionName = (database: string): string => (database.endsWith('.db') ? database.slice(0, -3) : database);
+
+const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/**
+ * Creates the connection to a database. The plugin's native side keeps its
+ * connections until they are closed, across reloads of the page, so one can be
+ * left from before a reload, and createConnection then fails with "Connection
+ * <name> already exists". No adapter of this page holds that one (an adapter
+ * holding it is refused before this), so it is closed and made again.
+ */
+const createConnection = async (sqlite: SQLiteConnection, database: string): Promise<SQLiteDBConnection> => {
+  try {
+    return await sqlite.createConnection(database, false, 'no-encryption', 1, false);
+  } catch (error) {
+    if (!/already exists/i.test(messageOf(error))) throw error;
+    await sqlite.closeConnection(database, false);
+    return sqlite.createConnection(database, false, 'no-encryption', 1, false);
+  }
+};
+
+const isPragma = (statement: string): boolean => firstKeyword(statement) === 'PRAGMA';
+
+/**
+ * A script's PRAGMA statements at its start and at its end, and the statements
+ * between them; null when it has none there.
+ *
+ * The plugin runs execute() and run() inside a transaction of its own, where
+ * SQLite ignores PRAGMA foreign_keys and refuses to change the journal mode,
+ * and on Android through execSQL, which fails on a statement that answers a
+ * row, as PRAGMA journal_mode = WAL does. The adapter sends these PRAGMA
+ * statements through query(), which runs a statement as it is: the ones before
+ * the rest of the script first, the rest in one execute() call as before, the
+ * ones after it last. That is SQLite's procedure for changing a table: foreign
+ * keys off, rebuild the table, foreign keys on. A PRAGMA between two other
+ * statements stays in the script.
+ */
+const pragmaEdges = (script: string): { before: string[]; body: string | null; after: string[] } | null => {
+  if (!/pragma/i.test(script)) return null;
+  const statements = splitSqlStatements(script);
+  let start = 0;
+  while (start < statements.length && isPragma(statements[start])) start += 1;
+  let end = statements.length;
+  while (end > start && isPragma(statements[end - 1])) end -= 1;
+  if (start === 0 && end === statements.length) return null;
+  const body = statements.slice(start, end);
+  return {
+    before: statements.slice(0, start),
+    // Separators on lines of their own, so a statement's trailing -- comment
+    // cannot swallow one.
+    body: body.length > 0 ? body.join('\n;\n') : null,
+    after: statements.slice(end),
+  };
 };
 
 /**
@@ -94,11 +180,23 @@ const toRunResult = (answer: unknown): StorageRunResult => {
 /**
  * Adapter using @capacitor-community/sqlite for native mobile targets.
  *
+ * It opens its database through the plugin's SQLiteConnection, one for every
+ * adapter in the page, and close() closes the plugin's connection too, so the
+ * database can be opened again. One adapter at a time holds a database: a
+ * second open() of the same database fails while the first adapter has it.
+ * The plugin drops a trailing ".db" from a name, so `notes.db` and `notes`
+ * are one database.
+ *
  * Transactions use the plugin's beginTransaction, commitTransaction and
  * rollbackTransaction (plugin 5.0.7 and later). The plugin runs every other
  * execute and run call in a transaction of its own, which cannot nest in an
  * open one, so the statements of a transaction's callback go to the plugin
- * with `transaction` false.
+ * with `transaction` false. A PRAGMA statement goes through the plugin's
+ * query(), outside that transaction of the plugin's own: in a run() call, or
+ * at the start or the end of an exec() script.
+ *
+ * The plugin turns foreign keys on when it opens a database, on Android, iOS
+ * and Electron. `foreignKeys: false` in the open options turns them off.
  */
 export class CapacitorSqliteAdapter implements StorageAdapter {
   public readonly kind = 'capacitor-sqlite';
@@ -109,7 +207,10 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
     'persistence'
   ]);
 
-  private plugin: CapacitorSQLitePlugin | null = null;
+  /** The SQLiteConnection that made this adapter's connection. */
+  private sqlite: SQLiteConnection | null = null;
+  /** The name of the database this adapter has open. */
+  private openName: string | null = null;
   private connection: SQLiteDBConnection | null = null;
   private dbName: string;
   /** The connection is shared, so transaction() runs one callback at a time. */
@@ -141,30 +242,52 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
       return;
     }
 
-    this.plugin = await loadCapacitorSqlite();
-    if (!this.plugin) {
-      throw new Error('@capacitor-community/sqlite is unavailable. Install the plugin or choose a different adapter.');
-    }
-
     const adapterOptions = options?.adapterOptions as { database?: unknown } | undefined;
     const requestedName = typeof adapterOptions?.database === 'string' ? adapterOptions.database : undefined;
-    const configuredName = this.options.database;
-    const resolvedDbName = segmentName(requestedName ?? configuredName ?? this.dbName, this.segment);
+    const name = connectionName(segmentName(requestedName ?? this.options.database ?? this.dbName, this.segment));
 
-    this.connection = await this.plugin.createConnection(resolvedDbName, false, 'no-encryption', 1, false);
-    await this.connection.open();
+    // Two adapters on one connection would run their transactions into each other.
+    if (openDatabases.has(name)) {
+      throw new Error(
+        `Capacitor SQLite: an adapter already has database "${name}" open. Close it before opening another adapter on the same database.`,
+      );
+    }
+    openDatabases.add(name);
 
-    if (this.options.enableWal ?? true) {
-      try {
-        await this.connection.execute('PRAGMA journal_mode = WAL;');
-      } catch (error) {
-        console.warn('[StorageAdapter] Failed to enable WAL on Capacitor SQLite.', error);
+    let sqlite: SQLiteConnection;
+    let connection: SQLiteDBConnection;
+    try {
+      const loaded = await loadSqliteConnection();
+      if (!loaded) {
+        throw new Error('@capacitor-community/sqlite is unavailable. Install the plugin or choose a different adapter.');
       }
+      sqlite = loaded;
+      connection = await createConnection(sqlite, name);
+      try {
+        await connection.open();
+        if (options?.foreignKeys !== undefined) {
+          // The plugin turns foreign keys on when it opens a database. The
+          // PRAGMA goes through query(), outside a transaction of the plugin's
+          // own, where SQLite ignores it. A failure here closes the connection
+          // and leaves the adapter closed, like a failed open().
+          await connection.query(`PRAGMA foreign_keys = ${options.foreignKeys ? 'ON' : 'OFF'};`);
+        }
+      } catch (error) {
+        // closeConnection closes the database too, when open() opened it.
+        await sqlite.closeConnection(name, false).catch(() => undefined);
+        throw error;
+      }
+    } catch (error) {
+      openDatabases.delete(name);
+      throw error;
     }
 
-    if (options?.foreignKeys !== undefined) {
-      // Outside the plugin's own transaction: SQLite ignores this PRAGMA inside one.
-      await this.connection.execute(`PRAGMA foreign_keys = ${options.foreignKeys ? 'ON' : 'OFF'};`, false);
+    this.sqlite = sqlite;
+    this.openName = name;
+    this.connection = connection;
+
+    if (this.options.enableWal ?? true) {
+      await this.enableWal(connection);
     }
   }
 
@@ -223,10 +346,27 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
     });
   }
 
+  /**
+   * Closes the database and the plugin's connection to it, so the database can
+   * be opened again, by this adapter or another one.
+   */
   public async close(): Promise<void> {
-    if (this.connection) {
-      await this.connection.close();
-      this.connection = null;
+    const connection = this.connection;
+    if (!connection) {
+      return;
+    }
+    const sqlite = this.sqlite;
+    const name = this.openName;
+    this.connection = null;
+    this.sqlite = null;
+    this.openName = null;
+    try {
+      await connection.close();
+    } finally {
+      if (sqlite && name !== null) {
+        openDatabases.delete(name);
+        await sqlite.closeConnection(name, false);
+      }
     }
   }
 
@@ -255,8 +395,28 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
   }
 
   /**
+   * Turns on WAL with PRAGMA journal_mode = WAL, through query(): the plugin
+   * runs execute() inside a transaction of its own by default, where SQLite
+   * refuses to change the journal mode, and on Android through execSQL, which
+   * fails on a statement that answers a row, as this PRAGMA does. query() runs
+   * it as it is and reads back the mode SQLite answers.
+   */
+  private async enableWal(connection: SQLiteDBConnection): Promise<void> {
+    try {
+      const answer = await connection.query<Record<string, unknown>>('PRAGMA journal_mode = WAL;');
+      const mode = String(Object.values(answer.values?.[0] ?? {})[0] ?? '').toLowerCase();
+      if (mode !== 'wal') {
+        console.warn(`[StorageAdapter] Capacitor SQLite kept journal mode "${mode}"; WAL is not on.`);
+      }
+    } catch (error) {
+      console.warn('[StorageAdapter] Failed to enable WAL on Capacitor SQLite.', error);
+    }
+  }
+
+  /**
    * @param ownTransaction - true for a statement from outside a transaction:
-   *   the plugin runs it in a transaction of its own, as it always has.
+   *   the plugin runs it in a transaction of its own, as it always has. A
+   *   PRAGMA goes through query() either way; see pragmaEdges().
    */
   private async runNow(
     statement: string,
@@ -266,6 +426,10 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
     ({ statement, parameters } = toSqliteStatement(statement, parameters));
     const conn = this.ensureConnection();
     const { positional } = normaliseParameters(parameters);
+    if (isPragma(statement)) {
+      await conn.query(statement, positional ?? []);
+      return { changes: 0, lastInsertRowid: null };
+    }
     return toRunResult(await conn.run(statement, positional ?? [], ownTransaction));
   }
 
@@ -279,7 +443,20 @@ export class CapacitorSqliteAdapter implements StorageAdapter {
 
   private async execNow(script: string, ownTransaction: boolean): Promise<void> {
     const conn = this.ensureConnection();
-    await conn.execute(script, ownTransaction);
+    const parts = pragmaEdges(script);
+    if (!parts) {
+      await conn.execute(script, ownTransaction);
+      return;
+    }
+    for (const pragma of parts.before) {
+      await conn.query(pragma);
+    }
+    if (parts.body !== null) {
+      await conn.execute(parts.body, ownTransaction);
+    }
+    for (const pragma of parts.after) {
+      await conn.query(pragma);
+    }
   }
 
   /** Keeps a statement sent from outside a transaction in `inFlight` until it answers. */
