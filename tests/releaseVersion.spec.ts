@@ -79,7 +79,7 @@ describe('the release decision', () => {
 
     const plan = await planFromRepository({ cwd: dir, fetch: registry({ '0.8.2': released }, '0.8.2') });
 
-    expect(plan).toMatchObject({ publish: true, version: '0.8.3', base: '0.8.2', baseCommit: released, release: '0.8.3' });
+    expect(plan).toMatchObject({ publish: true, version: '0.8.3', base: '0.8.2', baseCommit: released, release: '0.8.3', repair: null });
     expect(plan.releaseCommit).toBe(plan.head);
     const notes = releaseNotes({ cwd: dir, plan });
     expect(notes).toContain('fix: a save keeps its writes');
@@ -262,7 +262,22 @@ describe('the release decision', () => {
       fetch: registry({ '0.8.2': released, '0.8.3': published }, '0.8.3'),
     });
 
-    expect(plan).toMatchObject({ publish: false, release: '0.8.3', releaseCommit: published });
+    expect(plan).toMatchObject({ publish: false, release: null, repair: '0.8.3', repairCommit: published });
+  });
+
+  it('makes the missing release of an untagged published version beside the version it publishes', async () => {
+    // npm holds 0.8.3 from a run that failed before its release; the next push changes a shipped file.
+    const { dir, released } = releasedRepo();
+    const published = commit(dir, { 'src/index.ts': 'export const saves = 2;\n' }, 'fix: one');
+    commit(dir, { 'src/index.ts': 'export const saves = 3;\n' }, 'fix: two');
+
+    const plan = await planFromRepository({
+      cwd: dir,
+      fetch: registry({ '0.8.2': released, '0.8.3': published }, '0.8.3'),
+    });
+
+    expect(plan).toMatchObject({ publish: true, version: '0.8.4', release: '0.8.4', repair: '0.8.3', repairCommit: published });
+    expect(releaseNotes({ cwd: dir, plan, which: 'repair' })).toContain(published);
   });
 
   it('makes no release for a version whose tag exists', async () => {
@@ -270,7 +285,36 @@ describe('the release decision', () => {
 
     const plan = await planFromRepository({ cwd: dir, fetch: registry({ '0.8.2': released }, '0.8.2') });
 
-    expect(plan).toMatchObject({ publish: false, release: null });
+    expect(plan).toMatchObject({ publish: false, release: null, repair: null });
+  });
+
+  it('publishes nothing from a commit master has moved past, whatever npm and the tags name', async () => {
+    // npm holds 0.8.4 from the newer commit with no tag, its latest still names
+    // 0.8.2 and 0.8.3 is free: only master's tip tells this run it is older.
+    const { dir, released } = releasedRepo();
+    const older = commit(dir, { 'src/index.ts': 'export const saves = 2;\n' }, 'fix: one');
+    const newer = commit(dir, { 'src/index.ts': 'export const saves = 3;\n' }, 'fix: two');
+    git(dir, ['checkout', '-q', older]);
+
+    const plan = await planFromRepository({
+      cwd: dir,
+      fetch: registry({ '0.8.2': released, '0.8.4': newer }, '0.8.2'),
+      tip: newer,
+    });
+
+    expect(plan.publish).toBe(false);
+    expect(plan.reason).toContain('master has moved past this commit');
+  });
+
+  it("fails when master's tip does not hold this commit", async () => {
+    const { dir, released } = releasedRepo();
+    const side = commit(dir, { 'src/index.ts': 'export const saves = 9;\n' }, 'fix: on a branch');
+    git(dir, ['reset', '-q', '--hard', released]);
+    commit(dir, { 'src/index.ts': 'export const saves = 2;\n' }, 'fix: on master');
+
+    await expect(
+      planFromRepository({ cwd: dir, fetch: registry({ '0.8.2': released }, '0.8.2'), tip: side }),
+    ).rejects.toThrow("master's tip");
   });
 
   it("finds the published commit from npm's gitHead when no tag names it", async () => {
