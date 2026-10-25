@@ -47,10 +47,11 @@ jobs:
 
       # A push that changed a file the package ships publishes the newest
       # published version with its patch raised by one, or package.json's
-      # version when that is higher (RELEASING.md).
+      # version when that is higher; only the run of master's head publishes
+      # (RELEASING.md).
       - name: Decide the version to publish
         id: plan
-        run: node scripts/release-version.mjs --notes "$RUNNER_TEMP/release-notes.md"
+        run: node scripts/release-version.mjs --notes "$RUNNER_TEMP"
 
       - name: Install dependencies
         if: steps.plan.outputs.publish == 'true'
@@ -82,16 +83,27 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      # The version this run published, or the newest published version when
-      # no tag names it (a run that published and failed before this step).
       - name: Create GitHub release
         if: steps.plan.outputs.release != ''
         uses: ncipollo/release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           tag: v${{ steps.plan.outputs.release }}
-          # A new tag names the commit the version was published from, not master's head when the release is made.
+          # A new tag names the commit this run published, not master's head when the release is made.
           commit: ${{ steps.plan.outputs.release_commit }}
           name: sql-storage-adapter v${{ steps.plan.outputs.release }}
-          bodyFile: ${{ runner.temp }}/release-notes.md
+          bodyFile: ${{ runner.temp }}/release.md
+          allowUpdates: true
+
+      # The newest published version when no tag names it: a run that published
+      # it and failed before its release.
+      - name: Make the missing release of the newest published version
+        if: steps.plan.outputs.repair != ''
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: v${{ steps.plan.outputs.repair }}
+          commit: ${{ steps.plan.outputs.repair_commit }}
+          name: sql-storage-adapter v${{ steps.plan.outputs.repair }}
+          bodyFile: ${{ runner.temp }}/repair.md
           allowUpdates: true

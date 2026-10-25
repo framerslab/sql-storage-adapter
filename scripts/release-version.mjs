@@ -16,16 +16,20 @@
 // commit whose history does not hold that one fails the run.
 //
 // When no tag names the newest published version, the run makes its GitHub
-// release and tag at the commit it was published from: the repair of a run
-// that published and failed before its release.
+// release and tag at the commit it was published from, beside any version it
+// publishes: the repair of a run that published and failed before its release.
 //
 // The workflow writes the version into its own checkout's package.json alone:
 // master's package.json keeps the version a maintainer last named.
 //
-// Usage: node scripts/release-version.mjs [--notes <file>]
-// Writes publish, version, base, base_commit, release and release_commit to
-// $GITHUB_OUTPUT and the decision to the job summary, and with --notes the
-// release notes to <file>.
+// Only the run of master's head publishes: a run of an older commit, such as
+// a re-run, publishes nothing, since master's head holds its changes and that
+// commit's own run publishes them.
+//
+// Usage: node scripts/release-version.mjs [--notes <folder>]
+// Writes publish, version, base, base_commit, release, release_commit, repair
+// and repair_commit to $GITHUB_OUTPUT and the decision to the job summary, and
+// with --notes the release notes to <folder>/release.md and <folder>/repair.md.
 
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -69,16 +73,26 @@ export function raisePatch(version) {
 
 /**
  * The decision, from what the repository and the registry answer. Resolves to
- * { publish, version, base, baseCommit, release, releaseCommit, reason }: base
- * is the newest published version and baseCommit the commit it was published
- * from; release is the version whose GitHub release and tag the run makes at
- * releaseCommit (the one it publishes, or the newest published version when
- * no tag names it, the repair of a run that published and failed before its
- * release), or null.
+ * { publish, version, base, baseCommit, release, releaseCommit, repair,
+ * repairCommit, reason }: base is the newest published version and baseCommit
+ * the commit it was published from; release is the version this run publishes,
+ * whose GitHub release and tag it makes at releaseCommit; repair is the newest
+ * published version when no tag names it (a run that published and failed
+ * before its release), whose release and tag it makes at repairCommit.
  *
- * commitOf(version) resolves to { commit, tagged } or null.
+ * tip is master's head when the run decides: a run of an older commit
+ * publishes nothing, since the tip's own run carries its changes. commitOf
+ * (version) resolves to { commit, tagged } or null.
  */
-export async function planRelease({ packageVersion, latest, tagVersions, head, commitOf, isAncestor, shippedChanged, isPublished }) {
+export async function planRelease({ packageVersion, latest, tagVersions, head, tip, commitOf, isAncestor, shippedChanged, isPublished }) {
+  const skipped = { publish: false, version: null, base: null, baseCommit: null, release: null, releaseCommit: null, repair: null, repairCommit: null };
+  if (tip && tip !== head) {
+    if (await isAncestor(head, tip)) {
+      return { ...skipped, reason: `master has moved past this commit to ${tip.slice(0, 8)}, whose own run publishes this one's changes` };
+    }
+    throw new Error(`master's tip ${tip.slice(0, 8)} does not hold this commit ${head.slice(0, 8)}: only master publishes`);
+  }
+
   const named = VERSION.test(packageVersion ?? '') ? packageVersion : null;
   const newest = [latest, ...tagVersions]
     .filter((version) => typeof version === 'string' && VERSION.test(version))
@@ -88,9 +102,9 @@ export async function planRelease({ packageVersion, latest, tagVersions, head, c
   // neither its latest nor a tag named is a newer published version: the
   // decision is made again from it, so a run never publishes past a version
   // whose commit it has not compared with its own.
-  const publishOrCount = async (version, reason, base, baseCommit, steps) => {
+  const publishOrCount = async (version, reason, base, baseCommit, steps, repairs) => {
     if (!(await isPublished(version))) {
-      return { publish: true, version, base, baseCommit, release: version, releaseCommit: head, reason };
+      return { publish: true, version, base, baseCommit, release: version, releaseCommit: head, ...repairs, reason };
     }
     return decideFrom(version, steps + 1);
   };
@@ -104,18 +118,11 @@ export async function planRelease({ packageVersion, latest, tagVersions, head, c
       );
     }
     const baseCommit = found.commit;
-    const nothing = (reason) => ({
-      publish: false,
-      version: null,
-      base,
-      baseCommit,
-      release: found.tagged ? null : base,
-      releaseCommit: found.tagged ? null : baseCommit,
-      reason,
-    });
+    const repairs = found.tagged ? { repair: null, repairCommit: null } : { repair: base, repairCommit: baseCommit };
+    const nothing = (reason) => ({ ...skipped, base, baseCommit, ...repairs, reason });
 
     if (named !== null && compareVersions(named, base) > 0) {
-      return publishOrCount(named, `package.json names ${named}, above v${base}`, base, baseCommit, steps);
+      return publishOrCount(named, `package.json names ${named}, above v${base}`, base, baseCommit, steps, repairs);
     }
     if (baseCommit === head) return nothing(`v${base} was published from this commit`);
     if (!(await isAncestor(baseCommit, head))) {
@@ -128,14 +135,15 @@ export async function planRelease({ packageVersion, latest, tagVersions, head, c
       );
     }
     if (!(await shippedChanged(baseCommit, head))) return nothing(`no file the package ships changed since v${base}`);
-    return publishOrCount(raisePatch(base), `files the package ships changed since v${base}`, base, baseCommit, steps);
+    return publishOrCount(raisePatch(base), `files the package ships changed since v${base}`, base, baseCommit, steps, repairs);
   };
 
   if (newest === null) {
     if (named === null) {
       throw new Error(`package.json's version ${packageVersion} is not x.y.z, and npm holds no version to count from`);
     }
-    return publishOrCount(named, `npm holds no version yet, so package.json's ${named} is the first`, null, null, 0);
+    const first = `npm holds no version yet, so package.json's ${named} is the first`;
+    return publishOrCount(named, first, null, null, 0, { repair: null, repairCommit: null });
   }
   return decideFrom(newest, 0);
 }
@@ -160,8 +168,11 @@ function gitAnswers(cwd, args) {
   throw new Error(`git ${args.join(' ')} failed: ${result.stderr.trim()}`);
 }
 
-/** The decision for the repository at `cwd`, asking `registry` through `fetch`. */
-export async function planFromRepository({ cwd, fetch, registry = REGISTRY }) {
+/**
+ * The decision for the repository at `cwd`, asking `registry` through `fetch`;
+ * `tip` is master's head (left out, no run counts as older than master).
+ */
+export async function planFromRepository({ cwd, fetch, registry = REGISTRY, tip = null }) {
   const pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8'));
   const escaped = pkg.name.replace('/', '%2f');
 
@@ -190,6 +201,7 @@ export async function planFromRepository({ cwd, fetch, registry = REGISTRY }) {
     latest: distTags === null ? null : (JSON.parse(distTags).latest ?? null),
     tagVersions,
     head,
+    tip,
     commitOf: async (version) => {
       const tag = git(cwd, ['rev-parse', '-q', '--verify', `refs/tags/v${version}^{commit}`]);
       if (tag.status === 0) return { commit: tag.stdout.trim(), tagged: true };
@@ -221,13 +233,17 @@ function changelogSection(cwd, version) {
 }
 
 /**
- * The GitHub release's notes: the version's section of CHANGELOG.md, or else
- * the commits since the base version that changed what the package ships.
+ * A GitHub release's notes. For the version the run publishes (`which` is
+ * 'release'): its section of CHANGELOG.md, or else the commits since the base
+ * version that changed what the package ships. For the repaired version
+ * ('repair'): its section, or a line naming the commit it was published from.
  */
-export function releaseNotes({ cwd, plan, repository = null }) {
+export function releaseNotes({ cwd, plan, which = 'release', repository = null }) {
+  if (which === 'repair') {
+    return `${changelogSection(cwd, plan.repair) ?? `v${plan.repair} as npm holds it, published from ${plan.repairCommit}.`}\n`;
+  }
   const section = changelogSection(cwd, plan.release);
   if (section) return `${section}\n`;
-  if (!plan.publish) return `v${plan.release} as npm holds it, published from ${plan.releaseCommit}.\n`;
   if (plan.baseCommit === null) return `The first release of ${plan.name}.\n`;
   const commits = gitOutput(cwd, ['log', '--no-merges', '--format=- %s (%h)', `${plan.baseCommit}..${plan.head}`, '--', ...SHIPPED_PATHS]);
   const compare = repository ? `\n\nEvery change: ${repository}/compare/v${plan.base}...v${plan.version}` : '';
@@ -237,13 +253,17 @@ export function releaseNotes({ cwd, plan, repository = null }) {
 async function main() {
   const argv = process.argv.slice(2);
   const notesAt = argv.indexOf('--notes');
-  const notesFile = notesAt === -1 ? null : argv[notesAt + 1];
-  if (notesAt !== -1 && !notesFile) throw new Error('--notes needs a file');
+  const notesDir = notesAt === -1 ? null : argv[notesAt + 1];
+  if (notesAt !== -1 && !notesDir) throw new Error('--notes needs a folder');
 
   const cwd = process.cwd();
-  const plan = await planFromRepository({ cwd, fetch: globalThis.fetch });
-  const repair = !plan.publish && plan.release ? ` No tag names v${plan.release}: making its GitHub release.` : '';
-  const line = plan.publish ? `Publishing ${plan.version}: ${plan.reason}.` : `Publishing nothing: ${plan.reason}.${repair}`;
+  // master's head now, read from the remote: the repository is public, so this
+  // needs no credential.
+  const tip = gitOutput(cwd, ['ls-remote', 'origin', 'refs/heads/master']).split(/\s+/)[0];
+  if (!/^[0-9a-f]{40}$/.test(tip ?? '')) throw new Error(`git ls-remote named no master head (${tip || 'empty'})`);
+  const plan = await planFromRepository({ cwd, fetch: globalThis.fetch, tip });
+  const repair = plan.repair ? ` No tag names v${plan.repair}: making its GitHub release.` : '';
+  const line = plan.publish ? `Publishing ${plan.version}: ${plan.reason}.${repair}` : `Publishing nothing: ${plan.reason}.${repair}`;
   console.log(line);
 
   const outputs = {
@@ -253,14 +273,18 @@ async function main() {
     base_commit: plan.baseCommit ?? '',
     release: plan.release ?? '',
     release_commit: plan.releaseCommit ?? '',
+    repair: plan.repair ?? '',
+    repair_commit: plan.repairCommit ?? '',
   };
   if (process.env.GITHUB_OUTPUT) {
     fs.appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(outputs).map(([key, value]) => `${key}=${value}\n`).join(''));
   }
   if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${line}\n`);
-  if (plan.release && notesFile) {
+  if (notesDir) {
     const { GITHUB_SERVER_URL: server, GITHUB_REPOSITORY: repo } = process.env;
-    fs.writeFileSync(notesFile, releaseNotes({ cwd, plan, repository: server && repo ? `${server}/${repo}` : null }));
+    const repository = server && repo ? `${server}/${repo}` : null;
+    if (plan.release) fs.writeFileSync(path.join(notesDir, 'release.md'), releaseNotes({ cwd, plan, repository }));
+    if (plan.repair) fs.writeFileSync(path.join(notesDir, 'repair.md'), releaseNotes({ cwd, plan, which: 'repair' }));
   }
 }
 
