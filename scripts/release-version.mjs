@@ -7,9 +7,9 @@
 // published version, or when package.json names a version above every
 // published one. The version is package.json's in the second case and the
 // newest published version with its patch raised by one in the first. The
-// newest published version is the higher of npm's latest and the newest
-// v<x.y.z> tag: a release run's tag is read at once, while npm's dist-tags can
-// name the older latest for minutes after a publish. A version npm holds that
+// newest published version is the highest of the versions npm holds and the
+// v<x.y.z> tags: a release run's tag is read at once, while npm's documents
+// can name the older state for minutes after a publish. A version npm holds that
 // neither names is found when the run would publish it, and the decision is
 // made again from that version. A run of a commit older than the one the
 // newest version was published from, such as a re-run, publishes nothing; a
@@ -84,7 +84,7 @@ export function raisePatch(version) {
  * publishes nothing, since the tip's own run carries its changes. commitOf
  * (version) resolves to { commit, tagged } or null.
  */
-export async function planRelease({ packageVersion, latest, tagVersions, head, tip, commitOf, isAncestor, shippedChanged, isPublished }) {
+export async function planRelease({ packageVersion, latest, published = [], tagVersions, head, tip, commitOf, isAncestor, shippedChanged, isPublished }) {
   const skipped = { publish: false, version: null, base: null, baseCommit: null, release: null, releaseCommit: null, repair: null, repairCommit: null };
   if (tip && tip !== head) {
     if (await isAncestor(head, tip)) {
@@ -94,7 +94,7 @@ export async function planRelease({ packageVersion, latest, tagVersions, head, t
   }
 
   const named = VERSION.test(packageVersion ?? '') ? packageVersion : null;
-  const newest = [latest, ...tagVersions]
+  const newest = [latest, ...published, ...tagVersions]
     .filter((version) => typeof version === 'string' && VERSION.test(version))
     .reduce((top, version) => (top === null || compareVersions(version, top) > 0 ? version : top), null);
 
@@ -178,15 +178,18 @@ export async function planFromRepository({ cwd, fetch, registry = REGISTRY, tip 
 
   // A document's text, or null for npm's 404. Any other answer fails the run,
   // so a registry outage never reads as "not published".
-  const read = async (url) => {
-    const response = await fetch(url);
+  const read = async (url, headers = {}) => {
+    const response = await fetch(url, { headers });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`${url} answered ${response.status}`);
     return response.text();
   };
   const versionDocument = (version) => read(`${registry}/${escaped}/${version}`);
 
-  const distTags = await read(`${registry}/-/package/${escaped}/dist-tags`);
+  // The abbreviated document lists every version npm holds and its dist-tags,
+  // without the README a full document carries.
+  const document = await read(`${registry}/${escaped}`, { accept: 'application/vnd.npm.install-v1+json' });
+  const packument = document === null ? null : JSON.parse(document);
   const head = gitOutput(cwd, ['rev-parse', 'HEAD']);
   // Every tag, not only those this commit contains: a newer commit's tag is
   // what tells a re-run of an older commit that it is older.
@@ -198,7 +201,8 @@ export async function planFromRepository({ cwd, fetch, registry = REGISTRY, tip 
 
   const plan = await planRelease({
     packageVersion: pkg.version,
-    latest: distTags === null ? null : (JSON.parse(distTags).latest ?? null),
+    latest: packument?.['dist-tags']?.latest ?? null,
+    published: Object.keys(packument?.versions ?? {}),
     tagVersions,
     head,
     tip,
