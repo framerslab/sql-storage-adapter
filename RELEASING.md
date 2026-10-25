@@ -4,26 +4,34 @@
 
 ## What starts a release
 
-A push to `master` that changes `package.json`, a file under `src/` or the workflow. A maintainer can also start the workflow by hand.
+Every push to `master`. A maintainer can also start the workflow by hand on `master`; started on another branch, it publishes nothing.
 
 ## What the workflow does
 
 Its runs go one at a time, in the order they began to wait: a run that starts while another runs waits for it, and up to 100 wait, so a newer run never replaces one still waiting.
 
-1. Installs the dependencies, runs the tests and builds the package.
-2. Reads the version in `package.json` and asks npm whether it holds that exact version.
-3. When npm does not, publishes the package to npm.
-4. Creates the GitHub release `v<version>`, with the notes of that version's `## [<version>]` section in `CHANGELOG.md`, unless a release with that tag exists. The release creates the tag.
+1. Decides what to publish, with [`scripts/release-version.mjs`](https://github.com/framerslab/sql-storage-adapter/blob/master/scripts/release-version.mjs), before it installs anything. Only the run of master's head decides: a run of an older commit (a re-run, or a push master moved past while the run waited) publishes nothing, since master's head holds its changes and that commit's own run publishes them. The newest published version is the highest of the versions npm holds and the `v<x.y.z>` tags (a run's tag is read at once, while npm's documents can name the older state for minutes after a publish), and the commit it was published from is its tag's, or npm's `gitHead` for it.
+   - When `package.json` names a version above the newest published one, that version is published.
+   - Otherwise, when a file the package ships changed since that commit, the newest published version with its patch raised by one is published. The files it ships and builds from are `src/`, `package.json`, `README.md`, `LICENSE`, `tsconfig.json`, `tsconfig.build.json`, `scripts/fix-esm-imports.mjs` and `scripts/build-cjs.mjs`.
+   - Otherwise nothing is published: a push that changed only the tests, the docs outside the package, `CHANGELOG.md` or CI publishes nothing.
+   - When npm already holds the version the run would publish, that version is the newest published one and the decision is made again from its commit, so a run never publishes past a version it has not compared with its own commit.
+   - A commit whose history does not hold the commit the newest version was published from fails the run, which says to raise `package.json`'s version above that version, or to delete a tag npm holds no version for.
+   - When no tag names the newest published version (a run published it and failed before its release), the run makes that version's GitHub release and tag at the commit it was published from, beside any version it publishes.
+2. Installs the dependencies, runs the tests and builds the package.
+3. Writes the version into its checkout's `package.json` and publishes the package to npm with a provenance statement. Nothing is committed to `master`: its `package.json` keeps the version a maintainer last named, while npm and the `v<version>` tags hold the published ones.
+4. Creates the GitHub release `v<version>` on the published commit, with the notes of that version's `## [<version>]` section in `CHANGELOG.md`, or, when it has none, the commits since the previous version that changed what the package ships. The release creates the tag.
 
-A push whose version npm already has publishes nothing.
+Each run's job summary says what it published, or why it published nothing.
 
 ## Releasing a version
 
-1. Raise `version` in `package.json` (semantic versioning: a breaking change raises the major version, a new feature the minor version, a fix the patch version).
-2. Add the version's section to `CHANGELOG.md`, headed `## [x.y.z]`.
-3. Merge both to `master` through a pull request with green CI.
+A merged change to what the package ships needs no step: its push publishes the next patch.
 
-Do not push a version tag by hand.
+For a new minor or major version, raise `version` in `package.json` in the pull request (semantic versioning: a breaking change raises the major version, a new feature the minor version) and add the version's section to `CHANGELOG.md`, headed `## [x.y.z]`. Its merge publishes that version.
+
+A pull request's notes for `CHANGELOG.md` go under `## [Unreleased]`, which a maintainer heads with the version that published them.
+
+Do not push a version tag by hand: the decision counts from the newest tag, so a tag above npm's versions moves every later version past it.
 
 ## How the publish authenticates
 
