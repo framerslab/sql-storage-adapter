@@ -48,14 +48,27 @@ function commit(dir: string, files: Record<string, string>, message: string): st
 
 const manifest = (version: string) => `${JSON.stringify({ name: '@framers/sql-storage-adapter', version }, null, 2)}\n`;
 
-/** npm holding `published` (each version and the commit it was published from), `latest` its latest dist-tag. */
+/**
+ * npm holding `published` (each version and the commit it was published from),
+ * `latest` its latest dist-tag: the package's abbreviated document (its
+ * dist-tags and the versions it holds), and a version's document or a 404.
+ */
 function registry(published: Record<string, string>, latest: string | null) {
   return async (url: string | URL): Promise<Response> => {
     const href = String(url);
     if (href.endsWith('/dist-tags')) {
       return latest === null ? new Response('{"error":"Not found"}', { status: 404 }) : Response.json({ latest });
     }
-    const version = decodeURIComponent(href.slice(href.lastIndexOf('/') + 1));
+    const last = decodeURIComponent(href.slice(href.lastIndexOf('/') + 1));
+    if (last === '@framers/sql-storage-adapter') {
+      if (latest === null && Object.keys(published).length === 0) return new Response('{"error":"Not found"}', { status: 404 });
+      return Response.json({
+        name: '@framers/sql-storage-adapter',
+        'dist-tags': latest === null ? {} : { latest },
+        versions: Object.fromEntries(Object.keys(published).map((version) => [version, { version }])),
+      });
+    }
+    const version = last;
     const gitHead = published[version];
     return gitHead
       ? Response.json({ name: '@framers/sql-storage-adapter', version, gitHead })
@@ -198,6 +211,19 @@ describe('the release decision', () => {
     const plan = await planFromRepository({ cwd: dir, fetch: registry({ '0.8.2': released }, '0.8.2') });
 
     expect(plan).toMatchObject({ publish: true, version: '0.8.4', base: '0.8.3', baseCommit: second });
+  });
+
+  it('counts from the newest version npm holds, though neither its latest nor a tag names it', async () => {
+    // 0.8.4 was published by hand from an earlier commit, skipping 0.8.3, and
+    // npm's latest still names 0.8.2: publishing 0.8.3 would rank the newer
+    // code below 0.8.4 for every range that takes both.
+    const { dir, released } = releasedRepo();
+    const byHand = commit(dir, { 'src/index.ts': 'export const saves = 2;\n' }, 'fix: one');
+    commit(dir, { 'src/index.ts': 'export const saves = 3;\n' }, 'fix: two');
+
+    const plan = await planFromRepository({ cwd: dir, fetch: registry({ '0.8.2': released, '0.8.4': byHand }, '0.8.2') });
+
+    expect(plan).toMatchObject({ publish: true, version: '0.8.5', base: '0.8.4', baseCommit: byHand, repair: '0.8.4' });
   });
 
   it('passes over a version npm holds that no tag names', async () => {
