@@ -78,14 +78,16 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      # The version this run published, or the newest published version when
+      # no tag names it (a run that published and failed before this step).
       - name: Create GitHub release
-        if: steps.plan.outputs.publish == 'true'
+        if: steps.plan.outputs.release != ''
         uses: ncipollo/release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag: v${{ steps.plan.outputs.version }}
-          # A new tag names the commit this run published, not master's head when the release is made.
-          commit: ${{ github.sha }}
-          name: sql-storage-adapter v${{ steps.plan.outputs.version }}
+          tag: v${{ steps.plan.outputs.release }}
+          # A new tag names the commit the version was published from, not master's head when the release is made.
+          commit: ${{ steps.plan.outputs.release_commit }}
+          name: sql-storage-adapter v${{ steps.plan.outputs.release }}
           bodyFile: ${{ runner.temp }}/release-notes.md
           allowUpdates: true

@@ -6,20 +6,26 @@
 // A push publishes when a file the package ships changed since the newest
 // published version, or when package.json names a version above every
 // published one. The version is package.json's in the second case and the
-// newest published version with its patch raised by one in the first, and a
-// version npm already holds is passed over. The newest published version is
-// the higher of npm's latest and the newest v<x.y.z> tag this commit contains:
-// a release run's tag is read at once, while npm's dist-tags can name the
-// older latest for minutes after a publish. A run of a commit older than the
-// one that version was published from, such as a re-run, publishes nothing;
-// a commit whose history does not hold that one fails the run.
+// newest published version with its patch raised by one in the first. The
+// newest published version is the higher of npm's latest and the newest
+// v<x.y.z> tag: a release run's tag is read at once, while npm's dist-tags can
+// name the older latest for minutes after a publish. A version npm holds that
+// neither names is found when the run would publish it, and the decision is
+// made again from that version. A run of a commit older than the one the
+// newest version was published from, such as a re-run, publishes nothing; a
+// commit whose history does not hold that one fails the run.
+//
+// When no tag names the newest published version, the run makes its GitHub
+// release and tag at the commit it was published from: the repair of a run
+// that published and failed before its release.
 //
 // The workflow writes the version into its own checkout's package.json alone:
 // master's package.json keeps the version a maintainer last named.
 //
 // Usage: node scripts/release-version.mjs [--notes <file>]
-// Writes publish, version, base and base_commit to $GITHUB_OUTPUT and the
-// decision to the job summary, and with --notes the release notes to <file>.
+// Writes publish, version, base, base_commit, release and release_commit to
+// $GITHUB_OUTPUT and the decision to the job summary, and with --notes the
+// release notes to <file>.
 
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -61,63 +67,77 @@ export function raisePatch(version) {
   return `${major}.${minor}.${patch + 1}`;
 }
 
-/** `version`, or the first patch after it that npm does not hold. */
-async function firstUnpublished(version, isPublished) {
-  let candidate = version;
-  for (let tries = 0; tries < 50; tries += 1) {
-    if (!(await isPublished(candidate))) return candidate;
-    candidate = raisePatch(candidate);
-  }
-  throw new Error(`npm holds ${version} and the 49 patches after it`);
-}
-
 /**
  * The decision, from what the repository and the registry answer. Resolves to
- * { publish, version, base, baseCommit, reason }: base is the newest published
- * version and baseCommit the commit it was published from.
+ * { publish, version, base, baseCommit, release, releaseCommit, reason }: base
+ * is the newest published version and baseCommit the commit it was published
+ * from; release is the version whose GitHub release and tag the run makes at
+ * releaseCommit (the one it publishes, or the newest published version when
+ * no tag names it, the repair of a run that published and failed before its
+ * release), or null.
+ *
+ * commitOf(version) resolves to { commit, tagged } or null.
  */
 export async function planRelease({ packageVersion, latest, tagVersions, head, commitOf, isAncestor, shippedChanged, isPublished }) {
   const named = VERSION.test(packageVersion ?? '') ? packageVersion : null;
-  const base = [latest, ...tagVersions]
+  const newest = [latest, ...tagVersions]
     .filter((version) => typeof version === 'string' && VERSION.test(version))
-    .reduce((newest, version) => (newest === null || compareVersions(version, newest) > 0 ? version : newest), null);
+    .reduce((top, version) => (top === null || compareVersions(version, top) > 0 ? version : top), null);
 
-  const publishing = async (wanted, baseCommit, reason) => {
-    const version = await firstUnpublished(wanted, isPublished);
-    const passed = version === wanted ? '' : `; npm holds ${wanted}, so ${version}`;
-    return { publish: true, version, base, baseCommit, reason: `${reason}${passed}` };
+  // Publishes `version` unless npm holds it already. A version npm holds that
+  // neither its latest nor a tag named is a newer published version: the
+  // decision is made again from it, so a run never publishes past a version
+  // whose commit it has not compared with its own.
+  const publishOrCount = async (version, reason, base, baseCommit, steps) => {
+    if (!(await isPublished(version))) {
+      return { publish: true, version, base, baseCommit, release: version, releaseCommit: head, reason };
+    }
+    return decideFrom(version, steps + 1);
   };
 
-  if (base === null) {
+  const decideFrom = async (base, steps) => {
+    if (steps > 50) throw new Error(`npm holds 50 versions after the newest one a tag or npm's latest names`);
+    const found = await commitOf(base);
+    if (found === null) {
+      throw new Error(
+        `npm holds ${base}, but neither a v${base} tag nor npm's gitHead for it names a commit of this repository`,
+      );
+    }
+    const baseCommit = found.commit;
+    const nothing = (reason) => ({
+      publish: false,
+      version: null,
+      base,
+      baseCommit,
+      release: found.tagged ? null : base,
+      releaseCommit: found.tagged ? null : baseCommit,
+      reason,
+    });
+
+    if (named !== null && compareVersions(named, base) > 0) {
+      return publishOrCount(named, `package.json names ${named}, above v${base}`, base, baseCommit, steps);
+    }
+    if (baseCommit === head) return nothing(`v${base} was published from this commit`);
+    if (!(await isAncestor(baseCommit, head))) {
+      if (await isAncestor(head, baseCommit)) {
+        return nothing(`this commit is older than ${baseCommit.slice(0, 8)}, which v${base} was published from`);
+      }
+      // Skipping here would leave every later push unpublished behind a green run.
+      throw new Error(
+        `v${base} names ${baseCommit.slice(0, 8)} (its tag, or npm's gitHead for it), which this commit's history does not hold; raise package.json's version above ${base} to publish from this history, or delete the tag if npm holds no such version`,
+      );
+    }
+    if (!(await shippedChanged(baseCommit, head))) return nothing(`no file the package ships changed since v${base}`);
+    return publishOrCount(raisePatch(base), `files the package ships changed since v${base}`, base, baseCommit, steps);
+  };
+
+  if (newest === null) {
     if (named === null) {
       throw new Error(`package.json's version ${packageVersion} is not x.y.z, and npm holds no version to count from`);
     }
-    return publishing(named, null, `npm holds no version yet, so package.json's ${named} is the first`);
+    return publishOrCount(named, `npm holds no version yet, so package.json's ${named} is the first`, null, null, 0);
   }
-
-  const baseCommit = await commitOf(base);
-  if (baseCommit === null) {
-    throw new Error(
-      `v${base} is the newest published version, but neither a v${base} tag nor npm's gitHead for it names a commit of this repository`,
-    );
-  }
-  const nothing = (reason) => ({ publish: false, version: null, base, baseCommit, reason });
-
-  if (named !== null && compareVersions(named, base) > 0) {
-    return publishing(named, baseCommit, `package.json names ${named}, above v${base}`);
-  }
-  if (baseCommit === head) return nothing(`v${base} was published from this commit`);
-  if (!(await isAncestor(baseCommit, head))) {
-    if (await isAncestor(head, baseCommit)) {
-      return nothing(`this commit is older than ${baseCommit.slice(0, 8)}, which v${base} was published from`);
-    }
-    // Skipping here would leave every later push unpublished with a green run.
-    throw new Error(
-      `v${base} was published from ${baseCommit.slice(0, 8)}, which this commit's history does not hold; raise package.json's version above ${base} to publish from this history`,
-    );
-  }
-  if (!(await shippedChanged(baseCommit, head))) return nothing(`no file the package ships changed since v${base}`);
-  return publishing(raisePatch(base), baseCommit, `files the package ships changed since v${base}`);
+  return decideFrom(newest, 0);
 }
 
 function git(cwd, args) {
@@ -157,7 +177,9 @@ export async function planFromRepository({ cwd, fetch, registry = REGISTRY }) {
 
   const distTags = await read(`${registry}/-/package/${escaped}/dist-tags`);
   const head = gitOutput(cwd, ['rev-parse', 'HEAD']);
-  const tagVersions = gitOutput(cwd, ['tag', '--list', 'v*', '--merged', 'HEAD'])
+  // Every tag, not only those this commit contains: a newer commit's tag is
+  // what tells a re-run of an older commit that it is older.
+  const tagVersions = gitOutput(cwd, ['tag', '--list', 'v*'])
     .split('\n')
     .map((tag) => tag.trim())
     .filter((tag) => /^v\d+\.\d+\.\d+$/.test(tag))
@@ -169,11 +191,11 @@ export async function planFromRepository({ cwd, fetch, registry = REGISTRY }) {
     tagVersions,
     head,
     commitOf: async (version) => {
-      const tagged = git(cwd, ['rev-parse', '-q', '--verify', `refs/tags/v${version}^{commit}`]);
-      if (tagged.status === 0) return tagged.stdout.trim();
+      const tag = git(cwd, ['rev-parse', '-q', '--verify', `refs/tags/v${version}^{commit}`]);
+      if (tag.status === 0) return { commit: tag.stdout.trim(), tagged: true };
       // A version's document can carry a README that JSON.parse refuses, so gitHead is read on its own.
       const gitHead = (await versionDocument(version))?.match(/"gitHead"\s*:\s*"([0-9a-f]{40})"/)?.[1];
-      if (gitHead && git(cwd, ['cat-file', '-e', `${gitHead}^{commit}`]).status === 0) return gitHead;
+      if (gitHead && git(cwd, ['cat-file', '-e', `${gitHead}^{commit}`]).status === 0) return { commit: gitHead, tagged: false };
       return null;
     },
     isAncestor: async (ancestor, commit) => gitAnswers(cwd, ['merge-base', '--is-ancestor', ancestor, commit]),
@@ -203,8 +225,9 @@ function changelogSection(cwd, version) {
  * the commits since the base version that changed what the package ships.
  */
 export function releaseNotes({ cwd, plan, repository = null }) {
-  const section = changelogSection(cwd, plan.version);
+  const section = changelogSection(cwd, plan.release);
   if (section) return `${section}\n`;
+  if (!plan.publish) return `v${plan.release} as npm holds it, published from ${plan.releaseCommit}.\n`;
   if (plan.baseCommit === null) return `The first release of ${plan.name}.\n`;
   const commits = gitOutput(cwd, ['log', '--no-merges', '--format=- %s (%h)', `${plan.baseCommit}..${plan.head}`, '--', ...SHIPPED_PATHS]);
   const compare = repository ? `\n\nEvery change: ${repository}/compare/v${plan.base}...v${plan.version}` : '';
@@ -219,15 +242,23 @@ async function main() {
 
   const cwd = process.cwd();
   const plan = await planFromRepository({ cwd, fetch: globalThis.fetch });
-  const line = plan.publish ? `Publishing ${plan.version}: ${plan.reason}.` : `Publishing nothing: ${plan.reason}.`;
+  const repair = !plan.publish && plan.release ? ` No tag names v${plan.release}: making its GitHub release.` : '';
+  const line = plan.publish ? `Publishing ${plan.version}: ${plan.reason}.` : `Publishing nothing: ${plan.reason}.${repair}`;
   console.log(line);
 
-  const outputs = { publish: String(plan.publish), version: plan.version ?? '', base: plan.base ?? '', base_commit: plan.baseCommit ?? '' };
+  const outputs = {
+    publish: String(plan.publish),
+    version: plan.version ?? '',
+    base: plan.base ?? '',
+    base_commit: plan.baseCommit ?? '',
+    release: plan.release ?? '',
+    release_commit: plan.releaseCommit ?? '',
+  };
   if (process.env.GITHUB_OUTPUT) {
     fs.appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(outputs).map(([key, value]) => `${key}=${value}\n`).join(''));
   }
   if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${line}\n`);
-  if (plan.publish && notesFile) {
+  if (plan.release && notesFile) {
     const { GITHUB_SERVER_URL: server, GITHUB_REPOSITORY: repo } = process.env;
     fs.writeFileSync(notesFile, releaseNotes({ cwd, plan, repository: server && repo ? `${server}/${repo}` : null }));
   }
