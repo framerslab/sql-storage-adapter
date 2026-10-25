@@ -79,7 +79,8 @@ describe('the release decision', () => {
 
     const plan = await planFromRepository({ cwd: dir, fetch: registry({ '0.8.2': released }, '0.8.2') });
 
-    expect(plan).toMatchObject({ publish: true, version: '0.8.3', base: '0.8.2', baseCommit: released });
+    expect(plan).toMatchObject({ publish: true, version: '0.8.3', base: '0.8.2', baseCommit: released, release: '0.8.3' });
+    expect(plan.releaseCommit).toBe(plan.head);
     const notes = releaseNotes({ cwd: dir, plan });
     expect(notes).toContain('fix: a save keeps its writes');
     expect(notes).not.toContain('docs: notes the package does not ship');
@@ -152,6 +153,19 @@ describe('the release decision', () => {
     ).rejects.toThrow("raise package.json's version above 0.8.3");
   });
 
+  it('fails on a tag above every published version that this history does not hold', async () => {
+    // A tag made by hand on another branch would otherwise hold every later push back.
+    const { dir, released } = releasedRepo();
+    const side = commit(dir, { 'src/index.ts': 'export const saves = 9;\n' }, 'fix: on a branch');
+    git(dir, ['tag', 'v1.0.0', side]);
+    git(dir, ['reset', '-q', '--hard', released]);
+    commit(dir, { 'src/index.ts': 'export const saves = 2;\n' }, 'fix: on master');
+
+    await expect(
+      planFromRepository({ cwd: dir, fetch: registry({ '0.8.2': released }, '0.8.2') }),
+    ).rejects.toThrow('v1.0.0');
+  });
+
   it('reads an annotated tag as the commit it names', async () => {
     const dir = makeRepo();
     const released = commit(dir, { 'package.json': manifest('0.8.2'), 'src/index.ts': 'export const saves = 1;\n' }, 'feat: the adapter');
@@ -198,16 +212,65 @@ describe('the release decision', () => {
     expect(plan).toMatchObject({ publish: true, version: '0.8.4' });
   });
 
-  it('ignores a tag that the commit does not contain', async () => {
+  it("publishes nothing on a re-run of an older commit while npm's latest lags behind a newer commit's release", async () => {
+    // 0.8.3 is tagged and npm's latest; 0.8.4 was just published from a later
+    // commit, whose tag this older commit does not contain and which npm's
+    // latest does not name yet.
     const { dir, released } = releasedRepo();
-    const side = commit(dir, { 'src/index.ts': 'export const saves = 9;\n' }, 'fix: on a branch');
-    git(dir, ['tag', 'v1.0.0', side]);
-    git(dir, ['reset', '-q', '--hard', released]);
-    commit(dir, { 'src/index.ts': 'export const saves = 2;\n' }, 'fix: on master');
+    const tagged = commit(dir, { 'src/index.ts': 'export const saves = 2;\n' }, 'fix: one');
+    git(dir, ['tag', 'v0.8.3', tagged]);
+    const older = commit(dir, { 'src/index.ts': 'export const saves = 3;\n' }, 'fix: two');
+    const newer = commit(dir, { 'src/index.ts': 'export const saves = 4;\n' }, 'fix: three');
+    git(dir, ['tag', 'v0.8.4', newer]);
+    git(dir, ['checkout', '-q', older]);
+
+    const plan = await planFromRepository({
+      cwd: dir,
+      fetch: registry({ '0.8.2': released, '0.8.3': tagged, '0.8.4': newer }, '0.8.3'),
+    });
+
+    expect(plan.publish).toBe(false);
+    expect(plan.reason).toContain('this commit is older than');
+  });
+
+  it("counts from a version npm holds that no tag names, published from a commit this one does not contain", async () => {
+    // As above, with the newer release's tag step failed as well: only npm's
+    // version document names 0.8.4 and its commit.
+    const { dir, released } = releasedRepo();
+    const tagged = commit(dir, { 'src/index.ts': 'export const saves = 2;\n' }, 'fix: one');
+    git(dir, ['tag', 'v0.8.3', tagged]);
+    const older = commit(dir, { 'src/index.ts': 'export const saves = 3;\n' }, 'fix: two');
+    const newer = commit(dir, { 'src/index.ts': 'export const saves = 4;\n' }, 'fix: three');
+    git(dir, ['checkout', '-q', older]);
+
+    const plan = await planFromRepository({
+      cwd: dir,
+      fetch: registry({ '0.8.2': released, '0.8.3': tagged, '0.8.4': newer }, '0.8.3'),
+    });
+
+    expect(plan.publish).toBe(false);
+    expect(plan.reason).toContain('this commit is older than');
+  });
+
+  it('makes the missing GitHub release of a version published from this commit', async () => {
+    // A run published 0.8.3 and failed before its release and tag; its re-run publishes nothing.
+    const { dir, released } = releasedRepo();
+    const published = commit(dir, { 'src/index.ts': 'export const saves = 2;\n' }, 'fix: one');
+
+    const plan = await planFromRepository({
+      cwd: dir,
+      fetch: registry({ '0.8.2': released, '0.8.3': published }, '0.8.3'),
+    });
+
+    expect(plan).toMatchObject({ publish: false, release: '0.8.3', releaseCommit: published });
+  });
+
+  it('makes no release for a version whose tag exists', async () => {
+    const { dir, released } = releasedRepo();
 
     const plan = await planFromRepository({ cwd: dir, fetch: registry({ '0.8.2': released }, '0.8.2') });
 
-    expect(plan).toMatchObject({ publish: true, version: '0.8.3', base: '0.8.2' });
+    expect(plan).toMatchObject({ publish: false, release: null });
   });
 
   it("finds the published commit from npm's gitHead when no tag names it", async () => {
