@@ -1021,7 +1021,7 @@ TLS follows pg's, and so does the check of the server. pg's TLS is Node's, which
 
 - GitHub Actions workflows:
   - `ci.yml` runs on pushes and pull requests to `master`: lint, type check, tests with coverage and the build, then it packs the package, installs the tarball into a new ES module project and type-checks a consumer with `--module nodenext --moduleResolution nodenext`. The job starts a PostgreSQL 16 service, and the specs that need a server read its URL from `POSTGRES_TEST_URL`.
-  - `release.yml` publishes new versions to npm, tags the commit (`vX.Y.Z`), and creates/updates the GitHub Release when `CHANGELOG.md` and `package.json` bump the version.
+  - `release.yml` runs on every push to `master`: when a file the package ships changed since the newest published version, it publishes the next patch to npm (or `package.json`'s version when that is higher), tags the commit (`vX.Y.Z`) and creates the GitHub Release.
 - Check badge health whenever builds fail:
   - CI badge should be green for `master`.
   - Codecov badge updates after coverage reports upload.

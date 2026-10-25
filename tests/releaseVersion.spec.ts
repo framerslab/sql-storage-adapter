@@ -143,13 +143,25 @@ describe('the release decision', () => {
     // Skipping would leave every later push unpublished behind a green run.
     const { dir, released } = releasedRepo();
     const side = commit(dir, { 'src/index.ts': 'export const saves = 9;\n' }, 'fix: on a branch');
-    git(dir, ['tag', 'v0.8.3', side]);
+    git(dir, ['tag', '-a', 'v0.8.3', '-m', 'v0.8.3', side]);
     git(dir, ['reset', '-q', '--hard', released]);
     commit(dir, { 'src/index.ts': 'export const saves = 2;\n' }, 'fix: on master');
 
     await expect(
       planFromRepository({ cwd: dir, fetch: registry({ '0.8.2': released, '0.8.3': side }, '0.8.3') }),
     ).rejects.toThrow("raise package.json's version above 0.8.3");
+  });
+
+  it('reads an annotated tag as the commit it names', async () => {
+    const dir = makeRepo();
+    const released = commit(dir, { 'package.json': manifest('0.8.2'), 'src/index.ts': 'export const saves = 1;\n' }, 'feat: the adapter');
+    git(dir, ['tag', '-a', 'v0.8.2', '-m', 'v0.8.2', released]);
+    commit(dir, { 'src/index.ts': 'export const saves = 2;\n' }, 'fix: one');
+
+    // npm names no gitHead here, so the commit can only come from the tag.
+    const plan = await planFromRepository({ cwd: dir, fetch: registry({}, '0.8.2') });
+
+    expect(plan).toMatchObject({ publish: true, version: '0.8.3', baseCommit: released });
   });
 
   it('publishes the version package.json names when it is above every published one', async () => {

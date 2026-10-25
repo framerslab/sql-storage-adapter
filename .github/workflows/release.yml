@@ -4,16 +4,12 @@ on:
   push:
     branches:
       - master
-    paths:
-      - '.github/workflows/release.yml'
-      - 'package.json'
-      - 'src/**'
   workflow_dispatch:
 
 # One release run at a time, in the order the runs began to wait: a run that
 # starts while another runs waits for it, and up to 100 wait (queue: max), so a
-# newer run never replaces one still waiting. Two pushes whose package.json holds
-# the same new version never race npm publish, no version is skipped, and no
+# newer run never replaces one still waiting. Each run decides its version from
+# what the runs before it published, so no version is published twice and no
 # publish is cancelled part way.
 concurrency:
   group: release
@@ -22,6 +18,8 @@ concurrency:
 
 jobs:
   publish:
+    # A run started by hand on another branch publishes nothing.
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -33,6 +31,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
         with:
+          # Every commit and tag: the decision finds the commit the newest
+          # version was published from and compares this one with it.
           fetch-depth: 0
 
       - name: Use Node.js
@@ -41,80 +41,51 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
+      # A push that changed a file the package ships publishes the newest
+      # published version with its patch raised by one, or package.json's
+      # version when that is higher (RELEASING.md).
+      - name: Decide the version to publish
+        id: plan
+        run: node scripts/release-version.mjs --notes "$RUNNER_TEMP/release-notes.md"
+
       - name: Install dependencies
+        if: steps.plan.outputs.publish == 'true'
         run: npm install
 
       - name: Run tests
+        if: steps.plan.outputs.publish == 'true'
         run: npx vitest run
-        continue-on-error: false
 
       - name: Build package
+        if: steps.plan.outputs.publish == 'true'
         run: npm run build
 
-      - name: Read package version
-        id: pkg
-        shell: bash
-        run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Check if version is already published
-        id: npm_check
+      # Into this checkout's package.json alone: nothing is committed to master.
+      - name: Write the version into package.json
+        if: steps.plan.outputs.publish == 'true'
         env:
-          VERSION: ${{ steps.pkg.outputs.version }}
-        run: |
-          # The exact version, not npm's latest: a run of an older commit, such as a
-          # re-run, finds its version published and publishes nothing.
-          PUBLISHED=$(npm view "@framers/sql-storage-adapter@$VERSION" version 2>/dev/null || true)
-          if [ "$PUBLISHED" = "$VERSION" ]; then
-            echo "published=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "published=false" >> "$GITHUB_OUTPUT"
-          fi
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       # Trusted publishing needs npm 11.5.1 or later.
       - name: npm 11.20.0 for trusted publishing
-        if: steps.npm_check.outputs.published == 'false'
+        if: steps.plan.outputs.publish == 'true'
         run: npm install -g npm@11.20.0 && npm --version
 
       - name: Publish to npm
-        if: steps.npm_check.outputs.published == 'false'
-        run: npm publish --access public
+        if: steps.plan.outputs.publish == 'true'
+        run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Check if GitHub release already exists
-        id: release_check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if gh release view "v${{ steps.pkg.outputs.version }}" &>/dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Extract release notes from CHANGELOG
-        id: changelog
-        if: steps.release_check.outputs.exists == 'false'
-        run: |
-          VERSION=${{ steps.pkg.outputs.version }}
-          NOTES=$(awk "/^## \[$VERSION\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md)
-          if [ -z "$NOTES" ]; then
-            NOTES="Release v$VERSION"
-          fi
-          echo "notes<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$NOTES" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
       - name: Create GitHub release
-        if: steps.release_check.outputs.exists == 'false'
+        if: steps.plan.outputs.publish == 'true'
         uses: ncipollo/release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag: v${{ steps.pkg.outputs.version }}
+          tag: v${{ steps.plan.outputs.version }}
           # A new tag names the commit this run published, not master's head when the release is made.
           commit: ${{ github.sha }}
-          name: sql-storage-adapter v${{ steps.pkg.outputs.version }}
-          body: ${{ steps.changelog.outputs.notes }}
+          name: sql-storage-adapter v${{ steps.plan.outputs.version }}
+          bodyFile: ${{ runner.temp }}/release-notes.md
           allowUpdates: true

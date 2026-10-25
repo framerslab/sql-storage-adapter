@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.8.3] - 2026-10-25
+
 ### Added
 - `PostgresExporterOptions.unsetEnvironment` names libpq variables left out of `pg_dump`'s environment. The exporter of a PostgreSQL adapter leaves out `PGSSLNEGOTIATION`.
 
@@ -10,6 +12,7 @@
 - The exporter of a PostgreSQL adapter has `pg_dump` check the server as the pool's pg does. pg's TLS is Node's, which checks the server's certificate and its host name, and versions through 0.8.2 wrote `sslmode=require` for it, with which libpq checks neither without a root certificate file: an export connected to a server whose certificate the pool refuses. `pg_dump` gets `sslmode=verify-full`, or `verify-ca` where pg checks no host name (`uselibpqcompat=true` with `verify-ca`, or `require` beside a root certificate), against the root certificate file the connection string names, else the file `PGSSLROOTCERT` names, else the system's certificate authorities (`sslrootcert=system`, which libpq reads from PostgreSQL 16 on; with an older libpq the export fails, saying what to do). `uselibpqcompat=true` with `sslmode=verify-ca` and no root certificate is refused before `pg_dump` starts, as pg refuses it.
 
 ### Changed
+- The release workflow publishes on every push to `master` that changes a file the package ships: the newest published version with its patch raised by one, or `package.json`'s version when that is higher, written into the run's checkout alone (`scripts/release-version.mjs`, RELEASING.md). Through 0.8.2 it published only a `package.json` version npm did not hold, so the fixes merged after 0.8.2 went unpublished.
 - `new PostgresExporter(connectionString)` takes a function that gives the connection string, or a promise of it, when an export runs.
 - `createDatabase()` on Node treats only a `postgres://` or `postgresql://` URL or connection string as naming a PostgreSQL server, besides a pool, host, database or user. A URL of another scheme (`file:./dev.db`, which `DATABASE_URL` holds in a project that runs SQLite through Prisma, or `sqlite:...`) opens the local default again, as through 0.6.13, and with `strict` fails with an error that says the option names no server. From 0.6.14 through 0.8.2 such a URL chose `['postgres']` with no fallback and failed at start. To open PostgreSQL from a `socket:` URL or a socket path, pass `type: 'postgres'` or use `connectDatabase()`.
 - `connectDatabase()` opens PostgreSQL alone, in every runtime, from any connection string pg reads, and refuses a configuration that names no server (no pool, an empty or unset connection string, and no host, database or user, as `connectDatabase(process.env.DATABASE_URL)` gives with the variable unset): it throws an error that names the missing setting before it opens anything. Versions through 0.8.2 opened the SQLite file `db_data/app.sqlite3` under the working directory on Node when given no server, though the function is documented as connecting to a remote database, and in a browser opened IndexedDB whatever they were given. `createSyncManager()` calls it only with a URL, as before.
