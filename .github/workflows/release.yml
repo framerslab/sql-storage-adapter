@@ -34,6 +34,10 @@ jobs:
           # Every commit and tag: the decision finds the commit the newest
           # version was published from and compares this one with it.
           fetch-depth: 0
+          # No step after this one fetches or pushes with git, and npm install runs
+          # dependencies' scripts in this checkout, so the job's write token stays out
+          # of .git/config. The release step passes its own token.
+          persist-credentials: false
 
       - name: Use Node.js
         uses: actions/setup-node@v5
