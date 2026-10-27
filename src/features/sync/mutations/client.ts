@@ -400,6 +400,9 @@ export class MutationClient {
     switch (answer.kind) {
       case 'pull':
         return this.apply(answer, context);
+      case 'protocol_changed':
+        await this.blockSends(context, 'malformed', null);
+        return { kind: 'blocked' };
       case 'epoch_changed':
         return this.recover(context, answer.epoch);
       case 'cookie_ahead':
@@ -697,6 +700,9 @@ export class MutationClient {
         return { kind: 'blocked' };
       case 'rate_limited':
         return { kind: 'wait', ms: answer.retryAfterMs };
+      case 'protocol_changed':
+        await this.blockSends(context, 'malformed', null);
+        return { kind: 'blocked' };
       case 'epoch_changed':
         return this.recover(context, answer.epoch);
       case 'group_gone':
