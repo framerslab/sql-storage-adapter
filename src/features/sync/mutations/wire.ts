@@ -50,8 +50,11 @@ export type PatchEntry =
 /** What processing did with a mutation. */
 export type Outcome = 'applied' | 'noop' | 'copied' | 'refused';
 
-/** Why a mutation was refused for good: its value too long, the rows full, its row deleted, or its revision stale. */
-export type Refusal = 'too_long' | 'full' | 'removed' | 'stale';
+/**
+ * Why a mutation was refused for good: its value too long, the rows full, its row deleted, its revision stale, or its
+ * id taken by another value (a claim).
+ */
+export type Refusal = 'too_long' | 'full' | 'removed' | 'stale' | 'occupied';
 
 /** The recorded result of one processed mutation: ids, an outcome and a version, never a value. */
 export interface MutationResult {
@@ -179,7 +182,7 @@ export function parsePullRequest(value: unknown): PullRequest {
 }
 
 const OUTCOMES: readonly Outcome[] = ['applied', 'noop', 'copied', 'refused'];
-const REFUSALS: readonly Refusal[] = ['too_long', 'full', 'removed', 'stale'];
+const REFUSALS: readonly Refusal[] = ['too_long', 'full', 'removed', 'stale', 'occupied'];
 
 function patchEntryAt(value: unknown, field: string): PatchEntry {
   const record = objectAt(value, field);

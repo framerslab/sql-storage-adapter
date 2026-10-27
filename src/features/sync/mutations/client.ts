@@ -344,7 +344,7 @@ export class MutationClient {
       let state = m;
       const tooLong: string[] = [];
       for (const mutation of planned) {
-        if (mutation.name !== 'delete' && mutation.args.value.length > this.options.policy.maxUnits) {
+        if (mutation.name !== 'delete' && mutation.name !== 'amend' && mutation.args.value.length > this.options.policy.maxUnits) {
           // kept under its own id; an edit keeps the revision it was made against, so a save that fits edits the row
           const revision = mutation.name === 'edit' ? mutation.args.expected : null;
           await this.keep(trx, { id: mutation.args.id, value: mutation.args.value, reason: 'too_long', group: revision === null ? null : state.group, revision });
@@ -765,7 +765,7 @@ export class MutationClient {
     for (const pending of await this.pendingRows(trx)) {
       if (pending.mutationId > acknowledged) break;
       const result = await this.resultOf(trx, m.clientId as string, String(pending.mutationId));
-      if (result !== null && result.outcome === 'refused' && result.reason !== null && result.reason !== 'stale' && pending.mutation.name !== 'delete') {
+      if (result !== null && result.outcome === 'refused' && result.reason !== null && result.reason !== 'stale' && result.reason !== 'occupied' && pending.mutation.name !== 'delete' && pending.mutation.name !== 'amend') {
         const value = pending.mutation.args.value;
         const held = canonical.get(result.targetId);
         const there = kept.get(result.targetId);
@@ -1043,7 +1043,7 @@ export class MutationClient {
         local.set(`${clientId}:${context.mutationId}`, { outcome: effect.outcome, targetId: effect.targetId, revision: effect.revision });
         if (effect.write !== null) {
           overlay.set(effect.write.id, { ...effect.write, revision });
-        } else if (effect.outcome === 'refused' && pending.mutation.name !== 'delete') {
+        } else if (effect.outcome === 'refused' && pending.mutation.name !== 'delete' && pending.mutation.name !== 'amend') {
           const held = overlay.get(effect.targetId) ?? canonical.get(effect.targetId);
           const id = held !== undefined && held.state === 'live' ? await copyIdOf(context) : effect.targetId;
           provisional.set(id, { id, value: pending.mutation.args.value, revision, source: 'pending', reason: null });
