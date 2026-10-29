@@ -284,6 +284,40 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('cont
     expect(await a.client.preview([{ id: hex(1), value: 'text|x,y' }, { id: hex(2), value: 'claimed|', claim: true }])).toEqual({ creates: 1, edits: 0, deletes: 0 });
   });
 
+  it('edits a row the account cannot read at its revision with the whole new text, though the save plans amends', async () => {
+    const a = await open();
+    await a.join();
+    await a.save([{ id: hex(1), value: 'healthy|' }]);
+    await settle(a);
+    // the account's copy becomes unreadable at a new version, as a lost key or a moved value would leave it
+    await w.opened.adapter.run(`UPDATE ${w.opened.prefix}rows SET stored = ?, version = 99 WHERE id = ?`, ['garbage', hex(1)]);
+    await w.opened.adapter.run(`UPDATE ${w.opened.prefix}groups SET version = 99 WHERE scope = ?`, [w.scope]);
+    await settle(a);
+    expect((await a.client.snapshot()).kept).toMatchObject([{ id: hex(1), value: 'healthy|', reason: 'unreadable' }]);
+    await a.save([{ id: hex(1), value: 'healthy, edited|budget' }]);
+    expect((await pendingOf(a)).map((mutation) => mutation.name)).toEqual(['edit']);
+    await settle(a);
+    expect((await a.client.snapshot()).kept).toEqual([]);
+    const fresh = await open();
+    await fresh.join();
+    expect(await fresh.values()).toEqual(['healthy, edited|budget']);
+  });
+
+  it('changes a row kept too long at its revision with the whole new text, so no tag it added is lost', async () => {
+    const a = await open();
+    await a.join();
+    await a.save([{ id: hex(1), value: 'text|' }]);
+    await settle(a);
+    await a.save([{ id: hex(1), value: `${'x'.repeat(30_000)}|budget` }]);
+    expect((await a.client.snapshot()).kept).toMatchObject([{ id: hex(1), reason: 'too_long' }]);
+    expect(await pendingOf(a)).toEqual([]);
+    await a.save([{ id: hex(1), value: 'short|budget,more' }]);
+    expect((await pendingOf(a)).map((mutation) => mutation.name)).toEqual(['edit']);
+    await settle(a);
+    expect(await a.values()).toEqual(['short|budget,more']);
+    expect((await a.client.snapshot()).kept).toEqual([]);
+  });
+
   it.each([
     ['rows', 'content_client'], ['rows', 'content_mutation'],
     ['results', 'content_client'], ['results', 'content_mutation'], ['rows', null],

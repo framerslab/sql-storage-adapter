@@ -18,8 +18,9 @@ export function packMutations(
   mutations: readonly MutationRecord[],
   limits: { maxMutations: number; maxBytes: number },
 ): MutationRecord[][] {
-  // the request with no mutation, "mutations":[] included; each mutation adds its own bytes and, after the first, a comma
-  const head = encoder.encode(JSON.stringify({ group: envelope.group, epoch: envelope.epoch, clientId: envelope.clientId, mutations: [] })).length;
+  // the request with no mutation, its whole envelope (the protocol too) and "mutations":[] included; each mutation adds
+  // its own bytes and, after the first, a comma
+  const head = requestBytes({ ...envelope, mutations: [] });
   const batches: MutationRecord[][] = [];
   let current: MutationRecord[] = [];
   let bytes = head;
