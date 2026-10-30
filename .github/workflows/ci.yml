@@ -131,8 +131,25 @@ jobs:
             openIndexedDbStore,
             type KeyValueStore,
           } from '@framers/sql-storage-adapter/kv';
-          import { MutationClient, IndexedDbAdapter, createTabLock } from '@framers/sql-storage-adapter/browser';
-          import { MutationServer, createSqlMutationStore, DrainGate } from '@framers/sql-storage-adapter/sync';
+          import {
+            MutationClient,
+            IndexedDbAdapter,
+            createTabLock,
+            upgradeClientTables,
+            type ClientSnapshot,
+            type RowPolicy,
+          } from '@framers/sql-storage-adapter/browser';
+          import {
+            MutationServer,
+            createSqlMutationStore,
+            DrainGate,
+            PROTOCOL,
+            upgradeSqlMutationStore,
+            type MutationServerOptions,
+            type PullRefusal,
+            type PushAnswer,
+            type RowComposer,
+          } from '@framers/sql-storage-adapter/sync';
 
           declare const legacyDialect: Omit<SqlDialect, 'syncIdentitySequence'>;
           export const compatibleDialect: SqlDialect = legacyDialect;
@@ -150,6 +167,28 @@ jobs:
           export const openBrowserKv = (): Promise<KeyValueStore> => openIndexedDbStore({ dbName: 'app', storeName: 'kv' });
           export const authAdapter = (adapter: StorageAdapter): Adapter => createAuthJsAdapter(adapter);
           export const kinds = [MutationClient, IndexedDbAdapter, createTabLock, MutationServer, createSqlMutationStore, DrainGate].map((value) => typeof value);
+          // Content revisions as a consumer types them: a composer and the policy that takes it, a server
+          // narrowed to this release's protocol, both upgrades, a save that claims a derived id, a
+          // protocol_changed answer, a kept row refused as occupied and a row's content revision.
+          export const composer: RowComposer = {
+            contentOf: (value) => value.split('|')[0],
+            compose: (current, content, delta) => `${content ?? current.split('|')[0]}|${delta ?? current.split('|')[1]}`,
+            deltaOf: (before, after) => (before.split('|')[1] === after.split('|')[1] ? null : after.split('|')[1]),
+            sameClaim: (current, incoming) => current === incoming,
+          };
+          export const policy: RowPolicy = { maxRows: 100, maxUnits: 10_000, copyValue: (value) => `${value} (copy)`, composer };
+          export const narrowed = (options: MutationServerOptions): MutationServer =>
+            new MutationServer({ ...options, policy, protocols: [PROTOCOL] });
+          export const upgradeStore = (adapter: StorageAdapter): Promise<void> => upgradeSqlMutationStore(adapter, 'notes_');
+          export const upgradePage = (adapter: StorageAdapter): Promise<void> => upgradeClientTables(adapter, 'sync_');
+          export const claim = (client: MutationClient, id: string) =>
+            client.save({ rows: [{ id, value: 'copy|', claim: true }], write: async () => undefined });
+          export const protocolsTaken = (answer: PushAnswer | PullRefusal): number[] =>
+            answer.kind === 'protocol_changed' ? answer.protocols : [];
+          export const occupied = (snapshot: ClientSnapshot): string[] =>
+            snapshot.kept.filter((row) => row.reason === 'occupied').map((row) => row.value);
+          export const contentRevisions = (snapshot: ClientSnapshot): Array<string | null> =>
+            snapshot.visible.map((row) => row.contentRevision?.mutation ?? null);
           EOF
           tsc="$GITHUB_WORKSPACE/node_modules/.bin/tsc"
           "$tsc" --version
@@ -167,8 +206,8 @@ jobs:
           import { createPostgresAdapter } from '@framers/sql-storage-adapter/postgres';
           import { SqliteDialect, isUniqueViolation, runSchemaMigrations } from '@framers/sql-storage-adapter/core';
           import { createElectronRendererAdapter } from '@framers/sql-storage-adapter/electron/renderer';
-          import { MutationClient } from '@framers/sql-storage-adapter/browser';
-          import { MutationServer } from '@framers/sql-storage-adapter/sync';
+          import { MutationClient, upgradeClientTables } from '@framers/sql-storage-adapter/browser';
+          import { MutationServer, PROTOCOL, upgradeSqlMutationStore, type RowComposer } from '@framers/sql-storage-adapter/sync';
 
           export const open = (): Promise<StorageAdapter> => createDatabase();
           export const openPostgres = (url: string): StorageAdapter => createPostgresAdapter(url);
@@ -178,6 +217,9 @@ jobs:
           export const renderer = createElectronRendererAdapter;
           export const client = MutationClient;
           export const server = MutationServer;
+          export const protocol: number = PROTOCOL;
+          export const upgrades = [upgradeSqlMutationStore, upgradeClientTables].map((upgrade) => typeof upgrade);
+          export const sameClaim: RowComposer['sameClaim'] = (current, incoming) => current === incoming;
           EOF
           tsc="$GITHUB_WORKSPACE/node_modules/.bin/tsc"
           "$tsc" --module node16 --moduleResolution node16 --strict --skipLibCheck --noEmit cjs-consumer.cts
