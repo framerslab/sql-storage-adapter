@@ -18,20 +18,27 @@
  * that its sends stopped, and hands a changed epoch, a gone group or a gap to the recovery, the leave or the sequence
  * repair. A changed epoch keeps every downloaded row aside, takes a full snapshot, and pushes again from the journal
  * every issued mutation the restored server lacks, with its id; a journal with a hole retires the client.
+ *
+ * Every request speaks protocol 2: each row carries its content revision beside its whole revision, a save plans `amend`
+ * with the policy's composer and `claim` for a row marked so, and the journal keeps each mutation's whole local value for
+ * recovery alone. A claim the server refuses as occupied is kept aside with every change made on it, never sent again.
  */
 import type { StorageAdapter } from '../../../core/contracts';
 import { nextCounter, readCounter, writeCounter } from './counter';
 import { packMutations } from './packing';
-import { applyRowMutation, copyIdOf, planRowChanges, rowMutationOf, type PlannedRow, type Row, type RowMutation, type RowPolicy, type RowView } from './rows';
+import { applyRowMutation, copyIdOf, incomingValue, planRowChanges, rowMutationOf, type PlannedRow, type Row, type RowMutation, type RowPolicy, type RowView } from './rows';
 import type { TabLock } from './tabLock';
 import type { MutationTransport } from './transport';
-import type { MutationRecord, MutationResult, Outcome, PatchEntry, PullResponse, Refusal, Revision } from './wire';
+import { PROTOCOL, type MutationRecord, type MutationResult, type Outcome, type PatchEntry, type PullResponse, type Refusal, type Revision } from './wire';
 
 /** Where a client stands with its scope's group. */
 export type MembershipState = 'none' | 'joining' | 'joined' | 'declined' | 'off' | 'retired';
 
-/** Why a row is kept in this browser alone. */
-export type KeptReason = 'too_long' | 'full' | 'removed' | 'unreadable' | 'recovery' | 'differs';
+/**
+ * Why a row is kept in this browser alone. `occupied` holds a claim the server refused because another value holds its
+ * id, with every change made on it; it stays in the kept rows, out of the visible ones, until an explicit recovery.
+ */
+export type KeptReason = 'too_long' | 'full' | 'removed' | 'unreadable' | 'recovery' | 'differs' | 'occupied';
 
 /** The client's membership. */
 export interface Membership {
@@ -65,6 +72,8 @@ export interface VisibleRow {
   id: string;
   value: string;
   revision: Revision | null;
+  /** The mutation that last changed its content, as this browser knows it; null for a kept row. */
+  contentRevision: Revision | null;
   source: 'canonical' | 'pending' | 'kept';
   reason: KeptReason | null;
 }
@@ -163,7 +172,10 @@ export interface BackupCheck {
   /** False when the check could not run: not joined, recovering, sends stopped, or a mutation pending. */
   checked: boolean;
   reason: 'not_joined' | 'recovering' | 'sends_blocked' | 'pending' | null;
-  /** The blocks no acknowledged readable account copy holds (all of them when the check could not run). */
+  /**
+   * The blocks no acknowledged readable account copy holds (all of them when the check could not run), then every row
+   * kept as `occupied`, whose value no block holds.
+   */
   unbacked: Array<{ id: string | null; value: string }>;
   /** What a removal must present: the membership, the counters and the kept rows as they were checked. */
   stamp: string;
@@ -200,17 +212,61 @@ function randomHexId(): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-/** The client's tables; every counter column is BIGINT, as wide as the protocol's counters, on every database. */
+function retiredClientsDdl(p: string): string {
+  return `CREATE TABLE IF NOT EXISTS ${p}retired_clients (scope TEXT NOT NULL, grp TEXT NOT NULL, client_id TEXT NOT NULL, protocol INTEGER NOT NULL, next_mutation_id BIGINT NOT NULL, PRIMARY KEY (scope, grp, client_id))`;
+}
+
+/**
+ * The client's tables; every counter column is BIGINT, as wide as the protocol's counters, on every database. The
+ * columns protocol 2 added come last in their tables, where `upgradeClientTables` adds them to a table an earlier release
+ * made: the content revision of the rows and the results, the membership's protocol, and the journal's `incoming_value`,
+ * the whole local value a mutation was issued with, for recovery alone and never on the wire.
+ */
 export function clientDdl(p: string): string[] {
   return [
-    `CREATE TABLE IF NOT EXISTS ${p}membership (scope TEXT PRIMARY KEY, state TEXT NOT NULL, grp TEXT, client_id TEXT, activation TEXT NOT NULL, epoch TEXT, cookie BIGINT, next_mutation_id BIGINT NOT NULL, sends TEXT NOT NULL, recovering INTEGER NOT NULL, declined_group TEXT, removing INTEGER NOT NULL, synced_at TEXT)`,
-    `CREATE TABLE IF NOT EXISTS ${p}rows (scope TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, value TEXT, rev_client TEXT NOT NULL, rev_mutation BIGINT NOT NULL, version BIGINT NOT NULL, PRIMARY KEY (scope, id))`,
+    `CREATE TABLE IF NOT EXISTS ${p}membership (scope TEXT PRIMARY KEY, state TEXT NOT NULL, grp TEXT, client_id TEXT, activation TEXT NOT NULL, epoch TEXT, cookie BIGINT, next_mutation_id BIGINT NOT NULL, sends TEXT NOT NULL, recovering INTEGER NOT NULL, declined_group TEXT, removing INTEGER NOT NULL, synced_at TEXT, protocol INTEGER NOT NULL DEFAULT ${PROTOCOL})`,
+    `CREATE TABLE IF NOT EXISTS ${p}rows (scope TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, value TEXT, rev_client TEXT NOT NULL, rev_mutation BIGINT NOT NULL, version BIGINT NOT NULL, content_client TEXT, content_mutation BIGINT, PRIMARY KEY (scope, id))`,
     `CREATE TABLE IF NOT EXISTS ${p}base (scope TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (scope, id))`,
     `CREATE TABLE IF NOT EXISTS ${p}pending (scope TEXT NOT NULL, mutation_id BIGINT NOT NULL, name TEXT NOT NULL, args TEXT NOT NULL, size_error INTEGER NOT NULL, PRIMARY KEY (scope, mutation_id))`,
-    `CREATE TABLE IF NOT EXISTS ${p}journal (scope TEXT NOT NULL, grp TEXT NOT NULL, client_id TEXT NOT NULL, mutation_id BIGINT NOT NULL, name TEXT NOT NULL, args TEXT NOT NULL, PRIMARY KEY (scope, grp, client_id, mutation_id))`,
-    `CREATE TABLE IF NOT EXISTS ${p}results (scope TEXT NOT NULL, client_id TEXT NOT NULL, mutation_id BIGINT NOT NULL, outcome TEXT NOT NULL, reason TEXT, target_id TEXT NOT NULL, rev_client TEXT, rev_mutation BIGINT, PRIMARY KEY (scope, client_id, mutation_id))`,
+    `CREATE TABLE IF NOT EXISTS ${p}journal (scope TEXT NOT NULL, grp TEXT NOT NULL, client_id TEXT NOT NULL, mutation_id BIGINT NOT NULL, name TEXT NOT NULL, args TEXT NOT NULL, incoming_value TEXT, PRIMARY KEY (scope, grp, client_id, mutation_id))`,
+    `CREATE TABLE IF NOT EXISTS ${p}results (scope TEXT NOT NULL, client_id TEXT NOT NULL, mutation_id BIGINT NOT NULL, outcome TEXT NOT NULL, reason TEXT, target_id TEXT NOT NULL, rev_client TEXT, rev_mutation BIGINT, content_client TEXT, content_mutation BIGINT, PRIMARY KEY (scope, client_id, mutation_id))`,
     `CREATE TABLE IF NOT EXISTS ${p}kept (scope TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, reason TEXT NOT NULL, grp TEXT, rev_client TEXT, rev_mutation BIGINT, PRIMARY KEY (scope, id))`,
+    retiredClientsDdl(p),
   ];
+}
+
+/**
+ * Adds what protocol 2 needs to a client's tables an earlier release made: the content revision columns of the rows and
+ * the results, the membership's protocol (1 for a membership made before it), the journal's `incoming_value` and the
+ * retired clients' table; then gives each row without a content revision its whole revision. Each statement stands
+ * alone, a second run changes nothing, and a column another tab's open added first counts as added. `open()` runs it.
+ */
+export async function upgradeClientTables(adapter: StorageAdapter, p: string): Promise<void> {
+  await adapter.run(retiredClientsDdl(p));
+  const missing = async (table: string, column: string): Promise<boolean> => {
+    try {
+      await adapter.all(`SELECT ${column} FROM ${p}${table} WHERE 1 = 0`);
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  const add = async (table: string, column: string, type: string): Promise<void> => {
+    if (!(await missing(table, column))) return;
+    try {
+      await adapter.run(`ALTER TABLE ${p}${table} ADD COLUMN ${column} ${type}`);
+    } catch (error) {
+      // another tab's open added it between the check and the change
+      if (await missing(table, column)) throw error;
+    }
+  };
+  for (const table of ['rows', 'results']) {
+    await add(table, 'content_client', 'TEXT');
+    await add(table, 'content_mutation', 'BIGINT');
+  }
+  await add('membership', 'protocol', 'INTEGER NOT NULL DEFAULT 1');
+  await add('journal', 'incoming_value', 'TEXT');
+  await adapter.run(`UPDATE ${p}rows SET content_client = rev_client, content_mutation = rev_mutation WHERE content_client IS NULL OR content_mutation IS NULL`);
 }
 
 interface MembershipRecord {
@@ -234,6 +290,28 @@ interface PendingRow {
   sizeError: boolean;
 }
 
+/** A claim's chain in the journal: the claim's mutation id and the chain's final local value, null after a delete. */
+interface ClaimChain {
+  root: number;
+  value: string | null;
+}
+
+/** A result as this client holds it: the server's, or its own replay's for a pending mutation. */
+interface StoredResult {
+  outcome: Outcome;
+  reason: Refusal | null;
+  targetId: string;
+  /** The whole revision after a successful result, including a no-op; null for a refusal. */
+  revision: Revision | null;
+  /** Its target's content revision after it; null when it names none. */
+  contentRevision: Revision | null;
+}
+
+/** A revision from its two columns, or null when either is empty. */
+function revisionOf(client: string | null, mutation: unknown): Revision | null {
+  return client === null || mutation === null || mutation === undefined ? null : { client, mutation: writeCounter(readCounter(mutation)) };
+}
+
 function contextOf(m: Membership): RequestContext | null {
   if (m.state !== 'joined' || m.group === null || m.clientId === null || m.epoch === null) return null;
   return { group: m.group, clientId: m.clientId, activation: m.activation, epoch: m.epoch, cookie: m.cookie };
@@ -249,7 +327,7 @@ function holds(m: Membership, context: RequestContext): boolean {
  */
 function plannedOf(row: VisibleRow): PlannedRow {
   const edited = row.reason === 'unreadable' || (row.reason === 'too_long' && row.revision !== null);
-  return { id: row.id, value: row.value, revision: row.revision, local: row.source === 'kept' && !edited };
+  return { id: row.id, value: row.value, revision: row.revision, contentRevision: row.contentRevision, local: row.source === 'kept' && !edited };
 }
 
 function changeOf(before: ReadonlyMap<string, { value: string }>, after: ReadonlyMap<string, { value: string }>): VisibleChange {
@@ -282,10 +360,51 @@ export class MutationClient {
     return this.options.scope;
   }
 
-  /** Makes the client's tables; run once before anything else. */
+  /**
+   * Makes the client's tables, upgrades the ones an earlier release made, and retires a protocol 1 queue that still has
+   * pending work (see `retireOldQueue`); run once before anything else.
+   */
   async open(): Promise<void> {
     await this.options.adapter.transaction(async (trx) => {
       for (const statement of clientDdl(this.p)) await trx.run(statement);
+    });
+    await upgradeClientTables(this.options.adapter, this.p);
+    await this.retireOldQueue();
+  }
+
+  /**
+   * A protocol 1 queue with pending work is retired without acknowledgement: its whole journal stays under its old
+   * identity, every journal payload is kept as local recovery, and only the pending transport set is cleared. A fresh
+   * client id asks for a whole snapshot. The retirement marker keeps the old journal out of every replay and every
+   * transport reset. The marker, the recovery rows, the pending set's end, the fresh identity and the protocol commit
+   * together.
+   */
+  private async retireOldQueue(): Promise<void> {
+    await this.locked(async (trx, m) => {
+      const stored = await trx.get<{ protocol: unknown }>(`SELECT protocol FROM ${this.p}membership WHERE scope = ?`, [this.scope]);
+      if (stored === null || Number(stored.protocol) >= PROTOCOL) return;
+      let state = m;
+      if ((await this.pendingRows(trx)).length > 0 && m.state === 'joined' && m.group !== null && m.clientId !== null) {
+        const group = m.group;
+        const clientId = m.clientId;
+        await trx.run(`INSERT INTO ${this.p}retired_clients (scope, grp, client_id, protocol, next_mutation_id) VALUES (?, ?, ?, ?, ?)`, [this.scope, group, clientId, Number(stored.protocol), m.nextMutationId]);
+        const journal = await trx.all<{ mutation_id: unknown; name: string; args: string; incoming_value: string | null }>(
+          `SELECT mutation_id, name, args, incoming_value FROM ${this.p}journal WHERE scope = ? AND grp = ? AND client_id = ? ORDER BY mutation_id`,
+          [this.scope, group, clientId],
+        );
+        for (const record of journal) {
+          const mutation = rowMutationOf(record.name, JSON.parse(record.args));
+          if (mutation.name === 'delete') continue;
+          const value = record.incoming_value ?? (mutation.name === 'amend' ? null : mutation.args.value);
+          if (value === null) throw new Error('a retired mutation has no recovery value');
+          const id = await copyIdOf({ group, clientId, mutationId: writeCounter(readCounter(record.mutation_id)) });
+          await this.keep(trx, { id, value, reason: 'recovery', group, revision: null });
+        }
+        await trx.run(`DELETE FROM ${this.p}pending WHERE scope = ?`, [this.scope]);
+        state = { ...m, clientId: this.randomId(), nextMutationId: 1, cookie: null, sends: 'open', recovering: false };
+      }
+      await this.saveMembership(trx, state);
+      await trx.run(`UPDATE ${this.p}membership SET protocol = ? WHERE scope = ?`, [PROTOCOL, this.scope]);
     });
   }
 
@@ -310,14 +429,17 @@ export class MutationClient {
     return this.locked(async (_trx, m) => contextOf(m), false);
   }
 
-  /** What a save of `rows` would send, to ask the person before a save that removes many rows. */
-  async preview(rows: ReadonlyArray<{ id: string; value: string }>): Promise<{ creates: number; edits: number; deletes: number }> {
+  /**
+   * What a save of `rows` would send, planned as the save plans it, to ask the person before a save that removes many
+   * rows: a claim counts as a create and an amend as an edit.
+   */
+  async preview(rows: ReadonlyArray<{ id: string; value: string; claim?: boolean }>): Promise<{ creates: number; edits: number; deletes: number }> {
     return this.locked(async (trx, m) => {
       if (m.state !== 'joined') return { creates: 0, edits: 0, deletes: 0 };
-      const planned = planRowChanges([...(await this.visible(trx, m)).values()].map(plannedOf), rows);
+      const planned = this.plan(await this.visible(trx, m), rows);
       return {
-        creates: planned.filter((mutation) => mutation.name === 'create').length,
-        edits: planned.filter((mutation) => mutation.name === 'edit').length,
+        creates: planned.filter((mutation) => mutation.name === 'create' || mutation.name === 'claim').length,
+        edits: planned.filter((mutation) => mutation.name === 'edit' || mutation.name === 'amend').length,
         deletes: planned.filter((mutation) => mutation.name === 'delete').length,
       };
     }, false);
@@ -325,11 +447,13 @@ export class MutationClient {
 
   /**
    * Saves: the caller's data written by `write` and, while joined, the mutations that take the visible rows to `rows`,
-   * each with its journal record, in one transaction. A value too long for the account is kept in this browser under
-   * its row's id and gets no mutation id (an edit's keeps the revision it was made against); a save that would send
-   * more deletes than `allowDeletes` throws `DeletesChanged`.
+   * each with its journal record, in one transaction: with the policy's composer a changed row is an amend, and a row
+   * marked `claim` that the account does not hold is a claim. A value too long for the account (an amend's as it would
+   * write it) is kept in this browser under its row's id and gets no mutation id (an edit's or an amend's keeps the
+   * revision it was made against); a save that would send more deletes than `allowDeletes` throws `DeletesChanged`. A
+   * row kept as `occupied` is outside the saved set: a save that leaves it out does not release it.
    */
-  async save(input: { rows: ReadonlyArray<{ id: string; value: string }>; write(trx: StorageAdapter): Promise<void>; allowDeletes?: number }): Promise<SaveResult> {
+  async save(input: { rows: ReadonlyArray<{ id: string; value: string; claim?: boolean }>; write(trx: StorageAdapter): Promise<void>; allowDeletes?: number }): Promise<SaveResult> {
     return this.locked(async (trx, m) => {
       if (m.removing) throw new RemovalInProgress();
       if (m.state !== 'joined') {
@@ -337,24 +461,32 @@ export class MutationClient {
         return { mode: 'local', issued: 0, tooLong: [], deletes: 0 };
       }
       const before = await this.visible(trx, m);
-      const planned = planRowChanges([...before.values()].map(plannedOf), input.rows);
+      const planned = this.plan(before, input.rows);
       const deletes = planned.filter((mutation) => mutation.name === 'delete').length;
       if (input.allowDeletes !== undefined && deletes > input.allowDeletes) throw new DeletesChanged(deletes);
       const kept = await this.keptRows(trx);
       let state = m;
       const tooLong: string[] = [];
       for (const mutation of planned) {
-        if (mutation.name !== 'delete' && mutation.args.value.length > this.options.policy.maxUnits) {
-          // kept under its own id; an edit keeps the revision it was made against, so a save that fits edits the row
-          const revision = mutation.name === 'edit' ? mutation.args.expected : null;
-          await this.keep(trx, { id: mutation.args.id, value: mutation.args.value, reason: 'too_long', group: revision === null ? null : state.group, revision });
+        // the value the mutation would write: an amend's composed over the row it was planned against, which always
+        // has a whole revision
+        const shown = mutation.name === 'amend' ? before.get(mutation.args.id) : undefined;
+        const held: Row | undefined = shown === undefined || shown.revision === null ? undefined : { id: shown.id, state: 'live', value: shown.value, revision: shown.revision };
+        const value = incomingValue(this.options.policy, mutation, held);
+        if (mutation.name !== 'delete' && value !== null && value.length > this.options.policy.maxUnits) {
+          // kept under its own id; an edit or an amend keeps the revision it was made against, so a save that fits
+          // changes the row
+          const revision = mutation.name === 'edit' || mutation.name === 'amend' ? mutation.args.expected : null;
+          await this.keep(trx, { id: mutation.args.id, value, reason: 'too_long', group: revision === null ? null : state.group, revision });
           tooLong.push(mutation.args.id);
           continue;
         }
-        state = await this.issue(trx, state, mutation);
+        state = await this.issue(trx, state, mutation, value);
       }
       const saved = new Map(input.rows.map((row) => [row.id, row.value]));
       for (const row of kept.values()) {
+        // these rows are outside the edited set; leaving one out of an ordinary save does not resolve it
+        if (row.reason === 'occupied') continue;
         if (tooLong.includes(row.id)) continue;
         const value = saved.get(row.id);
         if (value === undefined) await this.unkeep(trx, row.id);
@@ -373,6 +505,30 @@ export class MutationClient {
     });
   }
 
+  /**
+   * The mutations a save of `rows` sends, planned with the policy's composer, but for a kept row a save changes at its
+   * revision (one the account cannot read, or one kept too long): an edit carrying the whole new value whenever the
+   * value differs, as without a composer. The server refuses an amend of an unreadable row; a delta from a value the
+   * account never held would drop what that value added; and a change the composer counts as none (tags in another
+   * order) would send nothing, so the save would release the kept row and write the account's older value over the page.
+   */
+  private plan(before: ReadonlyMap<string, VisibleRow>, rows: ReadonlyArray<{ id: string; value: string; claim?: boolean }>): RowMutation[] {
+    const planned = planRowChanges([...before.values()].map(plannedOf), rows, this.options.policy.composer);
+    const changes = new Map(planned.filter((mutation) => mutation.name !== 'delete').map((mutation): [string, RowMutation] => [mutation.args.id, mutation]));
+    const mutations: RowMutation[] = [];
+    for (const row of rows) {
+      const shown = before.get(row.id);
+      if (shown !== undefined && shown.source === 'kept' && shown.revision !== null && !plannedOf(shown).local) {
+        if (shown.value !== row.value) mutations.push({ name: 'edit', args: { id: row.id, expected: shown.revision, value: row.value } });
+        continue;
+      }
+      const mutation = changes.get(row.id);
+      if (mutation !== undefined) mutations.push(mutation);
+    }
+    // the deletes last, in the order the planner gave them
+    return [...mutations, ...planned.filter((mutation) => mutation.name === 'delete')];
+  }
+
   /** Sends the pending mutations in id order. A sent push acknowledges nothing: the pull after it does. */
   async push(): Promise<SyncOutcome> {
     const work = await this.locked(async (trx, m) => {
@@ -383,7 +539,8 @@ export class MutationClient {
       return { context, mutations: pending.map((row): MutationRecord => ({ id: writeCounter(row.mutationId), name: row.mutation.name, args: row.mutation.args })) };
     }, false);
     if (work === null) return { kind: 'idle' };
-    const envelope = { group: work.context.group, epoch: work.context.epoch, clientId: work.context.clientId };
+    // packed by the whole envelope the request carries, the protocol included
+    const envelope = { group: work.context.group, epoch: work.context.epoch, clientId: work.context.clientId, protocol: PROTOCOL };
     const limits = { maxMutations: this.options.pushMutations ?? 50, maxBytes: this.options.pushBytes ?? 1_000_000 };
     for (const batch of packMutations(envelope, work.mutations, limits)) {
       const outcome = await this.sendBatch(work.context, batch);
@@ -396,10 +553,13 @@ export class MutationClient {
   async pull(): Promise<SyncOutcome> {
     const context = await this.locked(async (_trx, m) => contextOf(m), false);
     if (context === null) return { kind: 'idle' };
-    const answer = await this.options.transport.pull({ group: context.group, epoch: context.epoch, clientId: context.clientId, cookie: context.cookie === null ? null : writeCounter(context.cookie) });
+    const answer = await this.options.transport.pull({ group: context.group, epoch: context.epoch, clientId: context.clientId, cookie: context.cookie === null ? null : writeCounter(context.cookie), protocol: PROTOCOL });
     switch (answer.kind) {
       case 'pull':
         return this.apply(answer, context);
+      case 'protocol_changed':
+        await this.blockSends(context, 'malformed', null);
+        return { kind: 'blocked' };
       case 'epoch_changed':
         return this.recover(context, answer.epoch);
       case 'cookie_ahead':
@@ -435,14 +595,15 @@ export class MutationClient {
         removing: false,
       };
       await this.clearTransport(trx);
-      // rows kept for an earlier group are merged again as ordinary blocks of the caller's data
-      await trx.run(`DELETE FROM ${this.p}kept WHERE scope = ?`, [this.scope]);
+      // rows kept for an earlier group are merged again as ordinary blocks of the caller's data; an occupied row, which
+      // no block holds, stays kept until its explicit recovery
+      await trx.run(`DELETE FROM ${this.p}kept WHERE scope = ? AND reason <> 'occupied'`, [this.scope]);
       await this.saveMembership(trx, next);
       return next;
     });
     if (intent === null || intent.clientId === null) return { kind: 'idle' };
     const clientId = intent.clientId;
-    const answer = await this.options.transport.pull({ group: input.group, epoch: input.epoch, clientId, cookie: null }).catch(async (error: unknown) => {
+    const answer = await this.options.transport.pull({ group: input.group, epoch: input.epoch, clientId, cookie: null, protocol: PROTOCOL }).catch(async (error: unknown) => {
       // no snapshot came: the joining state goes, since no push or pull could finish it; a revert that fails leaves it
       // to the next join, which replaces it, and the caller hears the request's own error
       await this.abandonJoin(intent.activation).catch(() => undefined);
@@ -451,6 +612,8 @@ export class MutationClient {
     if (answer.kind !== 'pull') {
       await this.abandonJoin(intent.activation);
       if (answer.kind === 'rate_limited') return { kind: 'wait', ms: answer.retryAfterMs };
+      // the server no longer takes this protocol: another join meets the same refusal, and only a newer page joins
+      if (answer.kind === 'protocol_changed') return { kind: 'blocked' };
       return { kind: answer.kind === 'group_gone' ? 'off' : 'stale' };
     }
     return this.locked(async (trx, m): Promise<SyncOutcome> => {
@@ -515,7 +678,7 @@ export class MutationClient {
 
   /**
    * Leaves the group an answer said is gone, only while `context` still holds: the canonical values become the
-   * comparison base, every transport record and kept row goes, and the caller's data stays as it is.
+   * comparison base, every transport record and kept row but an occupied one goes, and the caller's data stays as it is.
    */
   async leave(context: RequestContext): Promise<SyncOutcome> {
     return this.locked(async (trx, m): Promise<SyncOutcome> => {
@@ -525,7 +688,8 @@ export class MutationClient {
         if (row.state === 'live' && row.value !== null) await trx.run(`INSERT INTO ${this.p}base (scope, id, value) VALUES (?, ?, ?)`, [this.scope, row.id, row.value]);
       }
       await this.clearTransport(trx);
-      await trx.run(`DELETE FROM ${this.p}kept WHERE scope = ?`, [this.scope]);
+      // the caller's data holds every kept value but an occupied row's, which stays kept until its explicit recovery
+      await trx.run(`DELETE FROM ${this.p}kept WHERE scope = ? AND reason <> 'occupied'`, [this.scope]);
       await this.saveMembership(trx, { ...m, state: 'off', group: null, clientId: null, epoch: null, cookie: null, nextMutationId: 1, sends: 'open', recovering: false, removing: false, activation: this.randomId() });
       return { kind: 'off' };
     });
@@ -560,24 +724,28 @@ export class MutationClient {
   /**
    * Whether `blocks` are backed by the account: checked only while joined, with nothing pending, no recovery open and
    * sends open; a block is backed when a readable canonical row of its id holds exactly its text and no kept row of
-   * that id exists. A block with no id is never backed.
+   * that id exists. A block with no id is never backed. A row kept as `occupied` holds a value no block and no account
+   * row holds, so it is answered among the unbacked ones in every state.
    */
   async backedUp(blocks: ReadonlyArray<{ id: string | null; value: string }>): Promise<BackupCheck> {
     return this.locked(async (trx, m): Promise<BackupCheck> => {
       const stamp = await this.stampOf(trx, m);
-      const all = blocks.map((block) => ({ id: block.id, value: block.value }));
+      const kept = await this.keptRows(trx);
+      // an occupied row's value is in no block and in no account row, so it is never backed
+      const occupied: BackupCheck['unbacked'] = [...kept.values()].filter((row) => row.reason === 'occupied').map((row) => ({ id: row.id, value: row.value }));
+      const given = blocks.map((block) => ({ id: block.id, value: block.value }));
+      const all = [...given, ...occupied];
       if (m.state !== 'joined') return { checked: false, reason: 'not_joined', unbacked: all, stamp };
       if (m.recovering) return { checked: false, reason: 'recovering', unbacked: all, stamp };
       if (m.sends !== 'open') return { checked: false, reason: 'sends_blocked', unbacked: all, stamp };
       if ((await this.pendingRows(trx)).length > 0) return { checked: false, reason: 'pending', unbacked: all, stamp };
       const canonical = await this.canonical(trx);
-      const kept = await this.keptRows(trx);
-      const unbacked = all.filter((block) => {
+      const unbacked = given.filter((block) => {
         if (block.id === null || kept.has(block.id)) return true;
         const row = canonical.get(block.id);
         return row === undefined || row.state !== 'live' || row.value !== block.value;
       });
-      return { checked: true, reason: null, unbacked, stamp };
+      return { checked: true, reason: null, unbacked: [...unbacked, ...occupied], stamp };
     }, false);
   }
 
@@ -601,7 +769,7 @@ export class MutationClient {
         if (m.sends !== 'open') throw new RemovalInvalidated('sends_blocked');
         if ((await this.pendingRows(trx)).length > 0) throw new RemovalInvalidated('pending');
       }
-      for (const table of ['rows', 'base', 'pending', 'journal', 'results', 'kept']) await trx.run(`DELETE FROM ${this.p}${table} WHERE scope = ?`, [this.scope]);
+      for (const table of ['rows', 'base', 'pending', 'journal', 'results', 'kept', 'retired_clients']) await trx.run(`DELETE FROM ${this.p}${table} WHERE scope = ?`, [this.scope]);
       const declinedGroup = m.state === 'joined' ? m.group : m.declinedGroup;
       await this.saveMembership(trx, {
         ...m,
@@ -642,20 +810,26 @@ export class MutationClient {
   }
 
   /**
-   * Puts a kept row back into the account with an explicit create under its id (`too_long`, `full`, `recovery` and
-   * `differs` rows); false when it cannot be. A `removed` row is never put back here: its id is a tombstone the server
-   * refuses for good, so its return is a separate explicit save of a new row under a new id, the caller's, with the kept
-   * value; nothing here creates or re-stamps it. A recovery row whose id the restored server tombstoned comes back from
-   * its create refused `removed` and is kept as `removed`.
+   * Puts a kept row back into the account with an explicit create under its id (`too_long`, `full`, `recovery`,
+   * `differs` and `occupied` rows); false when it cannot be. A `removed` row is never put back here: its id is a
+   * tombstone the server refuses for good, so its return is a separate explicit save of a new row under a new id, the
+   * caller's, with the kept value; nothing here creates or re-stamps it. A recovery row whose id the restored server
+   * tombstoned comes back from its create refused `removed` and is kept as `removed`. What the create changes in the
+   * visible rows goes to `materialize`, so an `occupied` row, which the page held no block of, comes into the page.
    */
   async restoreKept(id: string): Promise<boolean> {
     return this.locked(async (trx, m) => {
       if (m.state !== 'joined' || m.removing) return false;
       const row = (await this.keptRows(trx)).get(id);
       if (row === undefined || row.reason === 'unreadable' || row.reason === 'removed' || row.value.length > this.options.policy.maxUnits) return false;
+      const before = await this.visible(trx, m);
       const state = await this.issue(trx, m, { name: 'create', args: { id: row.id, value: row.value } });
       await this.unkeep(trx, row.id);
       await this.saveMembership(trx, state);
+      // an occupied row was out of view, so the page holds no block of it: it gets the row as any change of the
+      // visible rows, or its next save would delete it
+      const change = changeOf(before, await this.visible(trx, state));
+      if (!emptyChange(change)) await this.options.materialize(trx, change);
       return true;
     });
   }
@@ -679,7 +853,7 @@ export class MutationClient {
   }
 
   private async sendBatch(context: RequestContext, batch: MutationRecord[]): Promise<SyncOutcome> {
-    const answer = await this.options.transport.push({ group: context.group, epoch: context.epoch, clientId: context.clientId, mutations: batch });
+    const answer = await this.options.transport.push({ group: context.group, epoch: context.epoch, clientId: context.clientId, mutations: batch, protocol: PROTOCOL });
     switch (answer.kind) {
       case 'ok':
         return { kind: 'sent' };
@@ -697,6 +871,9 @@ export class MutationClient {
         return { kind: 'blocked' };
       case 'rate_limited':
         return { kind: 'wait', ms: answer.retryAfterMs };
+      case 'protocol_changed':
+        await this.blockSends(context, 'malformed', null);
+        return { kind: 'blocked' };
       case 'epoch_changed':
         return this.recover(context, answer.epoch);
       case 'group_gone':
@@ -754,29 +931,50 @@ export class MutationClient {
   }
 
   /**
-   * Drops the pending mutations the server processed; a refused one's value is kept first, under the id `visible`
-   * showed it at while the refusal was pending: beside a live row, the copy's id the mutation would have taken; at a
-   * deleted or missing row, that row's id; beside an unreadable row, that row's id, unless this browser keeps that
-   * row's text already, when a different value goes under the copy's id and the same value adds nothing.
+   * Drops the pending mutations the server processed; a refused one's whole local value (`localIncoming`) is kept first,
+   * under the id `visible` showed it at while the refusal was pending: beside a live row, the copy's id the mutation
+   * would have taken; at a deleted or missing row, that row's id; beside an unreadable row, that row's id, unless this
+   * browser keeps that row's text already, when a different value goes under the copy's id and the same value adds
+   * nothing. A claim refused as occupied keeps its journal chain's final value, once for the claim and every change made
+   * on it, under the copy id of the claim's own mutation (which the server never takes, since a claim is never copied)
+   * and the reason `occupied`; nothing of the chain is sent again.
    */
   private async dropAcknowledged(trx: StorageAdapter, m: Membership, acknowledged: number): Promise<void> {
     const canonical = await this.canonical(trx);
     const kept = await this.keptRows(trx);
+    // read from the journal only when an occupied refusal comes
+    let claims: Map<number, ClaimChain> | null = null;
+    const occupied = new Set<number>();
     for (const pending of await this.pendingRows(trx)) {
       if (pending.mutationId > acknowledged) break;
       const result = await this.resultOf(trx, m.clientId as string, String(pending.mutationId));
-      if (result !== null && result.outcome === 'refused' && result.reason !== null && result.reason !== 'stale' && pending.mutation.name !== 'delete') {
-        const value = pending.mutation.args.value;
-        const held = canonical.get(result.targetId);
-        const there = kept.get(result.targetId);
-        const copyId = (): Promise<string> => copyIdOf({ group: m.group as string, clientId: m.clientId as string, mutationId: String(pending.mutationId) });
-        let id: string | null = result.targetId;
-        if (held !== undefined && held.state === 'live') id = await copyId();
-        else if (held !== undefined && held.state === 'unreadable' && there !== undefined) id = there.value === value ? null : await copyId();
-        if (id !== null) {
-          const row: KeptRow = { id, value, reason: result.reason, group: m.group, revision: null };
-          await this.keep(trx, row);
-          kept.set(id, row);
+      if (result !== null && result.outcome === 'refused' && result.reason === 'occupied') {
+        claims ??= await this.claimIncoming(trx, m);
+        const chain = claims.get(pending.mutationId);
+        if (chain === undefined) throw new Error('an occupied mutation has no claim in the journal');
+        if (!occupied.has(chain.root)) {
+          occupied.add(chain.root);
+          if (chain.value !== null) {
+            const id = await copyIdOf({ group: m.group as string, clientId: m.clientId as string, mutationId: writeCounter(chain.root) });
+            const row: KeptRow = { id, value: chain.value, reason: 'occupied', group: m.group, revision: null };
+            await this.keep(trx, row);
+            kept.set(id, row);
+          }
+        }
+      } else if (result !== null && result.outcome === 'refused' && result.reason !== null && result.reason !== 'stale' && pending.mutation.name !== 'delete') {
+        const value = await this.localIncoming(trx, m, pending);
+        if (value !== null) {
+          const held = canonical.get(result.targetId);
+          const there = kept.get(result.targetId);
+          const copyId = (): Promise<string> => copyIdOf({ group: m.group as string, clientId: m.clientId as string, mutationId: String(pending.mutationId) });
+          let id: string | null = result.targetId;
+          if (held !== undefined && held.state === 'live') id = await copyId();
+          else if (held !== undefined && held.state === 'unreadable' && there !== undefined) id = there.value === value ? null : await copyId();
+          if (id !== null) {
+            const row: KeptRow = { id, value, reason: result.reason, group: m.group, revision: null };
+            await this.keep(trx, row);
+            kept.set(id, row);
+          }
         }
       }
       await trx.run(`DELETE FROM ${this.p}pending WHERE scope = ? AND mutation_id = ?`, [this.scope, pending.mutationId]);
@@ -784,10 +982,51 @@ export class MutationClient {
   }
 
   /**
+   * Each claim-dependent mutation's chain: its claim's mutation id and the chain's final local value, from the immutable
+   * journal alone, never from a canonical or visible row at the claimed id. The journal holds acknowledged claims too, so
+   * a dependent refused on a later pull finds the same value.
+   */
+  private async claimIncoming(trx: StorageAdapter, m: Membership): Promise<Map<number, ClaimChain>> {
+    const journal = await trx.all<{ mutation_id: unknown; name: string; args: string }>(
+      `SELECT mutation_id, name, args FROM ${this.p}journal WHERE scope = ? AND grp = ? AND client_id = ? ORDER BY mutation_id`,
+      [this.scope, m.group, m.clientId],
+    );
+    const lineage = new Map<number, ClaimChain>();
+    const latest = new Map<number, ClaimChain>();
+    for (const record of journal) {
+      const id = readCounter(record.mutation_id);
+      const mutation = rowMutationOf(record.name, JSON.parse(record.args));
+      let own: ClaimChain | undefined;
+      if (mutation.name === 'claim') own = { root: id, value: mutation.args.value };
+      else if (mutation.name !== 'create' && mutation.args.expected.client === m.clientId) {
+        const prior = lineage.get(readCounter(mutation.args.expected.mutation));
+        if (prior !== undefined) {
+          let value: string | null;
+          if (mutation.name === 'delete') value = null;
+          else if (mutation.name === 'amend') {
+            if (prior.value === null || this.options.policy.composer === undefined) throw new Error('a claim\'s amend has no local base');
+            value = this.options.policy.composer.compose(prior.value, mutation.args.content, mutation.args.delta);
+          } else value = mutation.args.value;
+          own = { root: prior.root, value };
+        }
+      }
+      if (own !== undefined) {
+        lineage.set(id, own);
+        latest.set(own.root, own);
+      }
+    }
+    return new Map([...lineage].map(([id, own]) => [id, latest.get(own.root) as ClaimChain]));
+  }
+
+  /**
    * After a restore: every issued mutation above the restored last id, from the journal, pending again with its id. A
    * journal with a hole keeps the values only a pending mutation showed and retires the client.
    */
   private async rebuildPending(trx: StorageAdapter, m: Membership, acknowledged: number, shown: ReadonlyMap<string, VisibleRow>): Promise<Membership> {
+    // a retired client's journal is never replayed
+    if ((await trx.get(`SELECT client_id FROM ${this.p}retired_clients WHERE scope = ? AND grp = ? AND client_id = ?`, [this.scope, m.group, m.clientId])) !== null) {
+      return { ...m, state: 'retired' };
+    }
     const issued = m.nextMutationId - 1;
     const journal = await trx.all<{ mutation_id: unknown; name: string; args: string }>(
       `SELECT mutation_id, name, args FROM ${this.p}journal WHERE scope = ? AND grp = ? AND client_id = ? AND mutation_id > ? ORDER BY mutation_id`,
@@ -811,11 +1050,13 @@ export class MutationClient {
    * Settles the kept rows against the canonical state: a readable row with the same value releases its kept row; a
    * different readable value marks a row kept across a restore or kept unreadable as differing, at the same id, and it
    * stays shown; a tombstone releases a row kept across a restore (its downloaded value, unchanged here) and marks an
-   * unreadable or differing one removed; an unreadable or absent row leaves it as it is.
+   * unreadable or differing one removed; an unreadable or absent row leaves it as it is. A row kept as `occupied` leaves
+   * only by an explicit recovery, never by this.
    */
   private async reconcileKept(trx: StorageAdapter): Promise<void> {
     const canonical = await this.canonical(trx);
     for (const row of (await this.keptRows(trx)).values()) {
+      if (row.reason === 'occupied') continue;
       const held = canonical.get(row.id);
       if (held === undefined || held.state === 'unreadable') continue;
       if (held.state === 'live') {
@@ -926,17 +1167,30 @@ export class MutationClient {
     );
   }
 
-  /** Drops the group's transport records: canonical rows, pending mutations, the journal and the results. */
+  /**
+   * Drops the group's transport records: canonical rows, pending mutations, the journal and the results. A retired
+   * client's journal stays, under its marker, as the record its recovery rows came from.
+   */
   private async clearTransport(trx: StorageAdapter): Promise<void> {
-    for (const table of ['rows', 'pending', 'journal', 'results']) await trx.run(`DELETE FROM ${this.p}${table} WHERE scope = ?`, [this.scope]);
+    for (const table of ['rows', 'pending', 'results']) await trx.run(`DELETE FROM ${this.p}${table} WHERE scope = ?`, [this.scope]);
+    await trx.run(
+      `DELETE FROM ${this.p}journal WHERE scope = ? AND NOT EXISTS (SELECT 1 FROM ${this.p}retired_clients r WHERE r.scope = ${this.p}journal.scope AND r.grp = ${this.p}journal.grp AND r.client_id = ${this.p}journal.client_id)`,
+      [this.scope],
+    );
   }
 
   private async canonical(trx: StorageAdapter): Promise<Map<string, Row>> {
-    const rows = await trx.all<{ id: string; state: string; value: string | null; rev_client: string; rev_mutation: unknown }>(
-      `SELECT id, state, value, rev_client, rev_mutation FROM ${this.p}rows WHERE scope = ? ORDER BY id`,
+    const rows = await trx.all<{ id: string; state: string; value: string | null; rev_client: string; rev_mutation: unknown; content_client: string | null; content_mutation: unknown }>(
+      `SELECT id, state, value, rev_client, rev_mutation, content_client, content_mutation FROM ${this.p}rows WHERE scope = ? ORDER BY id`,
       [this.scope],
     );
-    return new Map(rows.map((row) => [row.id, { id: row.id, state: row.state as Row['state'], value: row.value, revision: { client: row.rev_client, mutation: writeCounter(readCounter(row.rev_mutation)) } }]));
+    return new Map(
+      rows.map((row): [string, Row] => {
+        const revision: Revision = { client: row.rev_client, mutation: writeCounter(readCounter(row.rev_mutation)) };
+        const contentRevision = revisionOf(row.content_client, row.content_mutation) ?? revision;
+        return [row.id, { id: row.id, state: row.state as Row['state'], value: row.value, revision, contentRevision }];
+      }),
+    );
   }
 
   private async keptRows(trx: StorageAdapter): Promise<Map<string, KeptRow>> {
@@ -960,10 +1214,13 @@ export class MutationClient {
     return rows.map((row) => ({ mutationId: readCounter(row.mutation_id), mutation: rowMutationOf(row.name, JSON.parse(row.args)), sizeError: Number(row.size_error) === 1 }));
   }
 
-  /** A recorded result of this client's, with the revision it recorded, which a dependent mutation is compared against. */
-  private async resultOf(trx: StorageAdapter, clientId: string, mutationId: string): Promise<{ outcome: Outcome; reason: Refusal | null; targetId: string; revision: Revision | null } | null> {
-    const row = await trx.get<{ outcome: string; reason: string | null; target_id: string; rev_client: string | null; rev_mutation: unknown }>(
-      `SELECT outcome, reason, target_id, rev_client, rev_mutation FROM ${this.p}results WHERE scope = ? AND client_id = ? AND mutation_id = ?`,
+  /**
+   * A recorded result of this client's, with the revision it recorded, which a dependent mutation is compared against,
+   * and its target's content revision after it.
+   */
+  private async resultOf(trx: StorageAdapter, clientId: string, mutationId: string): Promise<StoredResult | null> {
+    const row = await trx.get<{ outcome: string; reason: string | null; target_id: string; rev_client: string | null; rev_mutation: unknown; content_client: string | null; content_mutation: unknown }>(
+      `SELECT outcome, reason, target_id, rev_client, rev_mutation, content_client, content_mutation FROM ${this.p}results WHERE scope = ? AND client_id = ? AND mutation_id = ?`,
       [this.scope, clientId, readCounter(mutationId)],
     );
     if (row === null) return null;
@@ -971,22 +1228,37 @@ export class MutationClient {
       outcome: row.outcome as Outcome,
       reason: row.reason as Refusal | null,
       targetId: row.target_id,
-      revision: row.rev_client === null ? null : { client: row.rev_client, mutation: writeCounter(readCounter(row.rev_mutation)) },
+      revision: revisionOf(row.rev_client, row.rev_mutation),
+      contentRevision: revisionOf(row.content_client, row.content_mutation),
     };
   }
 
   private async writeResult(trx: StorageAdapter, result: MutationResult): Promise<void> {
+    const content = result.contentRevision ?? null;
     await trx.run(
-      `INSERT INTO ${this.p}results (scope, client_id, mutation_id, outcome, reason, target_id, rev_client, rev_mutation) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (scope, client_id, mutation_id) DO UPDATE SET outcome = excluded.outcome, reason = excluded.reason, target_id = excluded.target_id, rev_client = excluded.rev_client, rev_mutation = excluded.rev_mutation`,
-      [this.scope, result.clientId, readCounter(result.mutationId), result.outcome, result.reason, result.targetId, result.revision?.client ?? null, result.revision === null ? null : readCounter(result.revision.mutation)],
+      `INSERT INTO ${this.p}results (scope, client_id, mutation_id, outcome, reason, target_id, rev_client, rev_mutation, content_client, content_mutation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (scope, client_id, mutation_id) DO UPDATE SET outcome = excluded.outcome, reason = excluded.reason, target_id = excluded.target_id, rev_client = excluded.rev_client, rev_mutation = excluded.rev_mutation, content_client = excluded.content_client, content_mutation = excluded.content_mutation`,
+      [
+        this.scope,
+        result.clientId,
+        readCounter(result.mutationId),
+        result.outcome,
+        result.reason,
+        result.targetId,
+        result.revision?.client ?? null,
+        result.revision === null ? null : readCounter(result.revision.mutation),
+        content?.client ?? null,
+        content === null ? null : readCounter(content.mutation),
+      ],
     );
   }
 
+  /** Writes a patch entry; a put's content revision is its own, or its whole revision when the answer has none. */
   private async writeCanonical(trx: StorageAdapter, entry: PatchEntry): Promise<void> {
     const state = entry.op === 'put' ? 'live' : entry.op === 'del' ? 'tombstone' : 'unreadable';
+    const content = entry.op === 'put' ? (entry.contentRevision ?? entry.revision) : entry.revision;
     await trx.run(
-      `INSERT INTO ${this.p}rows (scope, id, state, value, rev_client, rev_mutation, version) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (scope, id) DO UPDATE SET state = excluded.state, value = excluded.value, rev_client = excluded.rev_client, rev_mutation = excluded.rev_mutation, version = excluded.version`,
-      [this.scope, entry.id, state, entry.op === 'put' ? entry.value : null, entry.revision.client, readCounter(entry.revision.mutation), readCounter(entry.version)],
+      `INSERT INTO ${this.p}rows (scope, id, state, value, rev_client, rev_mutation, version, content_client, content_mutation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (scope, id) DO UPDATE SET state = excluded.state, value = excluded.value, rev_client = excluded.rev_client, rev_mutation = excluded.rev_mutation, version = excluded.version, content_client = excluded.content_client, content_mutation = excluded.content_mutation`,
+      [this.scope, entry.id, state, entry.op === 'put' ? entry.value : null, entry.revision.client, readCounter(entry.revision.mutation), readCounter(entry.version), content.client, readCounter(content.mutation)],
     );
   }
 
@@ -1001,20 +1273,41 @@ export class MutationClient {
     await trx.run(`DELETE FROM ${this.p}kept WHERE scope = ? AND id = ?`, [this.scope, id]);
   }
 
-  /** Allocates the next mutation id and records the mutation as pending and in the journal. */
-  private async issue(trx: StorageAdapter, m: Membership, mutation: RowMutation): Promise<Membership> {
+  /**
+   * Allocates the next mutation id and records the mutation as pending and in the journal, with `incoming`, the whole
+   * local value it was issued with (its own value when left out; an amend's must be given), which neither a retry nor a
+   * rebase changes.
+   */
+  private async issue(trx: StorageAdapter, m: Membership, mutation: RowMutation, incoming?: string | null): Promise<Membership> {
     if (m.group === null || m.clientId === null) throw new Error('a mutation is issued only in a group');
+    const localValue = incoming === undefined ? (mutation.name === 'delete' ? null : mutation.name === 'amend' ? undefined : mutation.args.value) : incoming;
+    if (localValue === undefined) throw new Error('an amend is issued with its whole local value');
     const id = m.nextMutationId;
     const args = JSON.stringify(mutation.args);
     await trx.run(`INSERT INTO ${this.p}pending (scope, mutation_id, name, args, size_error) VALUES (?, ?, ?, ?, 0)`, [this.scope, id, mutation.name, args]);
-    await trx.run(`INSERT INTO ${this.p}journal (scope, grp, client_id, mutation_id, name, args) VALUES (?, ?, ?, ?, ?, ?)`, [this.scope, m.group, m.clientId, id, mutation.name, args]);
+    await trx.run(`INSERT INTO ${this.p}journal (scope, grp, client_id, mutation_id, name, args, incoming_value) VALUES (?, ?, ?, ?, ?, ?, ?)`, [this.scope, m.group, m.clientId, id, mutation.name, args, localValue]);
     return { ...m, nextMutationId: nextCounter(id) };
+  }
+
+  /** The whole local value a pending mutation was issued with; never rebuilt over the canonical state after a pull. */
+  private async localIncoming(trx: StorageAdapter, m: Membership, pending: PendingRow): Promise<string | null> {
+    if (pending.mutation.name === 'delete') return null;
+    const record = await trx.get<{ incoming_value: string | null }>(
+      `SELECT incoming_value FROM ${this.p}journal WHERE scope = ? AND grp = ? AND client_id = ? AND mutation_id = ?`,
+      [this.scope, m.group, m.clientId, pending.mutationId],
+    );
+    if (record !== null && record.incoming_value !== null) return record.incoming_value;
+    // a journal record an earlier release wrote holds the whole value in its arguments; it never holds an amend
+    if (pending.mutation.name !== 'amend') return pending.mutation.args.value;
+    throw new Error('an amend has no local value in the journal');
   }
 
   /**
    * The rows the caller shows: the canonical rows with the pending mutations replayed over them by the same mutators
-   * the server runs, a pending value the replay refuses kept in view until its refusal is acknowledged, and the kept
-   * rows over all of it.
+   * the server runs, a pending mutation's whole local value the replay refuses kept in view until its refusal is
+   * acknowledged (but for a claim, or a change made on one, refused as occupied, whose value the server's row holds
+   * the place of), and the kept rows over all of it but those kept as occupied, which `snapshot().kept` alone holds.
+   * Each row carries its whole revision and its content revision as the replay leaves them.
    */
   private async visible(trx: StorageAdapter, m: Membership): Promise<Map<string, VisibleRow>> {
     const canonical = await this.canonical(trx);
@@ -1023,7 +1316,7 @@ export class MutationClient {
     if (m.state === 'joined' && m.group !== null && m.clientId !== null) {
       const group = m.group;
       const clientId = m.clientId;
-      const local = new Map<string, { outcome: Outcome; targetId: string; revision: Revision | null }>();
+      const local = new Map<string, StoredResult>();
       const view: RowView = {
         row: async (id) => overlay.get(id) ?? canonical.get(id) ?? null,
         liveCount: async () => {
@@ -1040,23 +1333,45 @@ export class MutationClient {
         const context = { group, clientId, mutationId: String(pending.mutationId) };
         const revision: Revision = { client: clientId, mutation: context.mutationId };
         const effect = await applyRowMutation(view, this.options.policy, context, pending.mutation);
-        local.set(`${clientId}:${context.mutationId}`, { outcome: effect.outcome, targetId: effect.targetId, revision: effect.revision });
         if (effect.write !== null) {
-          overlay.set(effect.write.id, { ...effect.write, revision });
-        } else if (effect.outcome === 'refused' && pending.mutation.name !== 'delete') {
-          const held = overlay.get(effect.targetId) ?? canonical.get(effect.targetId);
-          const id = held !== undefined && held.state === 'live' ? await copyIdOf(context) : effect.targetId;
-          provisional.set(id, { id, value: pending.mutation.args.value, revision, source: 'pending', reason: null });
+          const prior = overlay.get(effect.write.id) ?? canonical.get(effect.write.id);
+          overlay.set(effect.write.id, {
+            id: effect.write.id,
+            state: effect.write.state,
+            value: effect.write.value,
+            revision,
+            contentRevision: effect.write.contentChanged || prior === undefined ? revision : (prior.contentRevision ?? prior.revision),
+          });
+        }
+        const target = overlay.get(effect.targetId) ?? canonical.get(effect.targetId);
+        local.set(`${clientId}:${context.mutationId}`, {
+          outcome: effect.outcome,
+          reason: effect.reason,
+          targetId: effect.targetId,
+          revision: effect.revision,
+          contentRevision: effect.outcome === 'refused' ? null : (target?.contentRevision ?? target?.revision ?? null),
+        });
+        if (effect.write === null && effect.outcome === 'refused' && effect.reason !== 'occupied' && pending.mutation.name !== 'delete') {
+          const value = await this.localIncoming(trx, m, pending);
+          if (value !== null) {
+            const held = overlay.get(effect.targetId) ?? canonical.get(effect.targetId);
+            const id = held !== undefined && held.state === 'live' ? await copyIdOf(context) : effect.targetId;
+            provisional.set(id, { id, value, revision, contentRevision: revision, source: 'pending', reason: null });
+          }
         }
       }
     }
     const visible = new Map<string, VisibleRow>();
     for (const id of new Set([...canonical.keys(), ...overlay.keys()])) {
       const row = overlay.get(id) ?? canonical.get(id);
-      if (row !== undefined && row.state === 'live' && row.value !== null) visible.set(id, { id, value: row.value, revision: row.revision, source: overlay.has(id) ? 'pending' : 'canonical', reason: null });
+      if (row !== undefined && row.state === 'live' && row.value !== null) {
+        visible.set(id, { id, value: row.value, revision: row.revision, contentRevision: row.contentRevision ?? row.revision, source: overlay.has(id) ? 'pending' : 'canonical', reason: null });
+      }
     }
     for (const [id, row] of provisional) visible.set(id, row);
-    for (const row of (await this.keptRows(trx)).values()) visible.set(row.id, { id: row.id, value: row.value, revision: row.revision, source: 'kept', reason: row.reason });
+    for (const row of (await this.keptRows(trx)).values()) {
+      if (row.reason !== 'occupied') visible.set(row.id, { id: row.id, value: row.value, revision: row.revision, contentRevision: null, source: 'kept', reason: row.reason });
+    }
     return visible;
   }
 }

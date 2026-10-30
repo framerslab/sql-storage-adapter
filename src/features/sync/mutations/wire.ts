@@ -1,8 +1,9 @@
 /**
  * The wire contract of the mutation sync. A client pushes its mutations in id order and pulls the server's changes;
  * the server answers each from one transaction. Group, client, epoch and row ids are 32 lower-case hexadecimal
- * characters, and every counter is a decimal string. The parsers check a message from the network before anything
- * reads it, and name the field that failed, never its value.
+ * characters, and every counter is a decimal string. A request names the protocol it speaks, none for protocol 1;
+ * protocol 2 carries each row's content revision on a pull's rows and results. The parsers check a message from the
+ * network before anything reads it, and name the field that failed, never its value.
  */
 import { CounterError, readCounter } from './counter';
 
@@ -11,6 +12,21 @@ export const HEX_ID = /^[0-9a-f]{32}$/;
 
 /** A mutation's name: a lower-case word of at most 32 characters. */
 export const MUTATION_NAME = /^[a-z][a-z_]{0,31}$/;
+
+/** The protocol this release's clients speak: 2 carries content revisions, `amend` and `claim`. A request with none speaks 1. */
+export const PROTOCOL = 2;
+
+/** A protocol number: a whole number from 1 to 99. */
+function protocolAt(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > 99) throw new WireError(field);
+  return value;
+}
+
+/** A nonempty list of protocol numbers. */
+function protocolsAt(value: unknown, field: string): number[] {
+  if (!Array.isArray(value) || value.length === 0) throw new WireError(field);
+  return value.map((each, index) => protocolAt(each, `${field}.${index}`));
+}
 
 /** Who last changed a row: a client and one of its mutation ids. A revision is never a time. */
 export interface Revision {
@@ -31,6 +47,8 @@ export interface PushRequest {
   epoch: string;
   clientId: string;
   mutations: MutationRecord[];
+  /** The protocol the client speaks; absent for protocol 1. */
+  protocol?: number;
 }
 
 /** A pull: the client's group, epoch and id, and the cookie of its canonical state, or null for a full snapshot. */
@@ -39,19 +57,27 @@ export interface PullRequest {
   epoch: string;
   clientId: string;
   cookie: string | null;
+  /** The protocol the client speaks; absent for protocol 1. */
+  protocol?: number;
 }
 
-/** One change of a pull: a readable row, a deleted one, or one the server cannot open. */
+/**
+ * One change of a pull: a readable row, a deleted one, or one the server cannot open. A readable row carries the
+ * mutation that last changed its content when the server answers protocol 2.
+ */
 export type PatchEntry =
-  | { op: 'put'; id: string; value: string; revision: Revision; version: string }
+  | { op: 'put'; id: string; value: string; revision: Revision; version: string; contentRevision?: Revision }
   | { op: 'del'; id: string; revision: Revision; version: string; deletedAt: string }
   | { op: 'unreadable'; id: string; revision: Revision; version: string };
 
 /** What processing did with a mutation. */
 export type Outcome = 'applied' | 'noop' | 'copied' | 'refused';
 
-/** Why a mutation was refused for good: its value too long, the rows full, its row deleted, or its revision stale. */
-export type Refusal = 'too_long' | 'full' | 'removed' | 'stale';
+/**
+ * Why a mutation was refused for good: its value too long, the rows full, its row deleted, its revision stale, or its
+ * id taken by another value (a claim).
+ */
+export type Refusal = 'too_long' | 'full' | 'removed' | 'stale' | 'occupied';
 
 /** The recorded result of one processed mutation: ids, an outcome and a version, never a value. */
 export interface MutationResult {
@@ -68,6 +94,8 @@ export interface MutationResult {
   revision: Revision | null;
   /** The version of the transaction that processed it. */
   version: string;
+  /** Its target's content revision after it, null when it was refused; absent from a protocol 1 server. */
+  contentRevision?: Revision | null;
 }
 
 /** A pull's answer, from one snapshot: the patch, the cookie, every client's last mutation id and this client's results. */
@@ -88,10 +116,15 @@ export type PushAnswer =
   | { kind: 'ok'; processed: number }
   | { kind: 'epoch_changed'; epoch: string }
   | { kind: 'group_gone' }
-  | { kind: 'gap'; expected: string };
+  | { kind: 'gap'; expected: string }
+  | { kind: 'protocol_changed'; protocols: number[] };
 
 /** What a pull is answered with when no patch streams. */
-export type PullRefusal = { kind: 'epoch_changed'; epoch: string } | { kind: 'group_gone' } | { kind: 'cookie_ahead' };
+export type PullRefusal =
+  | { kind: 'epoch_changed'; epoch: string }
+  | { kind: 'group_gone' }
+  | { kind: 'cookie_ahead' }
+  | { kind: 'protocol_changed'; protocols: number[] };
 
 /** A message that is not the contract's shape; `field` says where, never what it held. */
 export class WireError extends Error {
@@ -143,7 +176,7 @@ function textAt(value: unknown, field: string): string {
 /** Reads a push: ids strictly rising from 1, at most `maxMutations`; `parseArgs` checks each mutation's arguments. */
 export function parsePushRequest(value: unknown, maxMutations: number, parseArgs: (name: string, args: unknown, field: string) => unknown): PushRequest {
   const record = objectAt(value, 'push');
-  onlyKeys(record, ['group', 'epoch', 'clientId', 'mutations'], 'push');
+  onlyKeys(record, ['group', 'epoch', 'clientId', 'mutations', 'protocol'], 'push');
   const list = record.mutations;
   if (!Array.isArray(list) || list.length === 0 || list.length > maxMutations) throw new WireError('push.mutations');
   let previous = 0;
@@ -163,23 +196,25 @@ export function parsePushRequest(value: unknown, maxMutations: number, parseArgs
     epoch: hexIdAt(record.epoch, 'push.epoch'),
     clientId: hexIdAt(record.clientId, 'push.clientId'),
     mutations,
+    ...(record.protocol === undefined ? {} : { protocol: protocolAt(record.protocol, 'push.protocol') }),
   };
 }
 
 /** Reads a pull. */
 export function parsePullRequest(value: unknown): PullRequest {
   const record = objectAt(value, 'pull');
-  onlyKeys(record, ['group', 'epoch', 'clientId', 'cookie'], 'pull');
+  onlyKeys(record, ['group', 'epoch', 'clientId', 'cookie', 'protocol'], 'pull');
   return {
     group: hexIdAt(record.group, 'pull.group'),
     epoch: hexIdAt(record.epoch, 'pull.epoch'),
     clientId: hexIdAt(record.clientId, 'pull.clientId'),
     cookie: record.cookie === null ? null : counterAt(record.cookie, 'pull.cookie'),
+    ...(record.protocol === undefined ? {} : { protocol: protocolAt(record.protocol, 'pull.protocol') }),
   };
 }
 
 const OUTCOMES: readonly Outcome[] = ['applied', 'noop', 'copied', 'refused'];
-const REFUSALS: readonly Refusal[] = ['too_long', 'full', 'removed', 'stale'];
+const REFUSALS: readonly Refusal[] = ['too_long', 'full', 'removed', 'stale', 'occupied'];
 
 function patchEntryAt(value: unknown, field: string): PatchEntry {
   const record = objectAt(value, field);
@@ -187,8 +222,15 @@ function patchEntryAt(value: unknown, field: string): PatchEntry {
   const revision = revisionAt(record.revision, `${field}.revision`);
   const version = counterAt(record.version, `${field}.version`);
   if (record.op === 'put') {
-    onlyKeys(record, ['op', 'id', 'value', 'revision', 'version'], field);
-    return { op: 'put', id, value: textAt(record.value, `${field}.value`), revision, version };
+    onlyKeys(record, ['op', 'id', 'value', 'revision', 'version', 'contentRevision'], field);
+    return {
+      op: 'put',
+      id,
+      value: textAt(record.value, `${field}.value`),
+      revision,
+      version,
+      ...(record.contentRevision === undefined ? {} : { contentRevision: revisionAt(record.contentRevision, `${field}.contentRevision`) }),
+    };
   }
   if (record.op === 'del') {
     onlyKeys(record, ['op', 'id', 'revision', 'version', 'deletedAt'], field);
@@ -203,11 +245,14 @@ function patchEntryAt(value: unknown, field: string): PatchEntry {
 
 function resultAt(value: unknown, field: string): MutationResult {
   const record = objectAt(value, field);
-  onlyKeys(record, ['clientId', 'mutationId', 'outcome', 'reason', 'targetId', 'revision', 'version'], field);
+  onlyKeys(record, ['clientId', 'mutationId', 'outcome', 'reason', 'targetId', 'revision', 'version', 'contentRevision'], field);
   if (!OUTCOMES.includes(record.outcome as Outcome)) throw new WireError(`${field}.outcome`);
   if (record.reason !== null && !REFUSALS.includes(record.reason as Refusal)) throw new WireError(`${field}.reason`);
   if ((record.outcome === 'refused') !== (record.reason !== null)) throw new WireError(`${field}.reason`);
   if ((record.outcome === 'refused') !== (record.revision === null)) throw new WireError(`${field}.revision`);
+  // A refused mutation changed nothing, so it carries no content revision. The reverse does not hold: a result whose
+  // target is gone, or one stored before the server kept content revisions, reads null too.
+  if (record.outcome === 'refused' && record.contentRevision !== undefined && record.contentRevision !== null) throw new WireError(`${field}.contentRevision`);
   return {
     clientId: hexIdAt(record.clientId, `${field}.clientId`),
     mutationId: counterAt(record.mutationId, `${field}.mutationId`),
@@ -216,6 +261,9 @@ function resultAt(value: unknown, field: string): MutationResult {
     targetId: hexIdAt(record.targetId, `${field}.targetId`),
     revision: record.revision === null ? null : revisionAt(record.revision, `${field}.revision`),
     version: counterAt(record.version, `${field}.version`),
+    ...(record.contentRevision === undefined
+      ? {}
+      : { contentRevision: record.contentRevision === null ? null : revisionAt(record.contentRevision, `${field}.contentRevision`) }),
   };
 }
 
@@ -266,6 +314,9 @@ export function parsePushAnswer(value: unknown): PushAnswer {
     case 'gap':
       onlyKeys(record, ['kind', 'expected'], 'answer');
       return { kind: 'gap', expected: counterAt(record.expected, 'answer.expected') };
+    case 'protocol_changed':
+      onlyKeys(record, ['kind', 'protocols'], 'answer');
+      return { kind: 'protocol_changed', protocols: protocolsAt(record.protocols, 'answer.protocols') };
     default:
       throw new WireError('answer.kind');
   }
@@ -284,6 +335,9 @@ export function parsePullRefusal(value: unknown): PullRefusal {
     case 'cookie_ahead':
       onlyKeys(record, ['kind'], 'answer');
       return { kind: 'cookie_ahead' };
+    case 'protocol_changed':
+      onlyKeys(record, ['kind', 'protocols'], 'answer');
+      return { kind: 'protocol_changed', protocols: protocolsAt(record.protocols, 'answer.protocols') };
     default:
       throw new WireError('answer.kind');
   }
