@@ -5,6 +5,7 @@ import { upgradeClientTables } from '../../src/features/sync/mutations/client';
 import { packMutations, requestBytes } from '../../src/features/sync/mutations/packing';
 import type { RowComposer, RowPolicy } from '../../src/features/sync/mutations/rows';
 import { MutationServer } from '../../src/features/sync/mutations/server';
+import { createSqlGroup, dropSqlGroup } from '../../src/features/sync/mutations/sqlStore';
 import { PROTOCOL, type PushRequest } from '../../src/features/sync/mutations/wire';
 import { backends } from './backends';
 import { browser, hex, settle, world, type Browser, type World } from './harness';
@@ -58,6 +59,22 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('cont
   afterEach(async () => {
     await w.close();
   });
+
+  /** Two browsers claim one id with different text: a's lands, and b keeps its own aside as occupied, out of its page. */
+  const occupiedClaim = async (): Promise<{ a: Browser; b: Browser; id: string }> => {
+    const a = await open();
+    const b = await open();
+    await a.join();
+    await b.join();
+    await a.client.save({ rows: [{ id: hex(7), value: 'copy|', claim: true }], write: async () => undefined });
+    await settle(a);
+    await b.client.save({ rows: [{ id: hex(7), value: 'copy|x', claim: true }], write: async () => undefined });
+    await settle(b, a);
+    const kept = (await b.client.snapshot()).kept;
+    expect(kept.map((row) => [row.reason, row.value])).toEqual([['occupied', 'copy|x']]);
+    expect(await b.values()).toEqual(['copy|']);
+    return { a, b, id: kept[0]!.id };
+  };
 
   it.each(['tags', 'content'] as const)('lands a tags-only save and a content save from one base when the %s push comes first', async (first) => {
     const a = await open();
@@ -316,6 +333,80 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('cont
     await settle(a);
     expect(await a.values()).toEqual(['short|budget,more']);
     expect((await a.client.snapshot()).kept).toEqual([]);
+  });
+
+  it('keeps a row kept too long when a save only reorders its tags, a change the composer counts as none', async () => {
+    const a = await open();
+    await a.join();
+    await a.save([{ id: hex(1), value: 'text|' }]);
+    await settle(a);
+    const long = 'x'.repeat(30_000);
+    await a.save([{ id: hex(1), value: `${long}|budget,more` }]);
+    expect((await a.client.snapshot()).kept.map((row) => [row.reason, row.value === `${long}|budget,more`])).toEqual([['too_long', true]]);
+    await a.save([{ id: hex(1), value: `${long}|more,budget` }]);
+    // the page keeps the long text, never the account's older value written back over it
+    expect((await a.values()).map((value) => value === `${long}|more,budget`)).toEqual([true]);
+    expect((await a.client.snapshot()).kept.map((row) => [row.reason, row.value === `${long}|more,budget`])).toEqual([['too_long', true]]);
+    expect(await pendingOf(a)).toEqual([]);
+  });
+
+  it('repairs a row the account cannot read when a save only reorders its tags', async () => {
+    const a = await open();
+    await a.join();
+    await a.save([{ id: hex(1), value: 'healthy|x,y' }]);
+    await settle(a);
+    await w.opened.adapter.run(`UPDATE ${w.opened.prefix}rows SET stored = ?, version = 99 WHERE id = ?`, ['garbage', hex(1)]);
+    await w.opened.adapter.run(`UPDATE ${w.opened.prefix}groups SET version = 99 WHERE scope = ?`, [w.scope]);
+    await settle(a);
+    expect((await a.client.snapshot()).kept).toMatchObject([{ id: hex(1), value: 'healthy|x,y', reason: 'unreadable' }]);
+    await a.save([{ id: hex(1), value: 'healthy|y,x' }]);
+    expect((await pendingOf(a)).map((mutation) => mutation.name)).toEqual(['edit']);
+    await settle(a);
+    expect((await a.client.snapshot()).kept).toEqual([]);
+    expect(await a.values()).toEqual(['healthy|y,x']);
+  });
+
+  it('hands the page a restored occupied claim, so its next save keeps it', async () => {
+    const { a, b, id } = await occupiedClaim();
+    expect(await b.client.restoreKept(id)).toBe(true);
+    expect(await b.values()).toEqual(['copy|', 'copy|x']);
+    await b.save(await b.blocks());
+    await settle(b, a);
+    expect(await b.values()).toEqual(['copy|', 'copy|x']);
+    expect((await b.client.snapshot()).kept).toEqual([]);
+    expect((await a.client.snapshot()).visible.map((row) => row.value).sort()).toEqual(['copy|', 'copy|x']);
+  });
+
+  it('keeps an occupied claim aside when the group goes and through the next join, until it is restored', async () => {
+    const { b, id } = await occupiedClaim();
+    const kept = (await b.client.snapshot()).kept;
+    await dropSqlGroup(w.opened.adapter, w.opened.prefix, w.scope);
+    expect(await b.client.pull()).toEqual({ kind: 'off' });
+    expect((await b.client.snapshot()).kept).toEqual(kept);
+    expect((await b.client.backedUp(await b.blocks())).unbacked).toContainEqual({ id, value: 'copy|x' });
+    w.group = hex(0x6411);
+    await createSqlGroup(w.opened.adapter, w.opened.prefix, w.scope, w.group);
+    expect(await b.join()).toEqual({ kind: 'applied' });
+    await settle(b);
+    expect((await b.client.snapshot()).kept).toEqual(kept);
+    expect(await b.client.restoreKept(id)).toBe(true);
+    await settle(b);
+    expect(await b.values()).toEqual(['copy|', 'copy|x']);
+    expect((await b.client.snapshot()).kept).toEqual([]);
+  });
+
+  it('keeps an occupied claim aside when the browser declines the group and joins it again', async () => {
+    const { b } = await occupiedClaim();
+    const kept = (await b.client.snapshot()).kept;
+    await b.client.decline(w.group);
+    expect(await b.join()).toEqual({ kind: 'applied' });
+    expect((await b.client.snapshot()).kept).toEqual(kept);
+  });
+
+  it('counts an occupied claim as not backed up, so a removal is not confirmed over it', async () => {
+    const { b, id } = await occupiedClaim();
+    await b.client.beginRemoval();
+    expect(await b.client.backedUp(await b.blocks())).toMatchObject({ checked: true, reason: null, unbacked: [{ id, value: 'copy|x' }] });
   });
 
   it.each([
