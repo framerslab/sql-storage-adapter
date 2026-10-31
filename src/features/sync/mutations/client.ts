@@ -946,9 +946,14 @@ export class MutationClient {
    * under the id `visible` showed it at while the refusal was pending: beside a live row, the copy's id the mutation
    * would have taken; at a deleted or missing row, that row's id; beside an unreadable row, that row's id, unless this
    * browser keeps that row's text already, when a different value goes under the copy's id and the same value adds
-   * nothing. A claim refused as occupied keeps its journal chain's final value, once for the claim and every change made
-   * on it, under the copy id of the claim's own mutation (which the server never takes, since a claim is never copied)
-   * and the reason `occupied`; nothing of the chain is sent again.
+   * nothing. An amend refused as stale (a row the account cannot open, or a server with no composer) keeps its value at
+   * the row's id with the reason `unreadable` and the row's revision, as a pull's unreadable row does, so the page keeps
+   * the text and `repairUnreadable` or a later save changes the row; a different value this browser keeps there already
+   * goes under the copy's id. A change refused as removed at an id the account holds no row at and this browser keeps
+   * a refused value at (a change made on a refused copy shown beside its row) takes that kept row's place under its
+   * reason, since the account removed nothing there. A claim refused as occupied keeps its journal chain's final value,
+   * once for the claim and every change made on it, under the copy id of the claim's own mutation (which the server
+   * never takes, since a claim is never copied) and the reason `occupied`; nothing of the chain is sent again.
    */
   private async dropAcknowledged(trx: StorageAdapter, m: Membership, acknowledged: number): Promise<void> {
     const canonical = await this.canonical(trx);
@@ -972,19 +977,27 @@ export class MutationClient {
             kept.set(id, row);
           }
         }
-      } else if (result !== null && result.outcome === 'refused' && result.reason !== null && result.reason !== 'stale' && pending.mutation.name !== 'delete') {
+      } else if (result !== null && result.outcome === 'refused' && result.reason !== null && pending.mutation.name !== 'delete' && (result.reason !== 'stale' || pending.mutation.name === 'amend')) {
         const value = await this.localIncoming(trx, m, pending);
         if (value !== null) {
           const held = canonical.get(result.targetId);
           const there = kept.get(result.targetId);
           const copyId = (): Promise<string> => copyIdOf({ group: m.group as string, clientId: m.clientId as string, mutationId: String(pending.mutationId) });
-          let id: string | null = result.targetId;
-          if (held !== undefined && held.state === 'live') id = await copyId();
-          else if (held !== undefined && held.state === 'unreadable' && there !== undefined) id = there.value === value ? null : await copyId();
-          if (id !== null) {
-            const row: KeptRow = { id, value, reason: result.reason, group: m.group, revision: null };
+          let row: KeptRow | null;
+          if (result.reason === 'stale') {
+            if (there === undefined) row = { id: result.targetId, value, reason: 'unreadable', group: m.group, revision: held?.revision ?? null };
+            else row = there.value === value ? null : { id: await copyId(), value, reason: 'unreadable', group: m.group, revision: null };
+          } else if (held === undefined && result.reason === 'removed' && there !== undefined && there.reason !== 'occupied') {
+            row = { ...there, value };
+          } else {
+            let id: string | null = result.targetId;
+            if (held !== undefined && held.state === 'live') id = await copyId();
+            else if (held !== undefined && held.state === 'unreadable' && there !== undefined) id = there.value === value ? null : await copyId();
+            row = id === null ? null : { id, value, reason: result.reason, group: m.group, revision: null };
+          }
+          if (row !== null) {
             await this.keep(trx, row);
-            kept.set(id, row);
+            kept.set(row.id, row);
           }
         }
       }
