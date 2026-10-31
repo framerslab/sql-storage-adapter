@@ -16,7 +16,10 @@ function checkPrefix(prefix: string): void {
   if (!PREFIX.test(prefix)) throw new Error('a store prefix is a lower-case SQL identifier ending in an underscore');
 }
 
-/** The store's tables. */
+/**
+ * The store's tables. `CREATE TABLE IF NOT EXISTS` leaves a table an earlier release made as it was, so a server runs
+ * `upgradeSqlMutationStore` after these on every start, before it takes a request.
+ */
 export function mutationStoreDdl(prefix: string): string[] {
   checkPrefix(prefix);
   return [
@@ -31,19 +34,29 @@ export function mutationStoreDdl(prefix: string): string[] {
 /**
  * Brings a store made before content revisions to this release: the two columns on the rows and the results where
  * they are missing, and each row's content revision set to its revision where it has none. A second run changes
- * nothing. Each statement runs alone, outside a transaction, since a failed probe ends a transaction on Postgres.
+ * nothing, and a column another server's upgrade added between this one's check and its change counts as added, so
+ * servers that start at once on one store each finish. Each statement runs alone, outside a transaction, since a
+ * failed probe ends a transaction on Postgres. Run it after `mutationStoreDdl` on every start.
  */
 export async function upgradeSqlMutationStore(adapter: StorageAdapter, prefix: string): Promise<void> {
   checkPrefix(prefix);
+  const present = async (table: string, column: string): Promise<boolean> => {
+    try {
+      await adapter.all(`SELECT ${column} FROM ${prefix}${table} WHERE 1 = 0`);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   for (const table of ['rows', 'results']) {
     for (const [column, type] of [['content_client', 'TEXT'], ['content_mutation', 'BIGINT']] as const) {
-      let present = true;
+      if (await present(table, column)) continue;
       try {
-        await adapter.all(`SELECT ${column} FROM ${prefix}${table} WHERE 1 = 0`);
-      } catch {
-        present = false;
+        await adapter.run(`ALTER TABLE ${prefix}${table} ADD COLUMN ${column} ${type}`);
+      } catch (error) {
+        // another server's upgrade added it between the check and the change
+        if (!(await present(table, column))) throw error;
       }
-      if (!present) await adapter.run(`ALTER TABLE ${prefix}${table} ADD COLUMN ${column} ${type}`);
     }
   }
   await adapter.run(`UPDATE ${prefix}rows SET content_client = rev_client, content_mutation = rev_mutation WHERE content_client IS NULL OR content_mutation IS NULL`);
