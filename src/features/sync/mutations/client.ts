@@ -172,7 +172,10 @@ export interface BackupCheck {
   /** False when the check could not run: not joined, recovering, sends stopped, or a mutation pending. */
   checked: boolean;
   reason: 'not_joined' | 'recovering' | 'sends_blocked' | 'pending' | null;
-  /** The blocks no acknowledged readable account copy holds (all of them when the check could not run). */
+  /**
+   * The blocks no acknowledged readable account copy holds (all of them when the check could not run), then every row
+   * kept as `occupied`, whose value no block holds.
+   */
   unbacked: Array<{ id: string | null; value: string }>;
   /** What a removal must present: the membership, the counters and the kept rows as they were checked. */
   stamp: string;
@@ -504,16 +507,26 @@ export class MutationClient {
 
   /**
    * The mutations a save of `rows` sends, planned with the policy's composer, but for a kept row a save changes at its
-   * revision (one the account cannot read, or one kept too long): its amend becomes an edit carrying the whole new value,
-   * since the server refuses an amend of an unreadable row, and a delta from a value the account never held would drop
-   * what that value added.
+   * revision (one the account cannot read, or one kept too long): an edit carrying the whole new value whenever the
+   * value differs, as without a composer. The server refuses an amend of an unreadable row; a delta from a value the
+   * account never held would drop what that value added; and a change the composer counts as none (tags in another
+   * order) would send nothing, so the save would release the kept row and write the account's older value over the page.
    */
   private plan(before: ReadonlyMap<string, VisibleRow>, rows: ReadonlyArray<{ id: string; value: string; claim?: boolean }>): RowMutation[] {
-    const values = new Map(rows.map((row) => [row.id, row.value]));
-    return planRowChanges([...before.values()].map(plannedOf), rows, this.options.policy.composer).map((mutation): RowMutation => {
-      if (mutation.name !== 'amend' || before.get(mutation.args.id)?.source !== 'kept') return mutation;
-      return { name: 'edit', args: { id: mutation.args.id, expected: mutation.args.expected, value: values.get(mutation.args.id) as string } };
-    });
+    const planned = planRowChanges([...before.values()].map(plannedOf), rows, this.options.policy.composer);
+    const changes = new Map(planned.filter((mutation) => mutation.name !== 'delete').map((mutation): [string, RowMutation] => [mutation.args.id, mutation]));
+    const mutations: RowMutation[] = [];
+    for (const row of rows) {
+      const shown = before.get(row.id);
+      if (shown !== undefined && shown.source === 'kept' && shown.revision !== null && !plannedOf(shown).local) {
+        if (shown.value !== row.value) mutations.push({ name: 'edit', args: { id: row.id, expected: shown.revision, value: row.value } });
+        continue;
+      }
+      const mutation = changes.get(row.id);
+      if (mutation !== undefined) mutations.push(mutation);
+    }
+    // the deletes last, in the order the planner gave them
+    return [...mutations, ...planned.filter((mutation) => mutation.name === 'delete')];
   }
 
   /** Sends the pending mutations in id order. A sent push acknowledges nothing: the pull after it does. */
@@ -582,8 +595,9 @@ export class MutationClient {
         removing: false,
       };
       await this.clearTransport(trx);
-      // rows kept for an earlier group are merged again as ordinary blocks of the caller's data
-      await trx.run(`DELETE FROM ${this.p}kept WHERE scope = ?`, [this.scope]);
+      // rows kept for an earlier group are merged again as ordinary blocks of the caller's data; an occupied row, which
+      // no block holds, stays kept until its explicit recovery
+      await trx.run(`DELETE FROM ${this.p}kept WHERE scope = ? AND reason <> 'occupied'`, [this.scope]);
       await this.saveMembership(trx, next);
       return next;
     });
@@ -664,7 +678,7 @@ export class MutationClient {
 
   /**
    * Leaves the group an answer said is gone, only while `context` still holds: the canonical values become the
-   * comparison base, every transport record and kept row goes, and the caller's data stays as it is.
+   * comparison base, every transport record and kept row but an occupied one goes, and the caller's data stays as it is.
    */
   async leave(context: RequestContext): Promise<SyncOutcome> {
     return this.locked(async (trx, m): Promise<SyncOutcome> => {
@@ -674,7 +688,8 @@ export class MutationClient {
         if (row.state === 'live' && row.value !== null) await trx.run(`INSERT INTO ${this.p}base (scope, id, value) VALUES (?, ?, ?)`, [this.scope, row.id, row.value]);
       }
       await this.clearTransport(trx);
-      await trx.run(`DELETE FROM ${this.p}kept WHERE scope = ?`, [this.scope]);
+      // the caller's data holds every kept value but an occupied row's, which stays kept until its explicit recovery
+      await trx.run(`DELETE FROM ${this.p}kept WHERE scope = ? AND reason <> 'occupied'`, [this.scope]);
       await this.saveMembership(trx, { ...m, state: 'off', group: null, clientId: null, epoch: null, cookie: null, nextMutationId: 1, sends: 'open', recovering: false, removing: false, activation: this.randomId() });
       return { kind: 'off' };
     });
@@ -709,24 +724,28 @@ export class MutationClient {
   /**
    * Whether `blocks` are backed by the account: checked only while joined, with nothing pending, no recovery open and
    * sends open; a block is backed when a readable canonical row of its id holds exactly its text and no kept row of
-   * that id exists. A block with no id is never backed.
+   * that id exists. A block with no id is never backed. A row kept as `occupied` holds a value no block and no account
+   * row holds, so it is answered among the unbacked ones in every state.
    */
   async backedUp(blocks: ReadonlyArray<{ id: string | null; value: string }>): Promise<BackupCheck> {
     return this.locked(async (trx, m): Promise<BackupCheck> => {
       const stamp = await this.stampOf(trx, m);
-      const all = blocks.map((block) => ({ id: block.id, value: block.value }));
+      const kept = await this.keptRows(trx);
+      // an occupied row's value is in no block and in no account row, so it is never backed
+      const occupied: BackupCheck['unbacked'] = [...kept.values()].filter((row) => row.reason === 'occupied').map((row) => ({ id: row.id, value: row.value }));
+      const given = blocks.map((block) => ({ id: block.id, value: block.value }));
+      const all = [...given, ...occupied];
       if (m.state !== 'joined') return { checked: false, reason: 'not_joined', unbacked: all, stamp };
       if (m.recovering) return { checked: false, reason: 'recovering', unbacked: all, stamp };
       if (m.sends !== 'open') return { checked: false, reason: 'sends_blocked', unbacked: all, stamp };
       if ((await this.pendingRows(trx)).length > 0) return { checked: false, reason: 'pending', unbacked: all, stamp };
       const canonical = await this.canonical(trx);
-      const kept = await this.keptRows(trx);
-      const unbacked = all.filter((block) => {
+      const unbacked = given.filter((block) => {
         if (block.id === null || kept.has(block.id)) return true;
         const row = canonical.get(block.id);
         return row === undefined || row.state !== 'live' || row.value !== block.value;
       });
-      return { checked: true, reason: null, unbacked, stamp };
+      return { checked: true, reason: null, unbacked: [...unbacked, ...occupied], stamp };
     }, false);
   }
 
@@ -795,16 +814,22 @@ export class MutationClient {
    * `differs` and `occupied` rows); false when it cannot be. A `removed` row is never put back here: its id is a
    * tombstone the server refuses for good, so its return is a separate explicit save of a new row under a new id, the
    * caller's, with the kept value; nothing here creates or re-stamps it. A recovery row whose id the restored server
-   * tombstoned comes back from its create refused `removed` and is kept as `removed`.
+   * tombstoned comes back from its create refused `removed` and is kept as `removed`. What the create changes in the
+   * visible rows goes to `materialize`, so an `occupied` row, which the page held no block of, comes into the page.
    */
   async restoreKept(id: string): Promise<boolean> {
     return this.locked(async (trx, m) => {
       if (m.state !== 'joined' || m.removing) return false;
       const row = (await this.keptRows(trx)).get(id);
       if (row === undefined || row.reason === 'unreadable' || row.reason === 'removed' || row.value.length > this.options.policy.maxUnits) return false;
+      const before = await this.visible(trx, m);
       const state = await this.issue(trx, m, { name: 'create', args: { id: row.id, value: row.value } });
       await this.unkeep(trx, row.id);
       await this.saveMembership(trx, state);
+      // an occupied row was out of view, so the page holds no block of it: it gets the row as any change of the
+      // visible rows, or its next save would delete it
+      const change = changeOf(before, await this.visible(trx, state));
+      if (!emptyChange(change)) await this.options.materialize(trx, change);
       return true;
     });
   }
