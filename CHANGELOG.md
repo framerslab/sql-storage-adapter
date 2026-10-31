@@ -10,7 +10,7 @@
 - `upgradeSqlMutationStore(adapter, prefix)` adds the content revision columns to a reference store an earlier release made; run it after `mutationStoreDdl` on every start. `upgradeClientTables`, which `client.open()` runs, does the same for the client's tables, and a client with a protocol 1 queue keeps that queue's pending values as recovery rows and starts a new client id.
 
 ### Changed
-- The reference store's `rows` and `results` tables have two columns more (`content_client`, `content_mutation`), and `StoredRow` and `MutationResult` carry `contentRevision`: a store of an application's own reads and writes it.
+- The reference store's `rows` table has three columns more (`content_client`, `content_mutation` and `content_for`, the revision the row had when its content revision was written, so a row a server of an earlier release writes during a rolling deploy reads its own revision as its content revision) and its `results` table two (`content_client`, `content_mutation`). `StoredRow` and `MutationResult` carry `contentRevision`: a store of an application's own reads and writes it.
 - A client's tables have the columns protocol 2 added and a table of retired client ids; a joined protocol 1 client with nothing pending takes a whole snapshot at its first pull after the upgrade.
 
 ## [0.8.3] - 2026-10-25
