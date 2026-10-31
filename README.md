@@ -70,7 +70,7 @@ npm install better-sqlite3            # Native SQLite for Node/Electron
 npm install @capacitor-community/sqlite  # Capacitor / mobile
 ```
 
-`pg` and `sql.js` are dependencies of the package, listed once each, so they install with it. `better-sqlite3`, `@capacitor-community/sqlite`, `electron` and `@aws-sdk/client-s3` are optional peers: install the ones you use.
+`pg` and `sql.js` are dependencies of the package, listed once each, so they install with it, and `@types/sql.js` with them, so the declarations' `sql.js` import has types in a project that checks the declarations it reads (no `skipLibCheck`). `better-sqlite3`, `@capacitor-community/sqlite`, `electron` and `@aws-sdk/client-s3` are optional peers: install the ones you use.
 
 > Windows users: ensure the Visual Studio Build Tools (C++ workload) are installed before adding `better-sqlite3`. On Linux, install `python3`, `build-essential`, and `libssl-dev` prior to `npm install`.
 
