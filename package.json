@@ -270,6 +270,7 @@
     "esbuild": "^0.28.2"
   },
   "dependencies": {
+    "@types/sql.js": "^1.4.11",
     "pg": "^8.13.1",
     "sql.js": "^1.11.0"
   },
