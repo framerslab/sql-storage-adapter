@@ -362,7 +362,8 @@ export class MutationClient {
 
   /**
    * Makes the client's tables, upgrades the ones an earlier release made, and retires a protocol 1 queue that still has
-   * pending work (see `retireOldQueue`); run once before anything else.
+   * pending work (see `retireOldQueue`); a joined protocol 1 client with none takes a whole snapshot at its next pull.
+   * Run once before anything else.
    */
   async open(): Promise<void> {
     await this.options.adapter.transaction(async (trx) => {
@@ -374,17 +375,24 @@ export class MutationClient {
 
   /**
    * A protocol 1 queue with pending work is retired without acknowledgement: its whole journal stays under its old
-   * identity, every journal payload is kept as local recovery, and only the pending transport set is cleared. A fresh
-   * client id asks for a whole snapshot. The retirement marker keeps the old journal out of every replay and every
-   * transport reset. The marker, the recovery rows, the pending set's end, the fresh identity and the protocol commit
-   * together.
+   * identity, the payload of each mutation still pending is kept as local recovery, and only the pending transport set
+   * is cleared. A journal record the server acknowledged is not kept again: its value is the account's, or was kept
+   * when its refusal was acknowledged, and the journal, never trimmed on acknowledgement, holds every value the client
+   * ever had acknowledged. A fresh client id asks for a whole snapshot. The retirement marker keeps the old journal out
+   * of every replay and every transport reset. The marker, the recovery rows, the pending set's end, the fresh identity
+   * and the protocol commit together. A joined client with nothing pending keeps its identity and drops its cookie: a
+   * protocol 1 pull left out the content revisions, so the upgrade gave each row its whole revision as its content
+   * revision, which is not the account's for a row a tags-only amend changed, and only a whole snapshot sends an
+   * unchanged row again.
    */
   private async retireOldQueue(): Promise<void> {
     await this.locked(async (trx, m) => {
       const stored = await trx.get<{ protocol: unknown }>(`SELECT protocol FROM ${this.p}membership WHERE scope = ?`, [this.scope]);
       if (stored === null || Number(stored.protocol) >= PROTOCOL) return;
       let state = m;
-      if ((await this.pendingRows(trx)).length > 0 && m.state === 'joined' && m.group !== null && m.clientId !== null) {
+      const pending = await this.pendingRows(trx);
+      if (pending.length > 0 && m.state === 'joined' && m.group !== null && m.clientId !== null) {
+        const queued = new Set(pending.map((row) => row.mutationId));
         const group = m.group;
         const clientId = m.clientId;
         await trx.run(`INSERT INTO ${this.p}retired_clients (scope, grp, client_id, protocol, next_mutation_id) VALUES (?, ?, ?, ?, ?)`, [this.scope, group, clientId, Number(stored.protocol), m.nextMutationId]);
@@ -393,6 +401,7 @@ export class MutationClient {
           [this.scope, group, clientId],
         );
         for (const record of journal) {
+          if (!queued.has(readCounter(record.mutation_id))) continue;
           const mutation = rowMutationOf(record.name, JSON.parse(record.args));
           if (mutation.name === 'delete') continue;
           const value = record.incoming_value ?? (mutation.name === 'amend' ? null : mutation.args.value);
@@ -402,6 +411,8 @@ export class MutationClient {
         }
         await trx.run(`DELETE FROM ${this.p}pending WHERE scope = ?`, [this.scope]);
         state = { ...m, clientId: this.randomId(), nextMutationId: 1, cookie: null, sends: 'open', recovering: false };
+      } else if (m.state === 'joined') {
+        state = { ...m, cookie: null };
       }
       await this.saveMembership(trx, state);
       await trx.run(`UPDATE ${this.p}membership SET protocol = ? WHERE scope = ?`, [PROTOCOL, this.scope]);
