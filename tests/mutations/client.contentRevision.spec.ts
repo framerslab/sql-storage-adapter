@@ -390,6 +390,22 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('cont
     expect(await a.values()).toEqual(['healthy|y,x']);
   });
 
+  it('keeps the text of an amend the account refuses as stale once it cannot open the row, though no pull resends the row', async () => {
+    const a = await open();
+    await a.join();
+    await a.save([{ id: hex(1), value: 'old|' }]);
+    await settle(a);
+    await a.save([{ id: hex(1), value: 'new|' }]);
+    expect((await pendingOf(a)).map((mutation) => mutation.name)).toEqual(['amend']);
+    // the account can no longer open its copy, as a lost key leaves it, and the row's version stays as it was
+    await w.opened.adapter.run(`UPDATE ${w.opened.prefix}rows SET stored = ? WHERE id = ?`, ['garbage', hex(1)]);
+    await settle(a);
+    const snapshot = await a.client.snapshot();
+    expect(snapshot.pending).toBe(0);
+    expect(await a.values()).toEqual(['new|']);
+    expect(snapshot.kept.map((row) => [row.id, row.value])).toEqual([[hex(1), 'new|']]);
+  });
+
   it('hands the page a restored occupied claim, so its next save keeps it', async () => {
     const { a, b, id } = await occupiedClaim();
     expect(await b.client.restoreKept(id)).toBe(true);
