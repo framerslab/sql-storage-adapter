@@ -296,7 +296,7 @@ A browser keeps a row in its own table, shown over the server's rows with a reas
 | `too_long` | Its value is longer than `maxUnits`, at a save or a join, or as the server refused it |
 | `full` | The server refused it: the scope holds `maxRows` rows |
 | `removed` | The server refused it because its row was deleted, or the row of a kept `unreadable` or `differs` value was deleted |
-| `unreadable` | The server holds the row and cannot open it: the browser keeps the value it showed, or the value of an `amend` the server refused as `stale` |
+| `unreadable` | The server holds the row and cannot open it: the browser keeps the value it showed, or the value of an `amend` the server refused as `stale`, which is marked `differs` while the browser's copy of the row reads another value |
 | `recovery` | A row kept aside across a restore, or one a full snapshot no longer holds, until the server's row reads its value; or a retired client's unsent value |
 | `differs` | A row kept for `recovery` or `unreadable` whose row on the server reads another value |
 | `occupied` | A claim the server refused because another value holds its id, with every change made on it, out of the visible rows ([claim](#claim)) |

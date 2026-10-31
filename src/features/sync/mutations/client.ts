@@ -948,8 +948,9 @@ export class MutationClient {
    * browser keeps that row's text already, when a different value goes under the copy's id and the same value adds
    * nothing. An amend refused as stale (a row the account cannot open, or a server with no composer) keeps its value at
    * the row's id with the reason `unreadable` and the row's revision, as a pull's unreadable row does, so the page keeps
-   * the text and `repairUnreadable` or a later save changes the row; a different value this browser keeps there already
-   * goes under the copy's id. A change refused as removed at an id the account holds no row at and this browser keeps
+   * the text: it stays `unreadable`, for `repairUnreadable`, where this browser's copy of the row is unreadable too, and
+   * `reconcileKept` marks it `differs` where that copy reads another value; a different value this browser keeps there
+   * already goes under the copy's id. A change refused as removed at an id the account holds no row at and this browser keeps
    * a refused value at (a change made on a refused copy shown beside its row) takes that kept row's place under its
    * reason, since the account removed nothing there. A claim refused as occupied keeps its journal chain's final value,
    * once for the claim and every change made on it, under the copy id of the claim's own mutation (which the server
