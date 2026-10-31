@@ -56,6 +56,37 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      # A PostgreSQL that offers TLS with a certificate made for this run, for
+      # localhost, which no public certificate authority signed, so that
+      # tests/postgres.exporter.tls.spec.ts can show pg_dump checking a server
+      # as pg does. The spec reads POSTGRES_TLS_TEST_URL and
+      # POSTGRES_TLS_ROOT_CERT. The server reads its key only when the
+      # postgres user (uid 999 in the image) owns it with mode 0600.
+      - name: Start a PostgreSQL that offers TLS
+        run: |
+          dir="$RUNNER_TEMP/pg-tls"
+          mkdir -p "$dir"
+          openssl req -new -x509 -days 2 -nodes -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -keyout "$dir/server.key" -out "$dir/server.crt"
+          chmod 644 "$dir/server.crt"
+          chmod 600 "$dir/server.key"
+          sudo chown 999:999 "$dir/server.key"
+          docker run -d --name pg-tls -p 5433:5432 \
+            -e POSTGRES_USER=adapter -e POSTGRES_PASSWORD=adapter -e POSTGRES_DB=adapter_test \
+            -v "$dir:/tls:ro" postgres:16 \
+            -c ssl=on -c ssl_cert_file=/tls/server.crt -c ssl_key_file=/tls/server.key
+          for i in $(seq 1 90); do
+            if docker exec pg-tls pg_isready -U adapter -d adapter_test -h localhost >/dev/null 2>&1; then
+              echo "POSTGRES_TLS_TEST_URL=postgresql://adapter:adapter@localhost:5433/adapter_test" >> "$GITHUB_ENV"
+              echo "POSTGRES_TLS_ROOT_CERT=$dir/server.crt" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs pg-tls
+          exit 1
+
       - name: Lint
         run: npm run lint || true
 
@@ -133,6 +164,21 @@ jobs:
           tsc="$GITHUB_WORKSPACE/node_modules/.bin/tsc"
           "$tsc" --version
           "$tsc" --module nodenext --moduleResolution nodenext --strict --skipLibCheck --noEmit index.ts
+          # With library checks on, as a consumer that checks the declarations it reads compiles them: every module
+          # the packed declarations import has types once the package is installed. Errors in other packages'
+          # declarations (@auth/core, pg-protocol) are theirs; an error in this package's declarations fails the step.
+          code=0
+          "$tsc" --module nodenext --moduleResolution nodenext --strict --noEmit index.ts > lib-check.txt 2>&1 || code=$?
+          own="$(grep -E '^node_modules/@framers/sql-storage-adapter/.*error TS[0-9]+' lib-check.txt || true)"
+          if [ -n "$own" ]; then
+            echo "$own"
+            exit 1
+          fi
+          # A compiler that fails and prints no error line checked nothing.
+          if [ "$code" -ne 0 ] && ! grep -q 'error TS' lib-check.txt; then
+            cat lib-check.txt
+            exit 1
+          fi
 
       # The CommonJS build and the per-adapter entries, as a consumer installs
       # them: a CommonJS TypeScript consumer under node16 resolution, require()

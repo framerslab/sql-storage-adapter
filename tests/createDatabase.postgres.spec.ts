@@ -41,6 +41,7 @@ describe('createDatabase - choosing Postgres', () => {
     }
     for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
   });
 
   it('fails when the Postgres URL it was given cannot be reached, instead of opening SQLite', async () => {
@@ -72,6 +73,33 @@ describe('createDatabase - choosing Postgres', () => {
     const adapter = keep(await createDatabase({ file: tempFile() }));
 
     expect(['better-sqlite3', 'sqljs']).toContain(adapter.kind);
+  });
+
+  it('opens the local default for a URL that is not a PostgreSQL URL, as 0.6.13 did', async () => {
+    // A Prisma-style DATABASE_URL in development.
+    const adapter = keep(await createDatabase({ url: 'file:./dev.db', file: tempFile() }));
+
+    expect(['better-sqlite3', 'sqljs']).toContain(adapter.kind);
+  });
+
+  it('refuses connectDatabase() options that name no server, and opens no local file', async () => {
+    // connectDatabase({ connectionString: process.env.DATABASE_URL }) with the
+    // variable unset. The resolver's default file lives under the working
+    // directory, so the spec points that at a new folder.
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'connect-database-'));
+    dirs.push(cwd);
+    vi.spyOn(process, 'cwd').mockReturnValue(cwd);
+
+    let failure: unknown;
+    try {
+      keep(await connectDatabase({ connectionString: undefined }));
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(/no PostgreSQL server/);
+    expect(fs.existsSync(path.join(cwd, 'db_data', 'app.sqlite3'))).toBe(false);
   });
 
   describe.skipIf(!POSTGRES_TEST_URL)('against a Postgres server', () => {

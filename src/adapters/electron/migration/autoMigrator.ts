@@ -24,6 +24,7 @@
  */
 
 import fs from 'fs';
+import { createRequire } from 'module';
 import path from 'path';
 import type { StorageAdapter } from '../../../core/contracts';
 
@@ -82,7 +83,10 @@ export interface AutoMigratorConfig {
   tableName?: string;
   /** Enable verbose logging (default: false) */
   verbose?: boolean;
-  /** Get current app version (default: reads from package.json or electron) */
+  /**
+   * Get current app version (default: the version Electron's `app.getVersion()` reports, else the `version` of the
+   * working directory's package.json, else '0.0.0')
+   */
   getAppVersion?: () => string;
 }
 
@@ -561,8 +565,8 @@ export class AutoMigrator {
    */
   private defaultGetAppVersion(): string {
     try {
-      // Try Electron first
-      const { app } = require('electron');
+      // Try Electron first, through a require of this module's own: an ES module has none
+      const { app } = createRequire(import.meta.url)('electron') as { app?: { getVersion?: () => string } };
       if (app?.getVersion) {
         return app.getVersion();
       }

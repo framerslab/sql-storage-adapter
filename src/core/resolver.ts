@@ -117,11 +117,12 @@ export interface StorageResolutionOptions {
    * the segment. Takes the place of a `segment` in `postgres`, `indexedDb` or
    * `capacitor`.
    *
-   * Without it, a candidate whose options name no segment of their own
+   * Without it, a local candidate whose options name no segment of their own
    * (better-sqlite3 and sql.js have none), tried after a candidate whose
    * options named one and failed, opens in that candidate's segment: a
    * resolution that asked for a segment never falls through to the database
-   * every user of the file or the browser shares.
+   * every user of the file or the browser shares. A postgres candidate opens
+   * in the segment of its own options alone.
    */
   segment?: string;
 }
@@ -332,9 +333,9 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
             });
           }
         };
+      // 'sqljs' is not an AdapterKind, but the README lists it and hosts pass it;
+      // it builds what it has always built.
       case 'sqljs':
-      // Not an AdapterKind, but the README lists it and hosts pass it; it builds
-      // what it has always built.
       case 'memory':
         return {
           name: 'sqljs',
@@ -355,14 +356,17 @@ export const resolveStorageAdapter = async (options: StorageResolutionOptions = 
   const quiet = options.quiet === true;
   /**
    * The segment of the first candidate tried whose own options named one. A
-   * candidate after it with no segment of its own opens in it, so a candidate
-   * that asked for a segment and failed never falls through to the database
-   * every user of the file or the browser shares.
+   * local candidate after it (better-sqlite3, sql.js, IndexedDB, Capacitor)
+   * with no segment of its own opens in it, so a candidate that asked for a
+   * segment and failed never falls through to the database every user of the
+   * file or the browser shares. A postgres candidate takes no segment it did
+   * not name: its server's schemas are its own options' to choose, and a pool
+   * of the caller's cannot run in one.
    */
   let askedFor: string | undefined;
 
   for (const candidate of candidates) {
-    const chosen = segment ?? candidate.ownSegment ?? askedFor;
+    const chosen = segment ?? candidate.ownSegment ?? (candidate.name === 'postgres' ? undefined : askedFor);
     askedFor ??= candidate.ownSegment;
     try {
       const adapter = await candidate.build(chosen);

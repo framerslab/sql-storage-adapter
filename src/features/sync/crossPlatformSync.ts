@@ -9,7 +9,7 @@
 
 import type { StorageAdapter } from '../../core/contracts';
 import type { VectorClockData } from './protocol/vectorClock';
-import { mergeClocks, generateDeviceId } from './protocol/vectorClock';
+import { generateDeviceId } from './protocol/vectorClock';
 import type {
   SyncMessage,
   DeltaPush,
@@ -928,7 +928,7 @@ export class CrossPlatformSync {
   private _buildFieldMergers(): Record<string, FieldMerger> {
     const mergers: Record<string, FieldMerger> = {};
 
-    for (const [_table, config] of Object.entries(this._options.tables)) {
+    for (const config of Object.values(this._options.tables)) {
       if (config.fieldMergers) {
         Object.assign(mergers, config.fieldMergers);
       }

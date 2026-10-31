@@ -88,11 +88,13 @@ export interface StorageOpenOptions {
   adapterOptions?: Record<string, unknown>;
   /**
    * SQLite: `true` turns foreign-key enforcement on and `false` turns it off
-   * (`PRAGMA foreign_keys`) when the adapter opens, and the setting holds
-   * when sql.js reopens its connection (a save, an export, an import). Left
-   * out, each engine keeps its default: better-sqlite3 is built with
-   * `SQLITE_DEFAULT_FOREIGN_KEYS=1` and enforces them; sql.js, IndexedDB and
-   * Capacitor do not. PostgreSQL always enforces foreign keys and ignores this.
+   * (`PRAGMA foreign_keys`) when the adapter opens. On sql.js and IndexedDB
+   * it holds when sql.js reopens its connection (a save, an export, an
+   * import), as a `PRAGMA foreign_keys` statement run later does. Left out,
+   * each engine keeps its default: better-sqlite3 is built with
+   * `SQLITE_DEFAULT_FOREIGN_KEYS=1` and enforces them, and the Capacitor
+   * plugin turns them on when it opens a database; sql.js and IndexedDB do
+   * not. PostgreSQL always enforces foreign keys and ignores this.
    */
   foreignKeys?: boolean;
 }

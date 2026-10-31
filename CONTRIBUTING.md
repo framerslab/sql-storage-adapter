@@ -38,6 +38,8 @@ By participating in this project, you agree to abide by our code of conduct: be 
 8. Push to your fork
 9. Open a Pull Request
 
+On a pull request from a branch of this repository (not a fork), the Review comments workflow posts ESLint's findings on the lines the pull request adds under `src/` as review comments. Each run also deletes its earlier comments whose finding is gone, unless someone has replied to the comment. The workflow never fails the pull request.
+
 ## Development Setup
 
 ### Prerequisites
@@ -190,14 +192,10 @@ docs: update README with Capacitor examples
 
 ## Release Process
 
-A release is a version bump merged to `master`. The [release workflow](https://github.com/framerslab/sql-storage-adapter/blob/master/.github/workflows/release.yml) runs on every push to `master` that changes `package.json`, a file under `src/` or the workflow itself. It installs, runs the tests and builds; when npm holds no release of `package.json`'s version, it publishes to npm, then creates the GitHub release `v<version>` with the notes of that version's section in `CHANGELOG.md`. The release creates the tag.
+Every push to `master` that changes what the package ships publishes it. The [release workflow](https://github.com/framerslab/sql-storage-adapter/blob/master/.github/workflows/release.yml) decides the version before it installs anything: the newest published version with its patch raised by one, or `package.json`'s version when that is higher. It then installs, runs the tests, builds, publishes to npm and creates the GitHub release `v<version>`, which creates the tag. Nothing is committed to `master`. [RELEASING.md](./RELEASING.md) has the whole decision.
 
-1. **Update the version** in `package.json` following [semantic versioning](https://semver.org/):
-   - **MAJOR**: breaking changes (1.0.0 to 2.0.0)
-   - **MINOR**: new features, backward compatible (1.0.0 to 1.1.0)
-   - **PATCH**: bug fixes, backward compatible (1.0.0 to 1.0.1)
-2. **Add a section to `CHANGELOG.md`** headed `## [x.y.z]`, with what was added, changed, deprecated, removed and fixed.
-3. **Open a pull request** with both changes and merge it to `master` when CI is green. The merge publishes the version.
+- **A fix** needs no release step: its merge publishes the next patch. Add its notes to `CHANGELOG.md` under `## [Unreleased]`.
+- **A new minor or major version**: raise `version` in `package.json` in the pull request, following [semantic versioning](https://semver.org/) (MAJOR for breaking changes, 1.0.0 to 2.0.0; MINOR for new features, backward compatible, 1.0.0 to 1.1.0), and add a section to `CHANGELOG.md` headed `## [x.y.z]` with what was added, changed, deprecated, removed and fixed. The merge publishes that version, with that section as its release notes.
 
 Do not push a version tag by hand: the workflow creates it with the GitHub release.
 

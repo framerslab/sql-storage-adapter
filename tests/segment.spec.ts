@@ -26,17 +26,26 @@ const { capacitorNames, ipc } = vi.hoisted(() => ({
 }));
 
 // @capacitor-community/sqlite is an optional peer that CI does not install; the
-// adapter loads it in open(), and this stands in for it.
+// adapter loads it in open(), and this stands in for it: the native plugin,
+// CapacitorSQLite, and the plugin's SQLiteConnection over it, which makes the
+// connections (tests/capacitorSqliteAdapter.open.spec.ts keeps the native rules).
 vi.mock('@capacitor-community/sqlite', () => ({
-  createConnection: async (name: string) => {
-    capacitorNames.push(name);
-    return {
-      open: async () => undefined,
-      close: async () => undefined,
-      execute: async () => ({ changes: { changes: 0 } }),
-      run: async () => ({ changes: { changes: 0, lastId: 0 } }),
-      query: async () => ({ values: [] }),
-    };
+  CapacitorSQLite: {},
+  SQLiteConnection: class {
+    async createConnection(name: string) {
+      capacitorNames.push(name);
+      return {
+        open: async () => undefined,
+        close: async () => undefined,
+        execute: async () => ({ changes: { changes: 0 } }),
+        run: async () => ({ changes: { changes: 0, lastId: 0 } }),
+        query: async () => ({ values: [] }),
+      };
+    }
+
+    async closeConnection() {
+      return undefined;
+    }
   },
 }));
 
@@ -411,6 +420,29 @@ describe('a segment through createDatabase and the resolver', () => {
       end: async () => undefined,
     };
     const adapter = await resolveStorageAdapter({ postgres: { pool }, indexedDb: { segment: 'agentos' }, quiet: true });
+    adapters.push(adapter);
+
+    expect(adapter.kind).toBe('postgres');
+  });
+
+  // A postgres candidate takes no segment another backend's options named,
+  // tried after it or before: the Postgres adapter refuses a segment on a pool
+  // of the caller's, so the resolution threw.
+  it('opens a pool of the caller tried after an IndexedDB candidate that asked for a segment, without that segment', async () => {
+    // Node has no indexedDB, so the IndexedDB candidate fails.
+    const pool = {
+      query: async () => ({ rows: [] }),
+      connect: async () => {
+        throw new Error('not used: the adapter takes up a pool of the caller without connecting');
+      },
+      end: async () => undefined,
+    };
+    const adapter = await resolveStorageAdapter({
+      priority: ['indexeddb', 'postgres'],
+      postgres: { pool },
+      indexedDb: { segment: 'agentos' },
+      quiet: true,
+    });
     adapters.push(adapter);
 
     expect(adapter.kind).toBe('postgres');

@@ -32,7 +32,7 @@
  * ```
  */
 
-import { BrowserWindow, ipcMain } from 'electron';
+import { BrowserWindow } from 'electron';
 import { BROADCAST_CHANNELS } from '../ipc/channels';
 import type { DbChangeEvent, ConnectionStateEvent } from '../ipc/types';
 

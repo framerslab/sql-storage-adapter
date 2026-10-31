@@ -149,6 +149,36 @@ describe('IndexedDbAdapter durability', () => {
       expect(await storedPragma('commit-pragma-header', 'user_version')).toBe(4);
     });
 
+    it('stores PRAGMA default_cache_size, which lives in the database header, set through get() before it resolves', async () => {
+      // The deprecated pragma writes the suggested cache size at offset 48 of the header; total_changes() counts no row.
+      const adapter = await openWithItems('commit-pragma-cache-size');
+
+      await adapter.get('PRAGMA default_cache_size = 2000');
+
+      expect(await storedPragma('commit-pragma-cache-size', 'default_cache_size')).toBe(2000);
+    });
+
+    // SQLite reads a comment as whitespace between two tokens, a quoted name
+    // needs no space before it (sqlite.org/lang_comment.html), and a string in
+    // single quotes stands for a name where a PRAGMA's goes (parse.y:
+    // nm ::= STRING; cmd ::= PRAGMA nm dbnm EQ nmnum).
+    it.each([
+      ['a block comment before the name', 'get', 'PRAGMA /* note */ user_version = 5', 'user_version', 5],
+      ['a block comment before the =', 'get', 'PRAGMA user_version /* note */ = 6', 'user_version', 6],
+      ['a line comment before the =', 'all', 'PRAGMA user_version -- note\n= 7', 'user_version', 7],
+      ['comments around the schema dot', 'all', 'PRAGMA main/* a */./* b */application_id = 8', 'application_id', 8],
+      ['a quoted name with no space before it', 'get', 'PRAGMA"user_version"=9', 'user_version', 9],
+      ['a name in single quotes', 'get', "PRAGMA 'user_version' = 10", 'user_version', 10],
+      ['a schema and a name in single quotes, with no space before them', 'all', "PRAGMA'main'.'application_id'=11", 'application_id', 11],
+    ] as const)('stores a PRAGMA assignment with %s before it resolves', async (_name, method, sql, pragma, value) => {
+      const dbName = `commit-pragma-comment-${value}`;
+      const adapter = await openWithItems(dbName);
+
+      await (method === 'get' ? adapter.get(sql) : adapter.all(sql));
+
+      expect(await storedPragma(dbName, pragma)).toBe(value);
+    });
+
     it('writes nothing to IndexedDB for PRAGMA reads and connection settings through get() and all()', async () => {
       const adapter = await openWithItems('commit-pragma-reads');
       const puts = vi.spyOn(IDBObjectStore.prototype, 'put');
@@ -161,6 +191,8 @@ describe('IndexedDbAdapter durability', () => {
         expect(await adapter.get('PRAGMA user_version')).toEqual({ user_version: 0 });
         await adapter.get('PRAGMA foreign_keys = ON');
         await adapter.get('PRAGMA cache_size = 500');
+        expect(await adapter.get('PRAGMA /* = */ user_version -- = 3')).toEqual({ user_version: 0 });
+        expect(await adapter.get("PRAGMA 'user_version'")).toEqual({ user_version: 0 });
 
         expect(puts).not.toHaveBeenCalled();
       } finally {
@@ -322,6 +354,16 @@ describe('IndexedDbAdapter durability', () => {
     await adapter.close();
 
     const reopened = await openAdapter('interval-pragma', 'interval');
+    expect(await reopened.get('PRAGMA user_version')).toEqual({ user_version: 7 });
+  });
+
+  it('keeps PRAGMA user_version set through get() with a comment before its = across close() and open()', async () => {
+    const adapter = await openWithItems('interval-pragma-comment', 'interval');
+    await adapter.flush();
+    await adapter.get('PRAGMA user_version /* note */ = 7');
+    await adapter.close();
+
+    const reopened = await openAdapter('interval-pragma-comment', 'interval');
     expect(await reopened.get('PRAGMA user_version')).toEqual({ user_version: 7 });
   });
 

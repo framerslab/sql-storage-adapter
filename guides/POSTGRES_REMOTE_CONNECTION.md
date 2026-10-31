@@ -9,7 +9,8 @@ import { createDatabase } from '@framers/sql-storage-adapter';
 
 // PostgreSQL from DATABASE_URL. createDatabase() opens the database it
 // returns, and does not read DATABASE_URL on its own: pass it as url.
-// strict fails when DATABASE_URL is unset, instead of opening a local file.
+// strict fails when DATABASE_URL is unset, or holds a URL that is not
+// postgres:// or postgresql://, instead of opening a local file.
 const db = await createDatabase({
   url: process.env.DATABASE_URL,
   strict: true
@@ -55,13 +56,24 @@ DATABASE_URL=postgresql://user:pass@prod.db.com/myapp?sslmode=require
 // .env.development
 DATABASE_URL=  # Empty: a local SQLite file (without strict)
 
-// Your code: PostgreSQL where DATABASE_URL is set, a local SQLite file where it
-// is empty. Pass strict: true in production, so an unset DATABASE_URL fails
-// instead of writing to a local file.
+// Your code: PostgreSQL where DATABASE_URL holds a postgres:// or postgresql://
+// URL, a local SQLite file where it is empty or holds another scheme
+// (file:./dev.db). Pass strict: true in production, so an unset DATABASE_URL
+// fails instead of writing to a local file.
 const db = await createDatabase({
   url: process.env.DATABASE_URL,
   strict: process.env.NODE_ENV === 'production'
 });
+```
+
+### 4. connectDatabase()
+
+`connectDatabase()` opens PostgreSQL alone, with no local fallback in any runtime, from any connection string pg reads (a `socket:` URL or a socket path too), a `pool` of your own, or options with a host, database or user. Given none, as with an unset `DATABASE_URL`, it throws before it opens anything:
+
+```typescript
+import { connectDatabase } from '@framers/sql-storage-adapter';
+
+const db = await connectDatabase({ connectionString: process.env.DATABASE_URL });
 ```
 
 ## Cloud Provider Examples
