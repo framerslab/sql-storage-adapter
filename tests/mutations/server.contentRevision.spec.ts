@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import type { StorageAdapter, StorageParameters } from '../../src/core/contracts';
 import type { RowComposer, RowMutation } from '../../src/features/sync/mutations/rows';
 import { MutationServer } from '../../src/features/sync/mutations/server';
 import { mutationStoreDdl, upgradeSqlMutationStore } from '../../src/features/sync/mutations/sqlStore';
@@ -146,5 +147,31 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('%s: 
     const [row] = await w.opened.adapter.all<{ content_client: string; content_mutation: unknown; stored: string }>(`SELECT content_client, content_mutation, stored FROM ${p}rows WHERE id = ?`, [hex(8)]);
     expect([row?.content_client, Number(row?.content_mutation), row?.stored]).toEqual([A, 3, 'x']);
     expect(await w.opened.adapter.all(`SELECT content_client, content_mutation FROM ${p}results WHERE 1 = 0`)).toEqual([]);
+  });
+
+  it('finishes the store upgrade when another server adds a column between its check and its change', async () => {
+    w = await world(backend);
+    const p = `${w.opened.prefix}old_`;
+    const real = w.opened.adapter;
+    await real.exec(`CREATE TABLE ${p}rows (scope TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, stored TEXT, rev_client TEXT NOT NULL, rev_mutation BIGINT NOT NULL, version BIGINT NOT NULL, deleted_at TEXT, updated_at TEXT NOT NULL, PRIMARY KEY (scope, id))`);
+    await real.exec(`CREATE TABLE ${p}results (scope TEXT NOT NULL, grp TEXT NOT NULL, client_id TEXT NOT NULL, mutation_id BIGINT NOT NULL, outcome TEXT NOT NULL, reason TEXT, target_id TEXT NOT NULL, rev_client TEXT, rev_mutation BIGINT, version BIGINT NOT NULL, PRIMARY KEY (scope, grp, client_id, mutation_id))`);
+    await real.run(`INSERT INTO ${p}rows (scope, id, state, stored, rev_client, rev_mutation, version, deleted_at, updated_at) VALUES (?, ?, 'live', 'x', ?, 3, 3, NULL, '2026-10-15T00:00:00.000Z')`, [w.scope, hex(8), A]);
+    // the other server's upgrade adds each column after this one found it missing and before its own change runs
+    const racing = new Proxy(real, {
+      get(target, key) {
+        if (key === 'run') {
+          return async (statement: string, parameters?: StorageParameters) => {
+            if (statement.startsWith('ALTER TABLE')) await target.run(statement);
+            return target.run(statement, parameters);
+          };
+        }
+        const value = Reflect.get(target, key) as unknown;
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    }) as StorageAdapter;
+    await upgradeSqlMutationStore(racing, p);
+    const [row] = await real.all<{ content_client: string; content_mutation: unknown }>(`SELECT content_client, content_mutation FROM ${p}rows WHERE id = ?`, [hex(8)]);
+    expect([row?.content_client, Number(row?.content_mutation)]).toEqual([A, 3]);
+    expect(await real.all(`SELECT content_client, content_mutation FROM ${p}results WHERE 1 = 0`)).toEqual([]);
   });
 });
