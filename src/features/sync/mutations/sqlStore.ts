@@ -24,7 +24,7 @@ export function mutationStoreDdl(prefix: string): string[] {
   checkPrefix(prefix);
   return [
     `CREATE TABLE IF NOT EXISTS ${prefix}groups (scope TEXT PRIMARY KEY, grp TEXT NOT NULL UNIQUE, version BIGINT NOT NULL DEFAULT 0)`,
-    `CREATE TABLE IF NOT EXISTS ${prefix}rows (scope TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, stored TEXT, rev_client TEXT NOT NULL, rev_mutation BIGINT NOT NULL, content_client TEXT, content_mutation BIGINT, version BIGINT NOT NULL, deleted_at TEXT, updated_at TEXT NOT NULL, PRIMARY KEY (scope, id))`,
+    `CREATE TABLE IF NOT EXISTS ${prefix}rows (scope TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, stored TEXT, rev_client TEXT NOT NULL, rev_mutation BIGINT NOT NULL, content_client TEXT, content_mutation BIGINT, content_for TEXT, version BIGINT NOT NULL, deleted_at TEXT, updated_at TEXT NOT NULL, PRIMARY KEY (scope, id))`,
     `CREATE INDEX IF NOT EXISTS ${prefix}rows_version ON ${prefix}rows (scope, version)`,
     `CREATE TABLE IF NOT EXISTS ${prefix}clients (scope TEXT NOT NULL, grp TEXT NOT NULL, client_id TEXT NOT NULL, last_mutation_id BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (scope, grp, client_id))`,
     `CREATE TABLE IF NOT EXISTS ${prefix}results (scope TEXT NOT NULL, grp TEXT NOT NULL, client_id TEXT NOT NULL, mutation_id BIGINT NOT NULL, outcome TEXT NOT NULL, reason TEXT, target_id TEXT NOT NULL, rev_client TEXT, rev_mutation BIGINT, content_client TEXT, content_mutation BIGINT, version BIGINT NOT NULL, PRIMARY KEY (scope, grp, client_id, mutation_id))`,
@@ -32,8 +32,11 @@ export function mutationStoreDdl(prefix: string): string[] {
 }
 
 /**
- * Brings a store made before content revisions to this release: the two columns on the rows and the results where
- * they are missing, and each row's content revision set to its revision where it has none. A second run changes
+ * Brings a store made before content revisions to this release: the content revision's two columns on the rows and the
+ * results and the rows' `content_for` where they are missing, and each row's content revision set to its revision where
+ * it has none. `content_for` holds the revision a row had when its content revision was written; a row written since
+ * by a server of an earlier release, which writes no content column, reads its revision as its content revision, so a
+ * rolling deploy never leaves a content revision older than the write that changed the content. A second run changes
  * nothing, and a column another server's upgrade added between this one's check and its change counts as added, so
  * servers that start at once on one store each finish. Each statement runs alone, outside a transaction, since a
  * failed probe ends a transaction on Postgres. Run it after `mutationStoreDdl` on every start.
@@ -48,18 +51,25 @@ export async function upgradeSqlMutationStore(adapter: StorageAdapter, prefix: s
       return false;
     }
   };
-  for (const table of ['rows', 'results']) {
-    for (const [column, type] of [['content_client', 'TEXT'], ['content_mutation', 'BIGINT']] as const) {
-      if (await present(table, column)) continue;
-      try {
-        await adapter.run(`ALTER TABLE ${prefix}${table} ADD COLUMN ${column} ${type}`);
-      } catch (error) {
-        // another server's upgrade added it between the check and the change
-        if (!(await present(table, column))) throw error;
-      }
+  const columns: ReadonlyArray<readonly [string, string, string]> = [
+    ['rows', 'content_client', 'TEXT'],
+    ['rows', 'content_mutation', 'BIGINT'],
+    ['rows', 'content_for', 'TEXT'],
+    ['results', 'content_client', 'TEXT'],
+    ['results', 'content_mutation', 'BIGINT'],
+  ];
+  for (const [table, column, type] of columns) {
+    if (await present(table, column)) continue;
+    try {
+      await adapter.run(`ALTER TABLE ${prefix}${table} ADD COLUMN ${column} ${type}`);
+    } catch (error) {
+      // another server's upgrade added it between the check and the change
+      if (!(await present(table, column))) throw error;
     }
   }
-  await adapter.run(`UPDATE ${prefix}rows SET content_client = rev_client, content_mutation = rev_mutation WHERE content_client IS NULL OR content_mutation IS NULL`);
+  await adapter.run(
+    `UPDATE ${prefix}rows SET content_client = rev_client, content_mutation = rev_mutation, content_for = rev_client || ':' || CAST(rev_mutation AS TEXT) WHERE content_client IS NULL OR content_mutation IS NULL`,
+  );
 }
 
 /** Makes a scope's group at version 0. */
@@ -84,6 +94,8 @@ interface RowRecord {
   rev_mutation: unknown;
   content_client: string | null;
   content_mutation: unknown;
+  /** The revision the row had when its content revision was written, `<client>:<mutation>`. */
+  content_for: string | null;
   version: unknown;
   deleted_at: string | null;
 }
@@ -106,14 +118,24 @@ function contentRevisionOf(client: string | null, mutation: unknown): Revision |
   return client === null || mutation === null || mutation === undefined ? null : { client, mutation: writeCounter(readCounter(mutation)) };
 }
 
+/** `<client>:<mutation>`, as `content_for` holds a revision. */
+function markOf(revision: Revision): string {
+  return `${revision.client}:${writeCounter(readCounter(revision.mutation))}`;
+}
+
+/**
+ * A row as the server reads it. Its content revision stands only beside the revision it was written with: a row a
+ * server of an earlier release wrote since keeps the older content columns, and its own revision is its content revision.
+ */
 function rowOf(record: RowRecord): StoredRow {
   const revision = { client: record.rev_client, mutation: writeCounter(readCounter(record.rev_mutation)) };
+  const content = record.content_for === markOf(revision) ? contentRevisionOf(record.content_client, record.content_mutation) : null;
   return {
     id: record.id,
     state: record.state === 'tombstone' ? 'tombstone' : 'live',
     stored: record.stored,
     revision,
-    contentRevision: contentRevisionOf(record.content_client, record.content_mutation) ?? revision,
+    contentRevision: content ?? revision,
     version: readCounter(record.version),
     deletedAt: record.deleted_at,
   };
@@ -132,7 +154,7 @@ function resultOf(record: ResultRecord): MutationResult {
   };
 }
 
-const ROW_COLUMNS = 'id, state, stored, rev_client, rev_mutation, version, deleted_at, content_client, content_mutation';
+const ROW_COLUMNS = 'id, state, stored, rev_client, rev_mutation, version, deleted_at, content_client, content_mutation, content_for';
 const RESULT_COLUMNS = 'client_id, mutation_id, outcome, reason, target_id, rev_client, rev_mutation, version, content_client, content_mutation';
 
 /** The reference store on the tables `mutationStoreDdl(prefix)` makes. */
@@ -171,9 +193,9 @@ export function createSqlMutationStore(options: { prefix: string; lockTimeoutMs?
     },
     async writeRow(trx, scope, row, at) {
       await trx.run(
-        `INSERT INTO ${p}rows (scope, id, state, stored, rev_client, rev_mutation, content_client, content_mutation, version, deleted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ` +
-          'ON CONFLICT (scope, id) DO UPDATE SET state = excluded.state, stored = excluded.stored, rev_client = excluded.rev_client, rev_mutation = excluded.rev_mutation, content_client = excluded.content_client, content_mutation = excluded.content_mutation, version = excluded.version, deleted_at = excluded.deleted_at, updated_at = excluded.updated_at',
-        [scope, row.id, row.state, row.stored, row.revision.client, readCounter(row.revision.mutation), row.contentRevision.client, readCounter(row.contentRevision.mutation), row.version, row.deletedAt, at.toISOString()],
+        `INSERT INTO ${p}rows (scope, id, state, stored, rev_client, rev_mutation, content_client, content_mutation, content_for, version, deleted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ` +
+          'ON CONFLICT (scope, id) DO UPDATE SET state = excluded.state, stored = excluded.stored, rev_client = excluded.rev_client, rev_mutation = excluded.rev_mutation, content_client = excluded.content_client, content_mutation = excluded.content_mutation, content_for = excluded.content_for, version = excluded.version, deleted_at = excluded.deleted_at, updated_at = excluded.updated_at',
+        [scope, row.id, row.state, row.stored, row.revision.client, readCounter(row.revision.mutation), row.contentRevision.client, readCounter(row.contentRevision.mutation), markOf(row.revision), row.version, row.deletedAt, at.toISOString()],
       );
     },
     async liveCount(trx, scope) {

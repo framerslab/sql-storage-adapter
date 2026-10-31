@@ -67,9 +67,9 @@ const codec: ValueCodec = {
   },
 };
 
-/** The store's tables as the release before content revisions made them: the same statements without the two columns. */
+/** The store's tables as the release before content revisions made them: the same statements without the content columns. */
 function previousStoreDdl(prefix: string): string[] {
-  return sync.mutationStoreDdl(prefix).map((statement) => statement.replaceAll(', content_client TEXT, content_mutation BIGINT', ''));
+  return sync.mutationStoreDdl(prefix).map((statement) => statement.replaceAll(', content_for TEXT', '').replaceAll(', content_client TEXT, content_mutation BIGINT', ''));
 }
 
 /** A request body as it reached a route. */
