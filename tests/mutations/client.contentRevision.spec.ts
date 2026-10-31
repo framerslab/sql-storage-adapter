@@ -406,6 +406,29 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('cont
     expect(snapshot.kept.map((row) => [row.id, row.value])).toEqual([[hex(1), 'new|']]);
   });
 
+  it('keeps a second save of a refused amend\'s value under the reason of the first refusal, as the page showed it', async () => {
+    await w.close();
+    w = await world(backend, { policy: { ...policy, maxRows: 1 } });
+    const a = await browser(w, { clientPolicy: { ...policy, maxRows: 1 } });
+    const b = await browser(w, { clientPolicy: { ...policy, maxRows: 1 } });
+    await a.join();
+    await b.join();
+    await a.save([{ id: hex(1), value: 'text|' }]);
+    await settle(a, b);
+    await a.save([{ id: hex(1), value: 'theirs|' }]);
+    await settle(a);
+    await b.save([{ id: hex(1), value: 'mine|' }]);
+    await b.client.pull(); // replayed over theirs, the change is a copy the full account refuses, shown beside the row
+    const copy = (await b.client.snapshot()).visible.find((row) => row.id !== hex(1));
+    expect(copy?.value).toBe('mine|');
+    await b.save([{ id: hex(1), value: 'theirs|' }, { id: copy!.id, value: 'mine, more|' }]);
+    await settle(b, a);
+    const snapshot = await b.client.snapshot();
+    expect(await b.values()).toEqual(['mine, more|', 'theirs|']);
+    expect(snapshot.kept.map((row) => [row.id, row.value, row.reason])).toEqual([[copy!.id, 'mine, more|', 'full']]);
+    expect(snapshot.pending).toBe(0);
+  });
+
   it('hands the page a restored occupied claim, so its next save keeps it', async () => {
     const { a, b, id } = await occupiedClaim();
     expect(await b.client.restoreKept(id)).toBe(true);
