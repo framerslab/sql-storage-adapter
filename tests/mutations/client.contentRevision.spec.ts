@@ -227,6 +227,28 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('cont
     expect(await a.adapter.all('SELECT mutation_id, name, args, incoming_value FROM sync_journal WHERE client_id = ? ORDER BY mutation_id', [before.clientId])).toEqual(journal);
   });
 
+  it('takes a whole snapshot when a joined protocol 1 page upgrades, so a row a tags-only amend changed meanwhile has the account\'s content revision', async () => {
+    const a = await open();
+    const b = await open();
+    await a.join();
+    await b.join();
+    await a.save([{ id: hex(1), value: 'text|' }]);
+    await settle(a, b);
+    await a.save([{ id: hex(1), value: 'text|budget' }]);
+    await settle(a, b);
+    const [account] = (await a.client.snapshot()).visible;
+    expect(account!.contentRevision).not.toEqual(account!.revision);
+    // b as a protocol 1 page holds the row: its whole revision alone, the content revision a protocol 1 pull leaves out
+    await b.adapter.run('UPDATE sync_rows SET content_client = NULL, content_mutation = NULL');
+    await b.adapter.run('UPDATE sync_results SET content_client = NULL, content_mutation = NULL');
+    await b.adapter.run('UPDATE sync_membership SET protocol = 1');
+    const reloaded = b.reopen();
+    await reloaded.client.open();
+    expect((await reloaded.client.snapshot()).pending).toBe(0);
+    await reloaded.client.pull();
+    expect((await reloaded.client.snapshot()).visible.map((row) => [row.id, row.contentRevision])).toEqual([[hex(1), account!.contentRevision]]);
+  });
+
   it.each(['push-first', 'pull-first'] as const)('keeps the full local block after a tags-only edit is refused removed with %s', async (order) => {
     const a = await open();
     await a.join();
