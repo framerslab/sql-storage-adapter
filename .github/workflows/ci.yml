@@ -155,8 +155,20 @@ jobs:
           "$tsc" --version
           "$tsc" --module nodenext --moduleResolution nodenext --strict --skipLibCheck --noEmit index.ts
           # With library checks on, as a consumer that checks the declarations it reads compiles them: every module
-          # the packed declarations import has types once the package is installed.
-          "$tsc" --module nodenext --moduleResolution nodenext --strict --noEmit index.ts
+          # the packed declarations import has types once the package is installed. Errors in other packages'
+          # declarations (@auth/core, pg-protocol) are theirs; an error in this package's declarations fails the step.
+          code=0
+          "$tsc" --module nodenext --moduleResolution nodenext --strict --noEmit index.ts > lib-check.txt 2>&1 || code=$?
+          own="$(grep -E '^node_modules/@framers/sql-storage-adapter/.*error TS[0-9]+' lib-check.txt || true)"
+          if [ -n "$own" ]; then
+            echo "$own"
+            exit 1
+          fi
+          # A compiler that fails and prints no error line checked nothing.
+          if [ "$code" -ne 0 ] && ! grep -q 'error TS' lib-check.txt; then
+            cat lib-check.txt
+            exit 1
+          fi
 
       # The CommonJS build and the per-adapter entries, as a consumer installs
       # them: a CommonJS TypeScript consumer under node16 resolution, require()
