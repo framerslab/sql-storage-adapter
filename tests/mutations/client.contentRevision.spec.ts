@@ -325,6 +325,29 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('cont
     }
   });
 
+  it('keeps a change made on a claim the account took over other tags with the whole value the page saved, when the claim is refused occupied', async () => {
+    // a claim of the same content is the claim's own, whatever its tags
+    const loose: Partial<RowPolicy> = { ...policy, composer: { ...composer, sameClaim: (current, incoming) => composer.contentOf(current) === composer.contentOf(incoming) } };
+    await w.close();
+    w = await world(backend, { policy: loose });
+    const a = await browser(w, { clientPolicy: loose });
+    const b = await browser(w, { clientPolicy: loose });
+    await a.join();
+    await b.join();
+    await a.client.save({ rows: [{ id: hex(7), value: 'text|server', claim: true }], write: async () => undefined });
+    await settle(a);
+    await b.client.save({ rows: [{ id: hex(7), value: 'text|local', claim: true }], write: async () => undefined });
+    await b.client.pull(); // the claim replays as a no-op over a's value, whose tags the page now shows
+    expect((await b.client.snapshot()).visible.map((row) => row.value)).toEqual(['text|server']);
+    await b.client.save({ rows: [{ id: hex(7), value: 'text|server,x' }], write: async () => undefined });
+    await a.save([{ id: hex(7), value: 'other|server' }]);
+    await settle(a);
+    await settle(b, a);
+    const snapshot = await b.client.snapshot();
+    expect(snapshot.kept.map((row) => [row.reason, row.value])).toEqual([['occupied', 'text|server,x']]);
+    expect(snapshot.pending).toBe(0);
+  });
+
   it('joins and pulls in protocol 2: a server that takes protocol 2 alone answers them, and the join holds the content revision', async () => {
     w.server = new MutationServer({ ...w.options, protocols: [PROTOCOL] });
     const a = await open();
