@@ -1332,12 +1332,17 @@ export class MutationClient {
    * the server runs, a pending mutation's whole local value the replay refuses kept in view until its refusal is
    * acknowledged (but for a claim, or a change made on one, refused as occupied, whose value the server's row holds
    * the place of), and the kept rows over all of it but those kept as occupied, which `snapshot().kept` alone holds.
-   * Each row carries its whole revision and its content revision as the replay leaves them.
+   * Each row carries its whole revision and its content revision as the replay leaves them, but for a row a pending
+   * claim found holding its own value: until a later pending mutation writes it, the row carries the claim's revision
+   * as both, so a change made on it names the claim, follows it to the revision its no-op found when the server agrees,
+   * and is refused with it when the server refuses the claim as occupied.
    */
   private async visible(trx: StorageAdapter, m: Membership): Promise<Map<string, VisibleRow>> {
     const canonical = await this.canonical(trx);
     const overlay = new Map<string, Row>();
     const provisional = new Map<string, VisibleRow>();
+    // the rows a pending claim replayed as a no-op on, with the claim's revision
+    const claimed = new Map<string, Revision>();
     if (m.state === 'joined' && m.group !== null && m.clientId !== null) {
       const group = m.group;
       const clientId = m.clientId;
@@ -1367,7 +1372,9 @@ export class MutationClient {
             revision,
             contentRevision: effect.write.contentChanged || prior === undefined ? revision : (prior.contentRevision ?? prior.revision),
           });
+          claimed.delete(effect.write.id);
         }
+        if (pending.mutation.name === 'claim' && effect.outcome === 'noop') claimed.set(effect.targetId, revision);
         const target = overlay.get(effect.targetId) ?? canonical.get(effect.targetId);
         local.set(`${clientId}:${context.mutationId}`, {
           outcome: effect.outcome,
@@ -1390,7 +1397,15 @@ export class MutationClient {
     for (const id of new Set([...canonical.keys(), ...overlay.keys()])) {
       const row = overlay.get(id) ?? canonical.get(id);
       if (row !== undefined && row.state === 'live' && row.value !== null) {
-        visible.set(id, { id, value: row.value, revision: row.revision, contentRevision: row.contentRevision ?? row.revision, source: overlay.has(id) ? 'pending' : 'canonical', reason: null });
+        const claim = claimed.get(id);
+        visible.set(id, {
+          id,
+          value: row.value,
+          revision: claim ?? row.revision,
+          contentRevision: claim ?? row.contentRevision ?? row.revision,
+          source: overlay.has(id) || claim !== undefined ? 'pending' : 'canonical',
+          reason: null,
+        });
       }
     }
     for (const [id, row] of provisional) visible.set(id, row);
