@@ -297,6 +297,34 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('cont
     expect((await a.client.snapshot()).membership.state).toBe('off');
   });
 
+  it.each(['edited', 'unchanged'] as const)('keeps a change made on a claim that replayed as a no-op with the claim, the other page\'s row %s', async (other) => {
+    const a = await open();
+    const b = await open();
+    await a.join();
+    await b.join();
+    await a.client.save({ rows: [{ id: hex(7), value: 'copy|', claim: true }], write: async () => undefined });
+    await settle(a);
+    await b.client.save({ rows: [{ id: hex(7), value: 'copy|', claim: true }], write: async () => undefined });
+    await b.client.pull(); // the claim replays as a no-op over the same value from a
+    await b.client.save({ rows: [{ id: hex(7), value: 'copy|x' }], write: async () => undefined });
+    if (other === 'edited') {
+      await a.save([{ id: hex(7), value: 'edited|' }]);
+      await settle(a);
+    }
+    await settle(b, a);
+    const snapshot = await b.client.snapshot();
+    expect(snapshot.pending).toBe(0);
+    if (other === 'edited') {
+      // the claim is refused occupied, and the change made on it goes aside with it, not onto the other page's row
+      expect((await a.client.snapshot()).visible.map((row) => row.value)).toEqual(['edited|']);
+      expect(snapshot.kept.map((row) => [row.reason, row.value])).toEqual([['occupied', 'copy|x']]);
+    } else {
+      expect((await a.client.snapshot()).visible.map((row) => row.value)).toEqual(['copy|x']);
+      expect(snapshot.kept).toEqual([]);
+      expect(snapshot.visible.map((row) => row.value)).toEqual(['copy|x']);
+    }
+  });
+
   it('joins and pulls in protocol 2: a server that takes protocol 2 alone answers them, and the join holds the content revision', async () => {
     w.server = new MutationServer({ ...w.options, protocols: [PROTOCOL] });
     const a = await open();
