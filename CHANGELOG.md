@@ -1,5 +1,18 @@
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-31
+
+### Added
+- Content revisions: a row keeps the mutation that last changed its content beside its revision, through the server, the pull and the client. A `RowComposer` in the `RowPolicy` (`contentOf`, `compose`, `deltaOf`, `sameClaim`) says what a value's content is; the library never parses a value.
+- `amend`: a change made against a row's revision and its content revision, with replacement content or none and a delta or none, applied by the policy's composer. A delta alone lands on the current row; content lands on a current content revision or when it equals the row's; different content made on an older content revision becomes one copy carrying the current rest with the delta; a dependent amend acts where its earlier mutation's result landed and compares with the content revision that result recorded. With a composer, a save plans a changed row as an `amend`, and a change the composer counts as none sends nothing.
+- `claim`: a create at an id the caller derived, a no-op for the same value (`sameClaim`) and refused `occupied` for anything else, never a copy; a mutation that depends on a refused claim is refused too. `client.save` takes `claim: true` on a row. The client keeps a claim refused `occupied`, with every change made on it, as a kept row of reason `occupied`, out of the visible rows until `restoreKept`.
+- Protocol 2: requests carry `protocol` (`PROTOCOL` is 2); `MutationServerOptions.protocols` (default `[1, 2]`) and the `protocol_changed` answer, which stops a client's sends; a protocol 1 pull is answered with exactly its old keys.
+- `upgradeSqlMutationStore(adapter, prefix)` adds the content revision columns to a reference store an earlier release made; run it after `mutationStoreDdl` on every start. `upgradeClientTables`, which `client.open()` runs, does the same for the client's tables, and a client with a protocol 1 queue keeps that queue's pending values as recovery rows and starts a new client id.
+
+### Changed
+- The reference store's `rows` and `results` tables have two columns more (`content_client`, `content_mutation`), and `StoredRow` and `MutationResult` carry `contentRevision`: a store of an application's own reads and writes it.
+- A client's tables have the columns protocol 2 added and a table of retired client ids; a joined protocol 1 client with nothing pending takes a whole snapshot at its first pull after the upgrade.
+
 ## [0.8.3] - 2026-10-25
 
 ### Added
