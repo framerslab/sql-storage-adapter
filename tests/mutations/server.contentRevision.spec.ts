@@ -5,7 +5,7 @@ import { MutationServer } from '../../src/features/sync/mutations/server';
 import { mutationStoreDdl, upgradeSqlMutationStore } from '../../src/features/sync/mutations/sqlStore';
 import { PROTOCOL, WireError, type PushRequest } from '../../src/features/sync/mutations/wire';
 import { backends } from './backends';
-import { hex, pullOf, pullWhole, pushOf, world, type World } from './harness';
+import { hex, pullOf, pullWhole, pushOf, testCodec, world, type World } from './harness';
 
 const BACKENDS = await backends();
 const A = hex(0xa1);
@@ -147,6 +147,27 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('%s: 
     const [row] = await w.opened.adapter.all<{ content_client: string; content_mutation: unknown; stored: string }>(`SELECT content_client, content_mutation, stored FROM ${p}rows WHERE id = ?`, [hex(8)]);
     expect([row?.content_client, Number(row?.content_mutation), row?.stored]).toEqual([A, 3, 'x']);
     expect(await w.opened.adapter.all(`SELECT content_client, content_mutation FROM ${p}results WHERE 1 = 0`)).toEqual([]);
+  });
+
+  it('reads the content revision of a row an earlier release\'s server wrote after the upgrade as its revision, so an older content change becomes a copy', async () => {
+    w = await world(backend, { policy: { composer } });
+    const p = w.opened.prefix;
+    await w.server.push(w.context(), v2(pushOf(w, A, [{ name: 'create', args: { id: hex(1), value: 'text|' } }])));
+    // a server of the previous release, still running in a rolling deploy, edits the row: its write names no content column
+    await w.opened.adapter.run(`UPDATE ${p}rows SET stored = ?, rev_client = ?, rev_mutation = 1, version = 2 WHERE scope = ? AND id = ?`, [
+      await testCodec.seal('theirs|', { scope: w.scope, id: hex(1) }),
+      B,
+      w.scope,
+      hex(1),
+    ]);
+    await w.opened.adapter.run(`UPDATE ${p}groups SET version = 2 WHERE scope = ?`, [w.scope]);
+    const base = { client: A, mutation: '1' };
+    // a page that read the row before that edit changes its content
+    await w.server.push(w.context(), v2(pushOf(w, A, [{ name: 'amend', args: { id: hex(1), expected: base, expectedContent: base, content: 'mine', delta: null } }], 2)));
+    const answer = await pulled(w, A);
+    expect(answer.results.map((result) => result.outcome)).toEqual(['applied', 'copied']);
+    const puts = answer.patch.flatMap((entry) => (entry.op === 'put' ? [entry.value] : [])).sort();
+    expect(puts).toEqual(['mine| (copy)', 'theirs|']);
   });
 
   it('finishes the store upgrade when another server adds a column between its check and its change', async () => {
