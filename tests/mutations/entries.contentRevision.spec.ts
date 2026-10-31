@@ -562,14 +562,14 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('thro
     expect(await storedIds(s)).toEqual([hex(4)]);
   }, 30_000);
 
-  it('retires the queue a page of the previous release left: its values kept for recovery, a new client id, and only protocol 2 at the routes after', async () => {
+  it('retires the queue a page of the previous release left: its pending values kept for recovery, a new client id, and only protocol 2 at the routes after', async () => {
     const s = await start();
     const a = await openPage(s);
     await a.join();
     await a.save([{ id: hex(9), value: 'archived|' }]);
     await settle(a);
     await a.save([]);
-    await settle(a); // the archived value is in the journal alone
+    await settle(a); // the archived value is in the journal alone, acknowledged
     await a.save([{ id: hex(1), value: 'one|' }, { id: hex(2), value: 'two|' }]);
     const before = await a.client.snapshot();
     expect(before.pending).toBe(2);
@@ -593,8 +593,8 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('thro
     expect(after.pending).toBe(0);
     expect(after.membership.state).toBe('joined');
     expect(after.membership.clientId).not.toBe(oldId);
+    // only what the queue still held: the archived value the account acknowledged stays in the journal, out of the page
     expect(keptOf(after).sort()).toEqual([
-      ['recovery', 'archived|'],
       ['recovery', 'one|'],
       ['recovery', 'two|'],
     ]);

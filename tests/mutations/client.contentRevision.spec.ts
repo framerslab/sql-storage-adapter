@@ -190,13 +190,13 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('cont
     expect((await reloaded.client.snapshot()).pending).toBe(0);
   });
 
-  it('retires a protocol 1 queue on upgrade: its values kept for recovery, a new client id, the next push of protocol 2', async () => {
+  it('retires a protocol 1 queue on upgrade: its pending values kept for recovery, a new client id, the next push of protocol 2', async () => {
     const a = await open();
     await a.join();
     await a.save([{ id: hex(9), value: 'archived|' }]);
     await settle(a);
     await a.save([]);
-    await settle(a); // the earlier payload is in the journal alone
+    await settle(a); // the earlier payload is in the journal alone, acknowledged
     await a.save([{ id: hex(1), value: 'one|' }, { id: hex(2), value: 'two|' }]);
     const before = (await a.client.snapshot()).membership;
     const journal = await a.adapter.all('SELECT mutation_id, name, args, incoming_value FROM sync_journal WHERE client_id = ? ORDER BY mutation_id', [before.clientId]);
@@ -206,8 +206,10 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('cont
     const after = await reloaded.client.snapshot();
     expect(after.pending).toBe(0);
     expect(after.membership.clientId).not.toBe(before.clientId);
-    expect(after.kept.map((row) => [row.reason, row.value]).sort()).toEqual([['recovery', 'archived|'], ['recovery', 'one|'], ['recovery', 'two|']]);
+    // only the pending values: an acknowledged one is the account's, and stays in the journal alone
+    expect(after.kept.map((row) => [row.reason, row.value]).sort()).toEqual([['recovery', 'one|'], ['recovery', 'two|']]);
     expect(await a.adapter.all('SELECT mutation_id, name, args, incoming_value FROM sync_journal WHERE client_id = ? ORDER BY mutation_id', [before.clientId])).toEqual(journal);
+    expect((await a.adapter.all<{ incoming_value: string | null }>('SELECT incoming_value FROM sync_journal WHERE client_id = ?', [before.clientId])).map((record) => record.incoming_value)).toContain('archived|');
     expect(await a.adapter.get('SELECT protocol, next_mutation_id FROM sync_retired_clients WHERE client_id = ?', [before.clientId])).toMatchObject({ protocol: 1, next_mutation_id: before.nextMutationId });
     expect(Number((await a.adapter.get<{ protocol: unknown }>('SELECT protocol FROM sync_membership'))?.protocol)).toBe(PROTOCOL);
     await reloaded.client.open();
