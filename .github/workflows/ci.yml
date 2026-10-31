@@ -154,6 +154,9 @@ jobs:
           tsc="$GITHUB_WORKSPACE/node_modules/.bin/tsc"
           "$tsc" --version
           "$tsc" --module nodenext --moduleResolution nodenext --strict --skipLibCheck --noEmit index.ts
+          # With library checks on, as a consumer that checks the declarations it reads compiles them: every module
+          # the packed declarations import has types once the package is installed.
+          "$tsc" --module nodenext --moduleResolution nodenext --strict --noEmit index.ts
 
       # The CommonJS build and the per-adapter entries, as a consumer installs
       # them: a CommonJS TypeScript consumer under node16 resolution, require()
