@@ -1008,12 +1008,14 @@ export class MutationClient {
 
   /**
    * Each claim-dependent mutation's chain: its claim's mutation id and the chain's final local value, from the immutable
-   * journal alone, never from a canonical or visible row at the claimed id. The journal holds acknowledged claims too, so
-   * a dependent refused on a later pull finds the same value.
+   * journal alone, never from a canonical or visible row at the claimed id. An amend's value is the whole value it was
+   * journaled with, which it was planned over: a claim the replay found as a no-op over another value its composer
+   * counts as the claim's own shows that value, so the amend is made on it, not on the claim's. The journal holds
+   * acknowledged claims too, so a dependent refused on a later pull finds the same value.
    */
   private async claimIncoming(trx: StorageAdapter, m: Membership): Promise<Map<number, ClaimChain>> {
-    const journal = await trx.all<{ mutation_id: unknown; name: string; args: string }>(
-      `SELECT mutation_id, name, args FROM ${this.p}journal WHERE scope = ? AND grp = ? AND client_id = ? ORDER BY mutation_id`,
+    const journal = await trx.all<{ mutation_id: unknown; name: string; args: string; incoming_value: string | null }>(
+      `SELECT mutation_id, name, args, incoming_value FROM ${this.p}journal WHERE scope = ? AND grp = ? AND client_id = ? ORDER BY mutation_id`,
       [this.scope, m.group, m.clientId],
     );
     const lineage = new Map<number, ClaimChain>();
@@ -1029,8 +1031,11 @@ export class MutationClient {
           let value: string | null;
           if (mutation.name === 'delete') value = null;
           else if (mutation.name === 'amend') {
-            if (prior.value === null || this.options.policy.composer === undefined) throw new Error('a claim\'s amend has no local base');
-            value = this.options.policy.composer.compose(prior.value, mutation.args.content, mutation.args.delta);
+            if (record.incoming_value !== null) value = record.incoming_value;
+            else {
+              if (prior.value === null || this.options.policy.composer === undefined) throw new Error('a claim\'s amend has no local base');
+              value = this.options.policy.composer.compose(prior.value, mutation.args.content, mutation.args.delta);
+            }
           } else value = mutation.args.value;
           own = { root: prior.root, value };
         }
