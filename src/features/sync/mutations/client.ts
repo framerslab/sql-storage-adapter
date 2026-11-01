@@ -379,8 +379,9 @@ export class MutationClient {
    * is cleared. A journal record the server acknowledged is not kept again: its value is the account's, or was kept
    * when its refusal was acknowledged, and the journal, never trimmed on acknowledgement, holds every value the client
    * ever had acknowledged. A fresh client id asks for a whole snapshot. The retirement marker keeps the old journal out
-   * of every replay and every transport reset. The marker, the recovery rows, the pending set's end, the fresh identity
-   * and the protocol commit together. A joined client with nothing pending keeps its identity and drops its cookie: a
+   * of every replay and every transport reset. The marker, the recovery rows, the pending set's end, the fresh identity,
+   * the protocol and the change of the visible rows handed to `materialize` commit together, so the page holds each value
+   * aside under its recovery id, as the client shows it. A joined client with nothing pending keeps its identity and drops its cookie: a
    * protocol 1 pull left out the content revisions, so the upgrade gave each row its whole revision as its content
    * revision, which is not the account's for a row a tags-only amend changed, and only a whole snapshot sends an
    * unchanged row again.
@@ -391,7 +392,9 @@ export class MutationClient {
       if (stored === null || Number(stored.protocol) >= PROTOCOL) return;
       let state = m;
       const pending = await this.pendingRows(trx);
+      let shown: Map<string, VisibleRow> | null = null;
       if (pending.length > 0 && m.state === 'joined' && m.group !== null && m.clientId !== null) {
+        shown = await this.visible(trx, m);
         const queued = new Set(pending.map((row) => row.mutationId));
         const group = m.group;
         const clientId = m.clientId;
@@ -416,6 +419,10 @@ export class MutationClient {
       }
       await this.saveMembership(trx, state);
       await trx.run(`UPDATE ${this.p}membership SET protocol = ? WHERE scope = ?`, [PROTOCOL, this.scope]);
+      if (shown !== null) {
+        const change = changeOf(shown, await this.visible(trx, state));
+        if (!emptyChange(change)) await this.options.materialize(trx, change);
+      }
     });
   }
 
