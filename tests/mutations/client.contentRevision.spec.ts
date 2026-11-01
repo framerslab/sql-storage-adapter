@@ -227,6 +227,25 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('cont
     expect(await a.adapter.all('SELECT mutation_id, name, args, incoming_value FROM sync_journal WHERE client_id = ? ORDER BY mutation_id', [before.clientId])).toEqual(journal);
   });
 
+  it('hands the page what retiring a protocol 1 queue changes, so a restored recovery row stays through the next save', async () => {
+    const a = await open();
+    await a.join();
+    await a.save([{ id: hex(1), value: 'one|' }]);
+    await a.adapter.run('UPDATE sync_membership SET protocol = 1');
+    const reloaded = a.reopen();
+    await reloaded.client.open();
+    const snapshot = await reloaded.client.snapshot();
+    // the page holds what the client shows: the unsent value aside under its recovery id
+    expect((await reloaded.blocks()).map(({ id, value }) => [id, value])).toEqual(snapshot.visible.map(({ id, value }) => [id, value]));
+    const [kept] = snapshot.kept;
+    expect(kept).toMatchObject({ reason: 'recovery', value: 'one|' });
+    expect(await reloaded.client.restoreKept(kept!.id)).toBe(true);
+    await reloaded.save(await reloaded.blocks());
+    await settle(reloaded);
+    expect(await reloaded.values()).toEqual(['one|']);
+    expect(await w.opened.adapter.all(`SELECT id, state FROM ${w.opened.prefix}rows`)).toEqual([{ id: kept!.id, state: 'live' }]);
+  });
+
   it('takes a whole snapshot when a joined protocol 1 page upgrades, so a row a tags-only amend changed meanwhile has the account\'s content revision', async () => {
     const a = await open();
     const b = await open();
