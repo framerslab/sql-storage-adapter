@@ -30,7 +30,9 @@ describe('the sql.js adapters leave the WebAssembly stack where it was (sql.js 1
   it('runs on sql.js 1.14.1', async () => {
     const { createRequire } = await import('node:module');
     const require = createRequire(import.meta.url);
-    const { version } = require('sql.js-1.14.1/package.json') as { version: string };
+    // sql.js's exports map lists no ./package.json; read it beside dist/.
+    const manifest = path.join(path.dirname(require.resolve('sql.js-1.14.1')), '..', 'package.json');
+    const { version } = JSON.parse(fs.readFileSync(manifest, 'utf8')) as { version: string };
     expect(version).toBe('1.14.1');
   });
 
