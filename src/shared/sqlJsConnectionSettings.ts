@@ -1,4 +1,33 @@
-import type { Database as SqlJsDatabase } from 'sql.js';
+import type { Database as SqlJsDatabase, SqlValue } from 'sql.js';
+
+/**
+ * The first column of the first row a statement returns, or undefined when it
+ * returns none, read through `prepare()`, `step()` and `free()`. sql.js up to
+ * 1.14.1 takes 16 bytes of its fixed WebAssembly stack on every
+ * `Database.exec()` call and never gives them back (fixed in 1.14.2), and a
+ * save reads some thirty values; once the stack runs out SQLite writes over
+ * the heap. So the adapters' own reads never go through `exec()`.
+ */
+export const firstValue = (db: SqlJsDatabase, sql: string): SqlValue | undefined => {
+  const stmt = db.prepare(sql);
+  try {
+    return stmt.step() ? stmt.get()[0] : undefined;
+  } finally {
+    stmt.free();
+  }
+};
+
+/** Every row's first column, read as {@link firstValue} reads one. */
+export const firstColumn = (db: SqlJsDatabase, sql: string): SqlValue[] => {
+  const stmt = db.prepare(sql);
+  const values: SqlValue[] = [];
+  try {
+    while (stmt.step()) values.push(stmt.get()[0]);
+  } finally {
+    stmt.free();
+  }
+  return values;
+};
 
 /**
  * The connection settings that sql.js's `export()` resets: it closes the
@@ -45,7 +74,7 @@ export interface KeepSettingsReport {
 /** A PRAGMA's value on a connection, or undefined when this build of SQLite has no such setting. */
 const readPragma = (db: SqlJsDatabase, name: string): number | string | undefined => {
   try {
-    const value = db.exec(`PRAGMA ${name}`)[0]?.values?.[0]?.[0];
+    const value = firstValue(db, `PRAGMA ${name}`);
     if (typeof value === 'number' && Number.isInteger(value)) return value;
     if (typeof value === 'string' && /^[A-Za-z_]+$/.test(value)) return value;
   } catch {
@@ -84,7 +113,8 @@ export const restoreConnectionSettings = (
   for (const [name, value] of settings) {
     if (readPragma(db, name) === value) continue;
     try {
-      db.exec(`PRAGMA ${name} = ${settingLiteral(name, value)}`);
+      // run() without parameters is sqlite3_exec(), which returns the stack it takes.
+      db.run(`PRAGMA ${name} = ${settingLiteral(name, value)}`);
     } catch (error) {
       onRefused(name, value, error);
     }
@@ -94,7 +124,7 @@ export const restoreConnectionSettings = (
 /** How many TEMP tables, views, indexes and triggers the connection has. */
 const tempObjectCount = (db: SqlJsDatabase): number => {
   try {
-    return Number(db.exec('SELECT count(*) FROM sqlite_temp_master')[0]?.values?.[0]?.[0] ?? 0);
+    return Number(firstValue(db, 'SELECT count(*) FROM sqlite_temp_master') ?? 0);
   } catch {
     return 0;
   }
