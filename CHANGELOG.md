@@ -1,5 +1,11 @@
 ## [Unreleased]
 
+### Fixed
+- sql.js and IndexedDB adapters: a write and its save leave sql.js's WebAssembly stack as they found it. sql.js up to 1.14.1 takes 16 bytes of its fixed 5 MB stack on every `Database.exec()` call and never gives them back (sql-js/sql.js 548980814, released in 1.14.2), and from 0.8.3 a save read the connection's settings through `exec()` before and after its export, some 35 calls a save. On sql.js 1.14.1 the stack ran out after some thousands of saves and SQLite wrote over the heap: "memory access out of bounds", errors such as "ou", and `resolveStorageAdapter()` finding sql.js "not available" (wilds-ai's `foundation-db.test.ts`, 1 November 2026). The adapters' own reads (`last_insert_rowid()`, `total_changes()`, the settings, the TEMP objects, `PRAGMA quick_check`) go through `prepare()`, `step()` and `free()`, and a setting is set again through `run()`; `tests/sqlJs.wasmStack.spec.ts` runs them on sql.js 1.14.1.
+
+### Changed
+- The package takes sql.js `^1.14.2`, the first release whose `Database.exec()` returns the stack it takes, so the scripts a caller runs through `exec()` take none either. Versions through 0.9.0 took `^1.11.0`.
+
 ## [0.9.0] - 2026-11-01
 
 ### Added

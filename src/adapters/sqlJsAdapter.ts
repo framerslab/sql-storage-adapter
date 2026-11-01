@@ -12,7 +12,7 @@ import {
 } from '../shared/serializedTransaction';
 import { namesInMemoryDatabase, segmentFilePath, validateSegment } from '../shared/segment';
 import { queryWrites, type QueryWrite } from '../shared/queryWrites';
-import { exportKeepingSettings } from '../shared/sqlJsConnectionSettings';
+import { exportKeepingSettings, firstValue } from '../shared/sqlJsConnectionSettings';
 import { getStorageLogger } from '../shared/logger';
 
 /** sql.js's own configuration (`locateFile` and the rest), and the adapter's segment. */
@@ -141,8 +141,7 @@ export class SqlJsAdapter implements StorageAdapter {
       }
       stmt.step();
       // Read before the save, whose export reopens the connection.
-      const rowIdResult = this.db!.exec('SELECT last_insert_rowid() AS id');
-      const rawRowId = rowIdResult[0]?.values?.[0]?.[0];
+      const rawRowId = firstValue(this.db!, 'SELECT last_insert_rowid() AS id');
       result = {
         changes: this.db!.getRowsModified(),
         lastInsertRowid: normaliseRowId(rawRowId)
@@ -441,7 +440,7 @@ export class SqlJsAdapter implements StorageAdapter {
 
   /** SQLite's count of the rows changed since the connection opened. */
   private totalChanges(): number {
-    return Number(this.db!.exec('SELECT total_changes()')[0]?.values?.[0]?.[0] ?? 0);
+    return Number(firstValue(this.db!, 'SELECT total_changes()') ?? 0);
   }
 }
 

@@ -73,6 +73,8 @@ import { segmentName } from '../shared/segment';
 import { queryWrites } from '../shared/queryWrites';
 import {
   exportKeepingSettings,
+  firstColumn,
+  firstValue,
   readConnectionSettings,
   restoreConnectionSettings,
   type KeepSettingsReport,
@@ -525,8 +527,7 @@ export class IndexedDbAdapter implements StorageAdapter {
       }
       stmt.step();
 
-      const rowIdResult = this.db!.exec('SELECT last_insert_rowid() AS id');
-      const rawRowId = rowIdResult[0]?.values?.[0]?.[0];
+      const rawRowId = firstValue(this.db!, 'SELECT last_insert_rowid() AS id');
       const lastInsertRowid = this.normaliseRowId(rawRowId);
       this.writeGeneration += 1;
 
@@ -615,7 +616,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 
   /** The rows changed on this connection since it opened. */
   private totalChanges(): number {
-    return Number(this.db!.exec('SELECT total_changes()')[0]?.values?.[0]?.[0] ?? 0);
+    return Number(firstValue(this.db!, 'SELECT total_changes()') ?? 0);
   }
 
   /**
@@ -1045,9 +1046,9 @@ export class IndexedDbAdapter implements StorageAdapter {
     const imported = new this.SQL!.Database(data);
     let problem: string | null = null;
     try {
-      const rows = imported.exec('PRAGMA quick_check')[0]?.values ?? [];
-      if (rows.length !== 1 || rows[0][0] !== 'ok') {
-        problem = rows.map((row) => String(row[0])).join('; ') || 'quick_check answered nothing';
+      const rows = firstColumn(imported, 'PRAGMA quick_check');
+      if (rows.length !== 1 || rows[0] !== 'ok') {
+        problem = rows.map((row) => String(row)).join('; ') || 'quick_check answered nothing';
       }
     } catch (error) {
       problem = error instanceof Error ? error.message : String(error);
