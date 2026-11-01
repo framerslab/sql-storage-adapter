@@ -1,6 +1,6 @@
 ## [Unreleased]
 
-## [0.9.0] - 2026-10-31
+## [0.9.0] - 2026-11-01
 
 ### Added
 - Content revisions: a row keeps the mutation that last changed its content beside its revision, through the server, the pull and the client. A `RowComposer` in the `RowPolicy` (`contentOf`, `compose`, `deltaOf`, `sameClaim`) says what a value's content is; the library never parses a value.
