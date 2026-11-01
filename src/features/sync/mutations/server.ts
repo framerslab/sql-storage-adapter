@@ -6,7 +6,8 @@
  * consumes its id and records its result; any other failure rolls the whole push back. `pull` reads the version, the
  * rows changed since a cookie, every client's last id and the caller's results in one transaction, and streams them as
  * one JSON answer, batch by batch; a cancelled stream, or one still open at `maxPullMs`, rolls its transaction back and
- * never completes.
+ * never completes. A request in a protocol the server does not take is answered `protocol_changed` before anything is
+ * read, and a protocol 1 pull is answered without the content revisions protocol 1's parsers refuse.
  * `replayTombstone` writes a deletion fence's tombstone after a restore. The store is the caller's: its tables, its
  * locks and its isolation.
  */
@@ -14,7 +15,7 @@ import type { StorageAdapter } from '../../../core/contracts';
 import { nextCounter, readCounter, writeCounter } from './counter';
 import { HandOver, iterate, PullCancelled } from './handOver';
 import { applyRowMutation, parseRowArgs, rowMutationOf, type Row, type RowPolicy, type RowView } from './rows';
-import { parsePushRequest, type MutationResult, type PatchEntry, type PullRefusal, type PullRequest, type PushAnswer, type PushRequest, type Revision } from './wire';
+import { parsePushRequest, PROTOCOL, type MutationResult, type PatchEntry, type PullRefusal, type PullRequest, type PushAnswer, type PushRequest, type Revision } from './wire';
 
 /** A row as the store keeps it: its value sealed by the codec, or null for a tombstone. */
 export interface StoredRow {
@@ -22,6 +23,8 @@ export interface StoredRow {
   state: 'live' | 'tombstone';
   stored: string | null;
   revision: Revision;
+  /** The mutation that last changed its content. */
+  contentRevision: Revision;
   version: number;
   deletedAt: string | null;
 }
@@ -128,6 +131,8 @@ export interface MutationServerOptions {
    * back, so a reader that stops reading cannot hold it; `Infinity` sets no limit.
    */
   maxPullMs?: number;
+  /** The protocols a request may speak; `[1, 2]` by default. A product narrows it to `[2]` once old clients have drained. */
+  protocols?: readonly number[];
   clock?: () => Date;
 }
 
@@ -135,13 +140,21 @@ export interface MutationServerOptions {
 export class MutationServer {
   constructor(private readonly options: MutationServerOptions) {}
 
-  /** Reads a push's body with this server's limit and the row mutators' argument parser. */
+  /**
+   * Reads a push's body with this server's limit and the row mutators' argument parser. A body in a protocol this server
+   * does not take is read without its mutations' arguments, so `push` answers `protocol_changed` though a mutation in it
+   * is one this server does not know.
+   */
   parsePush(body: unknown): PushRequest {
-    return parsePushRequest(body, this.options.maxMutations, parseRowArgs);
+    const request = parsePushRequest(body, this.options.maxMutations, (_name, args) => args);
+    if (this.protocolRefusal(request.protocol) !== null) return request;
+    return { ...request, mutations: request.mutations.map((record, index) => ({ ...record, args: parseRowArgs(record.name, record.args, `push.mutations.${index}.args`) })) };
   }
 
   /** Processes a push; see the module's comment. */
   async push(context: ScopeContext, request: PushRequest, hooks: PushHooks = {}): Promise<PushAnswer> {
+    const refusal = this.protocolRefusal(request.protocol);
+    if (refusal !== null) return refusal;
     if (request.epoch !== context.epoch) return { kind: 'epoch_changed', epoch: context.epoch };
     const { adapter, store, codec, policy } = this.options;
     const at = this.now();
@@ -182,10 +195,17 @@ export class MutationServer {
         const effect = await applyRowMutation(view, policy, { group: group.group, clientId: request.clientId, mutationId: record.id }, rowMutationOf(record.name, record.args));
         const revision: Revision = { client: request.clientId, mutation: record.id };
         if (effect.write !== null) {
-          await read(effect.write.id);
-          writes.set(effect.write.id, { ...effect.write, revision });
+          const prior = writes.get(effect.write.id) ?? (await read(effect.write.id));
+          writes.set(effect.write.id, {
+            id: effect.write.id,
+            state: effect.write.state,
+            value: effect.write.value,
+            revision,
+            contentRevision: effect.write.contentChanged || prior === null ? revision : (prior.contentRevision ?? prior.revision),
+          });
         }
         if (effect.acceptedDelete) accepted.push({ id: effect.targetId, revision, deletedAt: at.toISOString() });
+        const target = effect.outcome === 'refused' ? null : await view.row(effect.targetId);
         const result: MutationResult = {
           clientId: request.clientId,
           mutationId: record.id,
@@ -194,6 +214,7 @@ export class MutationServer {
           targetId: effect.targetId,
           revision: effect.revision,
           version: writeCounter(version),
+          contentRevision: target === null ? null : (target.contentRevision ?? target.revision),
         };
         results.push(result);
         recorded.set(`${request.clientId}:${record.id}`, result);
@@ -212,6 +233,7 @@ export class MutationServer {
             state: tombstone ? 'tombstone' : 'live',
             stored: tombstone ? null : await codec.seal(row.value as string, { scope: context.scope, id: row.id }),
             revision: row.revision,
+            contentRevision: row.contentRevision ?? row.revision,
             version,
             deletedAt: tombstone ? at.toISOString() : null,
           },
@@ -236,6 +258,9 @@ export class MutationServer {
    * stream and rolls its transaction back.
    */
   async pull(context: ScopeContext, request: PullRequest, signal?: AbortSignal): Promise<PullOpening> {
+    const refusal = this.protocolRefusal(request.protocol);
+    if (refusal !== null) return refusal;
+    const protocol = request.protocol ?? 1;
     if (request.epoch !== context.epoch) return { kind: 'epoch_changed', epoch: context.epoch };
     const { adapter, store } = this.options;
     const batch = this.options.pullBatchRows ?? 200;
@@ -278,14 +303,14 @@ export class MutationServer {
           const rows = await store.rowsSince(trx, context.scope, since, after, batch);
           if (rows.length > 0) {
             const entries: string[] = [];
-            for (const row of rows) entries.push(JSON.stringify(await this.entryOf(context.scope, row)));
+            for (const row of rows) entries.push(JSON.stringify(patchForProtocol(await this.entryOf(context.scope, row), protocol)));
             await handOver.offer(`${first ? '' : ','}${entries.join(',')}`);
             first = false;
             after = rows[rows.length - 1].id;
           }
           if (rows.length < batch) break;
         }
-        const results = await store.resultsSince(trx, context.scope, group.group, request.clientId, since);
+        const results = (await store.resultsSince(trx, context.scope, group.group, request.clientId, since)).map((result) => resultForProtocol(result, protocol));
         const last: Record<string, string> = { [request.clientId]: '0' };
         for (const client of await store.clients(trx, context.scope, group.group)) last[client.clientId] = writeCounter(client.lastMutationId);
         await handOver.offer(`],"results":${JSON.stringify(results)},"lastMutationIds":${JSON.stringify(last)}}`);
@@ -320,7 +345,7 @@ export class MutationServer {
       const row = await store.readRow(trx, input.scope, input.id);
       if (row !== null && row.state === 'tombstone') return 'kept';
       const version = nextCounter(group.version);
-      await store.writeRow(trx, input.scope, { id: input.id, state: 'tombstone', stored: null, revision: input.revision, version, deletedAt: input.deletedAt }, at);
+      await store.writeRow(trx, input.scope, { id: input.id, state: 'tombstone', stored: null, revision: input.revision, contentRevision: input.revision, version, deletedAt: input.deletedAt }, at);
       await store.setVersion(trx, input.scope, version);
       return 'written';
     });
@@ -330,15 +355,21 @@ export class MutationServer {
     return (this.options.clock ?? (() => new Date()))();
   }
 
+  /** The answer to a request in a protocol this server does not take; null for one it takes. */
+  private protocolRefusal(protocol: number | undefined): { kind: 'protocol_changed'; protocols: number[] } | null {
+    const protocols = this.options.protocols ?? [1, PROTOCOL];
+    return protocols.includes(protocol ?? 1) ? null : { kind: 'protocol_changed', protocols: [...protocols] };
+  }
+
   /** A stored row as the mutators read it: live with its opened value, a tombstone, or unreadable. */
   private async rowOf(trx: StorageAdapter, scope: string, id: string): Promise<Row | null> {
     const stored = await this.options.store.readRow(trx, scope, id);
     if (stored === null) return null;
-    if (stored.state === 'tombstone' || stored.stored === null) return { id, state: 'tombstone', value: null, revision: stored.revision };
+    if (stored.state === 'tombstone' || stored.stored === null) return { id, state: 'tombstone', value: null, revision: stored.revision, contentRevision: stored.contentRevision };
     try {
-      return { id, state: 'live', value: await this.options.codec.open(stored.stored, { scope, id }), revision: stored.revision };
+      return { id, state: 'live', value: await this.options.codec.open(stored.stored, { scope, id }), revision: stored.revision, contentRevision: stored.contentRevision };
     } catch (error) {
-      if (error instanceof UnreadableValue) return { id, state: 'unreadable', value: null, revision: stored.revision };
+      if (error instanceof UnreadableValue) return { id, state: 'unreadable', value: null, revision: stored.revision, contentRevision: stored.contentRevision };
       throw error;
     }
   }
@@ -348,10 +379,22 @@ export class MutationServer {
     const version = writeCounter(row.version);
     if (row.state === 'tombstone' || row.stored === null) return { op: 'del', id: row.id, revision: row.revision, version, deletedAt: row.deletedAt ?? '' };
     try {
-      return { op: 'put', id: row.id, value: await this.options.codec.open(row.stored, { scope, id: row.id }), revision: row.revision, version };
+      return { op: 'put', id: row.id, value: await this.options.codec.open(row.stored, { scope, id: row.id }), revision: row.revision, version, contentRevision: row.contentRevision };
     } catch (error) {
       if (error instanceof UnreadableValue) return { op: 'unreadable', id: row.id, revision: row.revision, version };
       throw error;
     }
   }
+}
+
+/** A patch entry in the requesting client's protocol: protocol 1's parsers refuse a key they do not know. */
+function patchForProtocol(entry: PatchEntry, protocol: number): PatchEntry {
+  if (protocol !== 1 || entry.op !== 'put') return entry;
+  return { op: 'put', id: entry.id, value: entry.value, revision: entry.revision, version: entry.version };
+}
+
+/** A recorded result in the requesting client's protocol, without changing the stored result. */
+function resultForProtocol(result: MutationResult, protocol: number): MutationResult {
+  if (protocol !== 1) return result;
+  return { clientId: result.clientId, mutationId: result.mutationId, outcome: result.outcome, reason: result.reason, targetId: result.targetId, revision: result.revision, version: result.version };
 }

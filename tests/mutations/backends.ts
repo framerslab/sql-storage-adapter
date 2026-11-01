@@ -30,7 +30,7 @@ export function freshPrefix(): string {
 }
 
 /** Every table a suite may make under its prefix, dropped when it closes. */
-const TABLES = ['results', 'clients', 'rows', 'groups', 'kv_entries', 'probe', 'membership', 'base', 'pending', 'journal', 'kept'];
+const TABLES = ['results', 'clients', 'rows', 'groups', 'kv_entries', 'probe', 'membership', 'base', 'pending', 'journal', 'kept', 'old_results', 'old_rows'];
 
 async function betterSqliteLoads(): Promise<boolean> {
   try {
