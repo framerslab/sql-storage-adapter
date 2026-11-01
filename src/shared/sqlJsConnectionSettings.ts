@@ -1,4 +1,7 @@
-import type { Database as SqlJsDatabase, SqlValue } from 'sql.js';
+import type { Database as SqlJsDatabase } from 'sql.js';
+
+/** A value a sql.js statement returns, read from the Database type: sql.js's own declarations and @types/sql.js export it apart. */
+type SqlValue = ReturnType<ReturnType<SqlJsDatabase['prepare']>['get']>[number];
 
 /**
  * The first column of the first row a statement returns, or undefined when it
