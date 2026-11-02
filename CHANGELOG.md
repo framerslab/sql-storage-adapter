@@ -1,7 +1,18 @@
 ## [Unreleased]
 
+## [0.9.3] - 2026-11-02
+
+### Fixed
+- The better-sqlite3 adapter's class comment said it enables WAL mode, that readers do not block and that it recovers from corruption. It does none of these: the adapter sets no journal mode, so a file keeps the mode it has, and it has no recovery step. The comment and the README say so. A long read of a live file in rollback-journal mode can make a commit fail busy; set WAL on the file yourself where readers and writers overlap.
+
+## [0.9.2] - 2026-11-01
+
 ### Fixed
 - The build runs the package's own `tsc`, not `npx tsc`. Inside a workspace whose root declares npm workspaces, npx looks for `tsc` in the root's `node_modules/.bin`, which pnpm links only after the workspace packages' prepare scripts start; a prepare that got there first fetched the npm package named `tsc`, which prints "This is not the tsc command you are looking for", and the install failed (voice-chat-assistant's Release run of 1 November 2026). `tests/packageScripts.spec.ts` keeps the compiler out of npx.
+
+## [0.9.1] - 2026-11-01
+
+### Fixed
 - sql.js and IndexedDB adapters: a write and its save leave sql.js's WebAssembly stack as they found it. sql.js up to 1.14.1 takes 16 bytes of its fixed 5 MB stack on every `Database.exec()` call and never gives them back (sql-js/sql.js 548980814, released in 1.14.2), and from 0.8.3 a save read the connection's settings through `exec()` before and after its export, some 35 calls a save. On sql.js 1.14.1 the stack ran out after some thousands of saves and SQLite wrote over the heap: "memory access out of bounds", errors such as "ou", and `resolveStorageAdapter()` finding sql.js "not available" (wilds-ai's `foundation-db.test.ts`, 1 November 2026). The adapters' own reads (`last_insert_rowid()`, `total_changes()`, the settings, the TEMP objects, `PRAGMA quick_check`) go through `prepare()`, `step()` and `free()`, and a setting is set again through `run()`; `tests/sqlJs.wasmStack.spec.ts` runs them on sql.js 1.14.1.
 
 ### Changed

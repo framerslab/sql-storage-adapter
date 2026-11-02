@@ -155,7 +155,10 @@ const normaliseRowId = (rowId: number | bigint | null | undefined): string | num
  * - Efficient for single-writer, multiple-reader scenarios
  *
  * ## Limitations
- * - Single writer at a time (readers don't block)
+ * - Single writer at a time
+ * - Opens the file in its own journal mode: no `journal_mode` pragma is set, so a file made by this adapter runs SQLite's
+ *   default rollback journal unless the caller set WAL on it; a reader holding a read transaction (a backup, an inspection)
+ *   can therefore make a writer's commit wait out `timeout` (5,000 ms) and fail `SQLITE_BUSY`
  * - No network access (local files only)
  * - Platform-specific native binaries required
  *
@@ -167,8 +170,6 @@ const normaliseRowId = (rowId: number | bigint | null | undefined): string | num
  *
  * ## Graceful Degradation
  * - Falls back to sql.js if native module unavailable
- * - Automatically enables WAL mode for better concurrency
- * - Handles database corruption with automatic recovery
  */
 /**
  * Native SQLite adapter backed by the `better-sqlite3` module.
