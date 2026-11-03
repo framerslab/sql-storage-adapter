@@ -1,8 +1,9 @@
 /**
  * @fileoverview The key-value module, `@framers/sql-storage-adapter/kv`: one `KeyValueStore` contract and its
  * stores. `openIndexedDbStore` keeps values in one IndexedDB object store, moved unchanged from @framers/agentos, so a
- * page's keys stay where they are; `createSqlKeyValueStore` keeps them in a SQL table on any adapter; the memory store
- * keeps them for the page alone. `migrateIndexedDbKeyValue` moves one namespace of an old IndexedDB store into a
+ * page's keys stay where they are; `createSqlKeyValueStore` keeps them in a SQL table on any adapter;
+ * `WebStorageKeyValueStore` keeps them in the page's `sessionStorage` or `localStorage`; the memory store keeps them for
+ * the page alone. `migrateIndexedDbKeyValue` moves one namespace of an old IndexedDB store into a
  * `KeyValueStore` over an adapter, behind a marker, its old writers locked out by the database's version.
  *
  * The module imports no adapter, so a page that loads it for its key-value store loads neither sql.js nor pg: the move
@@ -22,6 +23,7 @@ export {
   type IdbTransactionLike,
 } from './idb';
 export { createSqlKeyValueStore, type SqlKeyValueStoreOptions } from './sqlKeyValueStore';
+export { StorageFullError, WebStorageKeyValueStore } from './webStorageKeyValueStore';
 export {
   migrateIndexedDbKeyValue,
   MIGRATION_MARKER,
