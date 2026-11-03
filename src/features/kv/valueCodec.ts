@@ -302,6 +302,21 @@ const defineOwn = (target: object, key: string, value: unknown): void => {
 };
 
 /**
+ * True when `text` carries the codec's own layout (JSON of two elements, the layout's version first), so a store that
+ * shares its storage with other writers tells their text, which it reads as no value, from its own, whose decoding
+ * failure it reports.
+ */
+export function isEncodedText(text: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return false;
+  }
+  return Array.isArray(parsed) && parsed.length === 2 && parsed[0] === FORMAT;
+}
+
+/**
  * Decodes text `encodeValue` wrote.
  *
  * @throws {Error} When the text is not one `encodeValue` writes.

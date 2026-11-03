@@ -7,7 +7,7 @@
  */
 
 import type { KeyValueStore } from './keyValueStore';
-import { decodeValue, encodeValue } from './valueCodec';
+import { decodeValue, encodeValue, isEncodedText } from './valueCodec';
 
 /** The storage refused a write for want of room: the caller says so in its own words; the message names no key or value. */
 export class StorageFullError extends Error {
@@ -29,8 +29,8 @@ function isQuotaError(error: unknown): boolean {
 /**
  * A `KeyValueStore` over a `Storage`. Each value is kept as the codec's text, so a value comes back as the structured
  * clone gives it back (a `Date` as a `Date`, `undefined` as a held key with no value). A value under a key that is not
- * the codec's text (another writer's) reads as undefined. Nothing of it outlives what the browser keeps of that
- * storage: `sessionStorage` goes with the tab.
+ * the codec's text (another writer's) reads as undefined; the codec's own text, malformed, is an error. Nothing of it
+ * outlives what the browser keeps of that storage: `sessionStorage` goes with the tab.
  */
 export class WebStorageKeyValueStore implements KeyValueStore {
   /** Always false: the values live as long as the storage keeps them. */
@@ -38,15 +38,15 @@ export class WebStorageKeyValueStore implements KeyValueStore {
 
   constructor(private readonly storage: Storage) {}
 
-  /** The value held under `key`, or undefined when there is none or it is not the codec's text. */
+  /**
+   * The value held under `key`, or undefined when there is none or another writer's text is there.
+   *
+   * @throws {Error} When the text is in the codec's own layout and malformed, as the SQL store reports it.
+   */
   async get<T = unknown>(key: string): Promise<T | undefined> {
     const text = this.storage.getItem(key);
-    if (text === null) return undefined;
-    try {
-      return decodeValue(text) as T;
-    } catch {
-      return undefined;
-    }
+    if (text === null || !isEncodedText(text)) return undefined;
+    return decodeValue(text) as T;
   }
 
   /**
