@@ -139,6 +139,15 @@ describe('WebStorageKeyValueStore', () => {
     await expect(store.set('k', 1)).rejects.toBe(plain);
   });
 
+  it("throws for a value in the codec's own format that is malformed, as the SQL store does, rather than reading it as missing", async () => {
+    const storage = new MapStorage();
+    const store = new WebStorageKeyValueStore(storage);
+    // the codec's format marker, with a node of a kind the codec never writes
+    storage.items.set('broken', '[1,["no such kind"]]');
+
+    await expect(store.get('broken')).rejects.toThrow(/malformed/);
+  });
+
   it("reads a value another writer put in a shape the codec does not write as undefined, never a throw", async () => {
     const storage = new MapStorage();
     const store = new WebStorageKeyValueStore(storage);
