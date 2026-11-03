@@ -382,7 +382,7 @@ export function decodeValue(text: string): unknown {
         return BigInt(String(node[1]));
       case 'r': {
         const id = node[1];
-        if (typeof id !== 'number' || id < 0 || id >= objects.length) throw malformed();
+        if (typeof id !== 'number' || !Number.isInteger(id) || id < 0 || id >= objects.length) throw malformed();
         return objects[id];
       }
       case 'o': {
