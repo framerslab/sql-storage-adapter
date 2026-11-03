@@ -1,5 +1,11 @@
 ## [Unreleased]
 
+### Added
+- `WebStorageKeyValueStore` in `@framers/sql-storage-adapter/kv`: a `KeyValueStore` over a page's `Storage` (`sessionStorage` for a tab's own copy, `localStorage` for one the browser keeps). Values go through the SQL store's codec, so a `Date` comes back as a `Date` and `undefined` as a held key with no value; a key another writer filled with text that is not the codec's reads as undefined, and the codec's own text, malformed, is an error, as the SQL store reports it. A write the storage refuses for want of room (a `DOMException` named `QuotaExceededError` or `NS_ERROR_DOM_QUOTA_REACHED`, or with code 22) is refused as `StorageFullError`, whose message names no key or value; any other failure passes through.
+
+### Fixed
+- The value codec reports a reference to a place between two objects (`["r",0.5]`) as malformed; it read it as a missing value.
+
 ## [0.9.3] - 2026-11-02
 
 ### Fixed

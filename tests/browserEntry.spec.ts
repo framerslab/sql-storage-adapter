@@ -109,6 +109,8 @@ describe('the browser entry', () => {
       'namespaced',
       'MemoryKeyValueStore',
       'openIndexedDbStore',
+      'WebStorageKeyValueStore',
+      'StorageFullError',
       'migrateIndexedDbKeyValue',
       'MIGRATION_MARKER',
       'createTabLock',

@@ -57,6 +57,7 @@ const MODULE_FILES = [
   'migrateIndexedDbKeyValue.ts',
   'sqlKeyValueStore.ts',
   'valueCodec.ts',
+  'webStorageKeyValueStore.ts',
 ];
 
 describe('the key-value module', () => {
@@ -79,6 +80,13 @@ describe('the key-value module', () => {
       }
     },
   );
+
+  it('exports the Web Storage store and its refusal from the entry', async () => {
+    const entry = await import('../../src/features/kv/index.js');
+
+    expect(typeof entry.WebStorageKeyValueStore).toBe('function');
+    expect(typeof entry.StorageFullError).toBe('function');
+  });
 
   it.each(['sqlKeyValueStore.ts', 'migrateIndexedDbKeyValue.ts'])('%s names the adapter contract for types only', (name) => {
     const { runtime, typesOnly } = importsOf(path.join(KV_DIR, name));

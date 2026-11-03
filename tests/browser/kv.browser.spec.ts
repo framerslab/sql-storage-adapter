@@ -2,7 +2,13 @@ import { describe, expect, it, afterEach } from 'vitest';
 import wasmUrl from 'sql.js/dist/sql-wasm.wasm?url';
 import browserWasmUrl from 'sql.js/dist/sql-wasm-browser.wasm?url';
 import { IndexedDbAdapter } from '../../src/adapters/indexedDbAdapter';
-import { createSqlKeyValueStore, openIndexedDbStore } from '../../src/features/kv/index';
+import {
+  createSqlKeyValueStore,
+  namespaced,
+  openIndexedDbStore,
+  StorageFullError,
+  WebStorageKeyValueStore,
+} from '../../src/features/kv/index';
 
 // The key-value module in the browsers themselves, Chromium, WebKit and
 // Firefox: the IndexedDB store reads a database another page made where it is,
@@ -176,5 +182,49 @@ describe('the key-value module in a browser', () => {
       (error: unknown) => error,
     );
     expect((refused as { name?: string } | null)?.name).toBe('DataCloneError');
+  });
+});
+
+// The Web Storage store on each browser's own storage, and its own refusal when the storage is full: the exception
+// differs by engine (a DOMException named QuotaExceededError, code 22, in Chromium and WebKit; Firefox's name has been
+// NS_ERROR_DOM_QUOTA_REACHED), and the store answers each as StorageFullError. The full case fills localStorage, whose
+// quota every engine sets at some megabytes; sessionStorage throws the same exception at its own quota.
+describe('the Web Storage store in a browser', () => {
+  // Only the keys these cases write go: the test runner's page may keep its own.
+  afterEach(async () => {
+    await new WebStorageKeyValueStore(sessionStorage).deletePrefix('demo/');
+    const local = new WebStorageKeyValueStore(localStorage);
+    await local.deletePrefix('fill/');
+    await local.delete('kept');
+  });
+
+  it("keeps a tab's values in sessionStorage under its namespace, as the codec's text", async () => {
+    const store = namespaced(new WebStorageKeyValueStore(sessionStorage), 'demo/go-1/');
+    const saved = new Date('2026-10-20T09:30:00.000Z');
+    await store.set('notes', [{ id: 'n1', title: 'Hotel', saved }]);
+
+    const read = await store.get<Array<{ id: string; title: string; saved: Date }>>('notes');
+    expect(read?.[0]?.saved).toBeInstanceOf(Date);
+    expect(read?.[0]?.saved.toISOString()).toBe(saved.toISOString());
+    expect(Object.keys(sessionStorage).filter((key) => key.startsWith('demo/'))).toEqual(['demo/go-1/notes']);
+    expect(store.memoryOnly).toBe(false);
+  });
+
+  it("refuses a write past the browser's quota as StorageFullError and keeps what was held", async () => {
+    const store = new WebStorageKeyValueStore(localStorage);
+    await store.set('kept', 'the first note');
+    const chunk = 'x'.repeat(512 * 1024);
+    let refused: unknown = null;
+    // 64 chunks are 32 million characters, past every engine's quota; a browser that took them all fails the case.
+    for (let index = 0; index < 64 && refused === null; index += 1) {
+      refused = await store.set(`fill/${index}`, chunk).then(
+        () => null,
+        (error: unknown) => error,
+      );
+    }
+
+    expect(refused).toBeInstanceOf(StorageFullError);
+    expect((refused as Error).message).not.toContain('fill/');
+    expect(await store.get('kept')).toBe('the first note');
   });
 });
