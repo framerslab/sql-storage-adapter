@@ -197,4 +197,13 @@ describe('the SQL key-value store value text', () => {
 
     expect(roundTrip(value)).toStrictEqual({ field: 'first' });
   });
+
+  // A reference names an object by the place it was met in; a place between
+  // two places is no place, and read as one it gave back a missing value.
+  it.each([
+    ['half a place', '[1,["o",["x",["r",0.5]]]]'],
+    ['a place and a half', '[1,["o",["x",["o",["y",["r",1.5]]]]]]'],
+  ])('reports a reference to %s as malformed', (_name, text) => {
+    expect(() => decodeValue(text)).toThrow(/malformed/);
+  });
 });
