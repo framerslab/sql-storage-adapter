@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
-// Decides what a push to master publishes, for .github/workflows/release.yml,
-// which runs it before it installs anything: it uses Node's own modules alone.
+// Decides what master publishes, for .github/workflows/release.yml, which runs
+// it daily (and when started by hand) before it installs anything: it uses
+// Node's own modules alone.
 //
-// A push publishes when a file the package ships changed since the newest
+// A run publishes when a file the package ships changed since the newest
 // published version, or when package.json names a version above every
 // published one. The version is package.json's in the second case and the
 // newest published version with its patch raised by one in the first. The
@@ -23,8 +24,9 @@
 // master's package.json keeps the version a maintainer last named.
 //
 // Only the run of master's head publishes: a run of an older commit, such as
-// a re-run, publishes nothing, since master's head holds its changes and that
-// commit's own run publishes them.
+// a re-run or a run whose commit master moved past while it tested, publishes
+// nothing, since master's head holds its changes and the next run publishes
+// them.
 //
 // Usage: node scripts/release-version.mjs [--notes <folder>]
 // Writes publish, version, base, base_commit, release, release_commit, repair
@@ -81,14 +83,14 @@ export function raisePatch(version) {
  * before its release), whose release and tag it makes at repairCommit.
  *
  * tip is master's head when the run decides: a run of an older commit
- * publishes nothing, since the tip's own run carries its changes. commitOf
+ * publishes nothing, since the next run of the tip carries its changes. commitOf
  * (version) resolves to { commit, tagged } or null.
  */
 export async function planRelease({ packageVersion, latest, published = [], tagVersions, head, tip, commitOf, isAncestor, shippedChanged, isPublished }) {
   const skipped = { publish: false, version: null, base: null, baseCommit: null, release: null, releaseCommit: null, repair: null, repairCommit: null };
   if (tip && tip !== head) {
     if (await isAncestor(head, tip)) {
-      return { ...skipped, reason: `master has moved past this commit to ${tip.slice(0, 8)}, whose own run publishes this one's changes` };
+      return { ...skipped, reason: `master has moved past this commit to ${tip.slice(0, 8)}, whose run publishes this one's changes` };
     }
     throw new Error(`master's tip ${tip.slice(0, 8)} does not hold this commit ${head.slice(0, 8)}: only master publishes`);
   }
