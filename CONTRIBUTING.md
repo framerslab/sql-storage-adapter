@@ -192,10 +192,10 @@ docs: update README with Capacitor examples
 
 ## Release Process
 
-Every push to `master` that changes what the package ships publishes it. The [release workflow](https://github.com/framerslab/sql-storage-adapter/blob/master/.github/workflows/release.yml) decides the version before it installs anything: the newest published version with its patch raised by one, or `package.json`'s version when that is higher. It then installs, runs the tests, builds, publishes to npm and creates the GitHub release `v<version>`, which creates the tag. Nothing is committed to `master`. [RELEASING.md](./RELEASING.md) has the whole decision.
+A release runs daily at 10:17 UTC when `master` holds changes to what the package ships since the newest published version; a merge to `master` runs quick checks and publishes nothing by itself. The [release workflow](https://github.com/framerslab/sql-storage-adapter/blob/master/.github/workflows/release.yml) decides the version before it installs anything: the newest published version with its patch raised by one, or `package.json`'s version when that is higher. It then runs the whole CI suite, builds, publishes to npm and creates the GitHub release `v<version>`, which creates the tag. Nothing is committed to `master`. To release now, start it by hand on `master` (`gh workflow run release.yml --ref master`; `-f dry_run=true` stops before the publish). [RELEASING.md](./RELEASING.md) has the whole decision.
 
-- **A fix** needs no release step: its merge publishes the next patch. Add its notes to `CHANGELOG.md` under `## [Unreleased]`.
-- **A new minor or major version**: raise `version` in `package.json` in the pull request, following [semantic versioning](https://semver.org/) (MAJOR for breaking changes, 1.0.0 to 2.0.0; MINOR for new features, backward compatible, 1.0.0 to 1.1.0), and add a section to `CHANGELOG.md` headed `## [x.y.z]` with what was added, changed, deprecated, removed and fixed. The merge publishes that version, with that section as its release notes.
+- **A fix** needs no release step: the next daily run after its merge publishes the next patch. Add its notes to `CHANGELOG.md` under `## [Unreleased]`.
+- **A new minor or major version**: raise `version` in `package.json` in the pull request, following [semantic versioning](https://semver.org/) (MAJOR for breaking changes, 1.0.0 to 2.0.0; MINOR for new features, backward compatible, 1.0.0 to 1.1.0), and add a section to `CHANGELOG.md` headed `## [x.y.z]` with what was added, changed, deprecated, removed and fixed. The next daily run after the merge publishes that version, with that section as its release notes.
 
 Do not push a version tag by hand: the workflow creates it with the GitHub release.
 

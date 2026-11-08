@@ -1,13 +1,77 @@
 name: CI
 
+# A pull request runs the whole suite (build, postgres18 and browser, the checks
+# master's rules require). A push to master, a merged pull request, runs the
+# quick job alone: lint, type check and the tests the push changed. The release
+# workflow calls this workflow (workflow_call) before each daily release, which
+# runs the whole suite with coverage on master and uploads it to Codecov. A
+# called workflow sees its caller's event (schedule or workflow_dispatch) in
+# github.event_name, so the whole suite runs there.
 on:
   push:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  workflow_call:
+    secrets:
+      CODECOV_TOKEN:
+        required: false
 
 jobs:
+  quick:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg16
+        env:
+          POSTGRES_USER: adapter
+          POSTGRES_PASSWORD: adapter
+          POSTGRES_DB: adapter_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U adapter -d adapter_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TZ: Europe/Berlin
+      POSTGRES_TEST_URL: postgresql://adapter:adapter@localhost:5432/adapter_test
+      SYNC_TEST_REQUIRE_POSTGRES: '1'
+      SYNC_TEST_POSTGRES_URL: postgresql://adapter:adapter@localhost:5432/adapter_test
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The commit before the push, which the changed-tests run compares with.
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Lint
+        run: npm run lint || true
+
+      - name: TypeCheck
+        run: npm run typecheck
+
+      # The specs whose files, or the modules they import, the push changed.
+      - name: Run the tests the push changed
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          since="$BEFORE"
+          if [ -z "$since" ] || [ "$since" = 0000000000000000000000000000000000000000 ] || ! git cat-file -e "${since}^{commit}" 2>/dev/null; then
+            since="$(git rev-parse HEAD~1)"
+          fi
+          echo "Tests affected by the changes since ${since}"
+          npx vitest run --changed "$since" --passWithNoTests
+
   build:
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # The Postgres specs that need a server (createDatabase.postgres,
     # postgres.integration, postgres.dialect.integration, postgres.segment,
@@ -252,6 +316,7 @@ jobs:
 
 
   postgres18:
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -284,6 +349,7 @@ jobs:
   # key-value module, on the browsers' own IndexedDB, Web Locks and structured
   # clone: Chromium, WebKit and Firefox, through Playwright.
   browser:
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

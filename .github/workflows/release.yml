@@ -1,10 +1,25 @@
 name: Release sql-storage-adapter
 
+# A release runs once a day, at 10:17 UTC, when master holds releasable
+# changes, and whenever a maintainer starts this workflow by hand on master
+# (Actions, Release sql-storage-adapter, Run workflow; or
+# `gh workflow run release.yml --ref master`). A merge to master publishes
+# nothing by itself: ci.yml's quick checks run on it, and the next daily run
+# publishes what it changed. GitHub may start a scheduled run some minutes late
+# when Actions is under load. RELEASING.md has the whole flow.
 on:
-  push:
-    branches:
-      - master
+  schedule:
+    - cron: '17 10 * * *'
   workflow_dispatch:
+    inputs:
+      force:
+        description: Skip the releasable-changes check and run the suite and the release job (the release job still decides the version, and publishes nothing when nothing changed)
+        type: boolean
+        default: false
+      dry_run:
+        description: Run everything up to the publish and stop there (no npm publish, tag or GitHub release)
+        type: boolean
+        default: false
 
 # One release run at a time, in the order the runs began to wait: a run that
 # starts while another runs waits for it, and up to 100 wait (queue: max), so a
@@ -16,10 +31,78 @@ concurrency:
   cancel-in-progress: false
   queue: max
 
+permissions:
+  contents: read
+
 jobs:
-  publish:
+  # Seconds, with git and Node alone: nothing is installed. It runs the release
+  # decision (scripts/release-version.mjs) and ends the run green when nothing
+  # is releasable.
+  gate:
+    name: Releasable changes
     # A run started by hand on another branch publishes nothing.
     if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      releasable: ${{ steps.decide.outputs.releasable }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          # Every commit and tag: the decision finds the commit the newest
+          # version was published from and compares master with it.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Use Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Read the release decision
+        id: plan
+        run: node scripts/release-version.mjs
+
+      - name: Decide whether to run the suite and the release
+        id: decide
+        env:
+          PUBLISH: ${{ steps.plan.outputs.publish }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          REPAIR: ${{ steps.plan.outputs.repair }}
+          FORCE: ${{ inputs.force == true }}
+        run: |
+          if [ "$FORCE" = true ]; then
+            releasable=true
+            reason="force is set, so the check is skipped; the release job decides the version again"
+          elif [ "$PUBLISH" = true ]; then
+            releasable=true
+            reason="master holds releasable changes: ${VERSION} would be published"
+          elif [ -n "$REPAIR" ]; then
+            releasable=true
+            reason="no tag names v${REPAIR}, the newest published version: the release job makes its GitHub release"
+          else
+            releasable=false
+            reason="nothing releasable on master since the newest published version; no install, build or test runs"
+          fi
+          echo "Releasable: ${releasable} (${reason})"
+          echo "releasable=${releasable}" >> "$GITHUB_OUTPUT"
+          echo "Releasable: ${releasable} (${reason})" >> "$GITHUB_STEP_SUMMARY"
+
+  # The full suite of ci.yml on this commit, with coverage uploaded to Codecov,
+  # which keeps master's coverage badge current.
+  suite:
+    needs: gate
+    if: needs.gate.outputs.releasable == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  publish:
+    needs: [gate, suite]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -45,10 +128,11 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      # A push that changed a file the package ships publishes the newest
-      # published version with its patch raised by one, or package.json's
-      # version when that is higher; only the run of master's head publishes
-      # (RELEASING.md).
+      # The decision again, at publish time: a file the package ships changed
+      # since the newest published version publishes that version with its patch
+      # raised by one, or package.json's version when that is higher. Only a run
+      # of master's head publishes: when master moved while the suite ran, this
+      # run publishes nothing and the next one publishes (RELEASING.md).
       - name: Decide the version to publish
         id: plan
         run: node scripts/release-version.mjs --notes "$RUNNER_TEMP"
@@ -56,10 +140,6 @@ jobs:
       - name: Install dependencies
         if: steps.plan.outputs.publish == 'true'
         run: npm install
-
-      - name: Run tests
-        if: steps.plan.outputs.publish == 'true'
-        run: npx vitest run
 
       - name: Build package
         if: steps.plan.outputs.publish == 'true'
@@ -72,19 +152,38 @@ jobs:
           VERSION: ${{ steps.plan.outputs.version }}
         run: npm version "$VERSION" --no-git-tag-version --allow-same-version
 
+      - name: Stop before the publish (dry run)
+        if: inputs.dry_run == true
+        env:
+          PUBLISH: ${{ steps.plan.outputs.publish }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          REPAIR: ${{ steps.plan.outputs.repair }}
+        run: |
+          if [ "$PUBLISH" = true ]; then
+            npm pack --dry-run
+            line="Dry run: would publish ${VERSION}; nothing was published, tagged or released."
+          else
+            line="Dry run: nothing to publish."
+          fi
+          if [ -n "$REPAIR" ]; then
+            line="${line} Would make the missing GitHub release of v${REPAIR}."
+          fi
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+
       # Trusted publishing needs npm 11.5.1 or later.
       - name: npm 11.20.0 for trusted publishing
-        if: steps.plan.outputs.publish == 'true'
+        if: steps.plan.outputs.publish == 'true' && inputs.dry_run != true
         run: npm install -g npm@11.20.0 && npm --version
 
       - name: Publish to npm
-        if: steps.plan.outputs.publish == 'true'
+        if: steps.plan.outputs.publish == 'true' && inputs.dry_run != true
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub release
-        if: steps.plan.outputs.release != ''
+        if: steps.plan.outputs.release != '' && inputs.dry_run != true
         uses: ncipollo/release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -98,7 +197,7 @@ jobs:
       # The newest published version when no tag names it: a run that published
       # it and failed before its release.
       - name: Make the missing release of the newest published version
-        if: steps.plan.outputs.repair != ''
+        if: steps.plan.outputs.repair != '' && inputs.dry_run != true
         uses: ncipollo/release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
