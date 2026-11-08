@@ -34,6 +34,12 @@ concurrency:
 permissions:
   contents: read
 
+# Electron is a dev dependency for its types; no job launches it. Its install
+# script downloads the binary from GitHub's release servers, which answered the
+# runners with 504s on 8 November and failed the daily release, so it is skipped.
+env:
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
 jobs:
   # Seconds, with git and Node alone: nothing is installed. It runs the release
   # decision (scripts/release-version.mjs) and ends the run green when nothing
