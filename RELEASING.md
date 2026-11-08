@@ -4,7 +4,7 @@
 
 ## What starts a release
 
-A schedule: the workflow runs once a day at 10:17 UTC, and publishes when `master` holds releasable changes since the newest published version. GitHub can start a scheduled run some minutes late when Actions is under load ([GitHub's events page](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)). A merge to `master` publishes nothing by itself: `ci.yml`'s quick checks run on it (lint, type check and the tests the push changed), and the next daily run publishes it.
+A schedule: the workflow runs once a day at 10:17 UTC, and publishes when `master` holds releasable changes since the newest published version. GitHub can start a scheduled run some minutes late when Actions is under load ([GitHub's events page](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)). A merge to `master` publishes nothing by itself: `ci.yml`'s quick checks run on it (lint, type check and the tests the push changed), and the next daily run publishes it. GitHub turns off a public repository's scheduled workflows after 60 days with no activity in it; the Actions tab turns this one on again.
 
 To release now, start the workflow by hand on `master`: Actions, Release sql-storage-adapter, Run workflow, or
 
