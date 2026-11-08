@@ -103,6 +103,8 @@ jobs:
 
   publish:
     needs: [gate, suite]
+    # Only after the suite passed on a releasable master.
+    if: needs.gate.outputs.releasable == 'true' && needs.suite.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write

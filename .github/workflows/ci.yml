@@ -49,6 +49,16 @@ jobs:
         with:
           node-version: '22'
 
+      # Seconds, and outside Vitest: the release workflow's suite runs only when
+      # the package changed, so a push that changes only the workflows is
+      # checked here.
+      - name: No workflow pushes to master
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          node --test .github/scripts/check-workflow-pushes.test.mjs
+          node .github/scripts/check-workflow-pushes.mjs
+
       - name: Install dependencies
         run: npm install
 
@@ -65,10 +75,12 @@ jobs:
         run: |
           since="$BEFORE"
           if [ -z "$since" ] || [ "$since" = 0000000000000000000000000000000000000000 ] || ! git cat-file -e "${since}^{commit}" 2>/dev/null; then
-            since="$(git rev-parse HEAD~1)"
+            echo "The commit before the push is not in the history; running every test"
+            npx vitest run
+          else
+            echo "Tests affected by the changes since ${since}"
+            npx vitest run --changed "$since" --passWithNoTests
           fi
-          echo "Tests affected by the changes since ${since}"
-          npx vitest run --changed "$since" --passWithNoTests
 
   build:
     if: github.event_name != 'push'
