@@ -69,6 +69,9 @@ jobs:
         run: npm run typecheck
 
       # The specs whose files, or the modules they import, the push changed.
+      # Coverage is off here: vitest.config.ts turns it on with thresholds over
+      # all of src/, which a few specs alone need not meet. The release run's
+      # whole suite collects it.
       - name: Run the tests the push changed
         env:
           BEFORE: ${{ github.event.before }}
@@ -76,10 +79,10 @@ jobs:
           since="$BEFORE"
           if [ -z "$since" ] || [ "$since" = 0000000000000000000000000000000000000000 ] || ! git cat-file -e "${since}^{commit}" 2>/dev/null; then
             echo "The commit before the push is not in the history; running every test"
-            npx vitest run
+            npx vitest run --coverage.enabled=false
           else
             echo "Tests affected by the changes since ${since}"
-            npx vitest run --changed "$since" --passWithNoTests
+            npx vitest run --changed "$since" --passWithNoTests --coverage.enabled=false
           fi
 
   build:
