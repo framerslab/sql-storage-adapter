@@ -611,6 +611,27 @@ if (db instanceof PostgresAdapter) {
 - `allowExitOnIdle` is pg's option: Node can exit while every pooled connection is idle. Without it, idle connections keep the process running until `idleTimeoutMillis` (10 seconds by default) closes them.
 - On a segmented adapter, `withConnection()` and `transaction()` run in the segment, as every connection of its pool does, and a `CREATE EXTENSION` that names no schema still installs into `public`. `getPoolStats()` counts a pool of yours too.
 
+#### A client you already hold
+
+`onClient(client)` runs the adapter's calls on a Postgres client you hold, such as one inside a transaction an ORM opened over the same pool, so a read sees your uncommitted writes and takes no second connection:
+
+```typescript
+const client = await pool.connect(); // the pool your ORM runs on
+try {
+  await client.query('BEGIN');
+  await client.query('INSERT INTO notes (id, body) VALUES ($1, $2)', [1, 'draft']);
+  const note = await db.onClient(client).get('SELECT body FROM notes WHERE id = ?', [1]); // { body: 'draft' }
+  await client.query('COMMIT');
+} finally {
+  client.release();
+}
+```
+
+- The view has `run`, `get`, `all` and `exec`, with the adapter's `?` placeholders, and its statements run on `client` alone: it takes no connection of the pool and works before `open()`.
+- It never releases the client: its `close()` does nothing, and you release or end the client yourself.
+- Its `transaction()` and `batch()` reject, since you own the transaction: run `BEGIN`, `COMMIT` and `ROLLBACK` on the client. Its `capabilities` leave out `transactions` and `batch`.
+- A segmented adapter refuses `onClient()`: the segment's `search_path` is set when each connection of the adapter's own pool starts, and a client you hold did not start that way.
+
 ### sql.js Saves to a File
 
 ```typescript
