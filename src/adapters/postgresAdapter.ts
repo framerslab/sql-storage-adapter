@@ -42,6 +42,14 @@ export interface PostgresPoolClientLike {
 }
 
 /**
+ * A Postgres client the caller holds, for `onClient()`: a pg `PoolClient` it
+ * checked out, or a pg `Client` it connected. Only `query` is used.
+ */
+export interface PostgresClientLike {
+  query(text: string, values?: unknown[]): Promise<PostgresQueryResultLike>;
+}
+
+/**
  * The part of pg's `Pool` the adapter uses. A `Pool` from `pg` is one; so is
  * any object with these members.
  */
@@ -1055,6 +1063,61 @@ class PostgresConnectionAdapter implements PostgresConnection {
   }
 }
 
+const ON_CLIENT_NO_TRANSACTION =
+  'onClient(): the caller holds this client and owns its transaction. Run BEGIN, COMMIT and ROLLBACK on the client ' +
+  'itself, or use the adapter\'s own transaction().';
+
+/**
+ * The adapter's calls bound to a client the caller holds (`onClient()`). Its
+ * statements run on that client, inside whatever transaction the caller has
+ * open on it. It takes no connection of the pool, never releases the client,
+ * and refuses `transaction()` and `batch()`, since the caller owns the
+ * transaction.
+ */
+class PostgresClientAdapter implements StorageAdapter {
+  public readonly kind = 'postgres';
+  private readonly query: QueryRunner;
+
+  constructor(
+    client: PostgresClientLike,
+    public readonly capabilities: ReadonlySet<StorageCapability>,
+  ) {
+    this.query = (text, values) => client.query(text, values);
+  }
+
+  public async open(): Promise<void> {
+    // The caller connected the client.
+  }
+
+  public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
+    return runWith(this.query, statement, parameters);
+  }
+
+  public async get<T>(statement: string, parameters?: StorageParameters): Promise<T | null> {
+    return getWith<T>(this.query, statement, parameters);
+  }
+
+  public async all<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
+    return allWith<T>(this.query, statement, parameters);
+  }
+
+  public async exec(script: string): Promise<void> {
+    await execWith(this.query, script);
+  }
+
+  public async transaction<T>(_fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
+    throw new Error(ON_CLIENT_NO_TRANSACTION);
+  }
+
+  public async batch(_operations: BatchOperation[]): Promise<BatchResult> {
+    throw new Error(ON_CLIENT_NO_TRANSACTION);
+  }
+
+  public async close(): Promise<void> {
+    // The caller releases or ends the client; the adapter never does.
+  }
+}
+
 /**
  * PostgreSQL adapter for production-grade SQL operations.
  *
@@ -1175,6 +1238,8 @@ class PostgresConnectionAdapter implements PostgresConnection {
  * - `transaction(fn, { isolationLevel, readOnly, deferrable })` sets how the
  *   transaction begins.
  * - `allowExitOnIdle` lets Node exit while the pool is idle.
+ * - `onClient(client)` runs the adapter's calls on a client the caller
+ *   holds, inside the caller's own transaction.
  */
 /**
  * Production-grade PostgreSQL adapter backed by pg.Pool.
@@ -1517,6 +1582,44 @@ export class PostgresAdapter implements StorageAdapter {
       watch.stop();
       client.release(releaseError ?? connection.brokenBy ?? watch.failure());
     }
+  }
+
+  /**
+   * The adapter's calls (`run`, `get`, `all`, `exec`) bound to a client the
+   * caller already holds, such as one inside a transaction an ORM opened over
+   * the same pool: the statements run on that client, so they see the
+   * caller's uncommitted writes and commit or roll back with its transaction.
+   * The view takes no connection of the pool and works before `open()`; its
+   * `close()` never releases the client. Its `transaction()` and `batch()`
+   * reject, since the caller owns the transaction.
+   *
+   * A segmented adapter refuses: the segment's `search_path` is set when each
+   * connection of the adapter's own pool starts, and a client the caller
+   * holds did not start that way, so the statements would run outside the
+   * segment.
+   *
+   * @example
+   * ```typescript
+   * const client = await pool.connect();
+   * await client.query('BEGIN');
+   * await client.query('INSERT INTO notes (id, body) VALUES ($1, $2)', [1, 'draft']);
+   * const note = await db.onClient(client).get('SELECT body FROM notes WHERE id = ?', [1]); // sees the draft
+   * await client.query('COMMIT');
+   * client.release();
+   * ```
+   */
+  public onClient(client: PostgresClientLike): StorageAdapter {
+    if (this.segmentStatements) {
+      throw new Error(
+        `PostgresAdapter: onClient() cannot run on segment "${this.segmentStatements.segment}": the segment's search_path is ` +
+          "set when each connection of the adapter's own pool starts, and a client the caller holds did not start that way, " +
+          "so its statements would run outside the segment. Use the adapter's transaction() or withConnection() instead.",
+      );
+    }
+    const capabilities = new Set(this.capabilities);
+    capabilities.delete('transactions');
+    capabilities.delete('batch');
+    return new PostgresClientAdapter(client, capabilities);
   }
 
   /**

@@ -1,6 +1,7 @@
 ## [Unreleased]
 
 ### Added
+- `PostgresAdapter.onClient(client)`: the adapter's `run`, `get`, `all` and `exec` bound to a Postgres client the caller holds, such as one inside a transaction an ORM opened over the same pool, so a read sees the caller's uncommitted writes and takes no second connection. The view never releases the client and refuses `transaction()` and `batch()`, since the caller owns the transaction; a segmented adapter refuses `onClient()`. `tests/postgres.onClient.spec.ts` reads, on a pool of one held connection, a row the caller wrote in its open transaction.
 - `WebStorageKeyValueStore` in `@framers/sql-storage-adapter/kv`: a `KeyValueStore` over a page's `Storage` (`sessionStorage` for a tab's own copy, `localStorage` for one the browser keeps). Values go through the SQL store's codec, so a `Date` comes back as a `Date` and `undefined` as a held key with no value; a key another writer filled with text that is not the codec's reads as undefined, and the codec's own text, malformed, is an error, as the SQL store reports it. A write the storage refuses for want of room (a `DOMException` named `QuotaExceededError` or `NS_ERROR_DOM_QUOTA_REACHED`, or with code 22) is refused as `StorageFullError`, whose message names no key or value; any other failure passes through.
 
 ### Fixed
