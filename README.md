@@ -508,6 +508,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({ adapter: createAut
 ```
 
 - **Tables.** They are `auth_users`, `auth_accounts`, `auth_sessions` and `auth_verification_tokens`; `tablePrefix` changes the `auth_`. Ids are text, from `crypto.randomUUID()` unless Auth.js passes one or `generateId` is given. Times are `timestamptz` on PostgreSQL and ISO 8601 text on SQLite, and Dates either way in JavaScript.
+- **Emails.** `getUserByEmail` compares case-insensitively, so a user saved as `Person@Example.test` is found as `person@example.test`. Emails are stored as given. SQLite's `lower()` folds only A to Z; PostgreSQL's follows the database's locale. The column's `UNIQUE` is case-sensitive, so two sign-ups that run at the same moment with different case can each make a user; when two users differ only in case, the exact spelling is returned.
 - **Deletes.** `deleteUser` deletes the user's sessions and accounts first, in one transaction, so it holds on engines that leave foreign keys off.
 - **Verification tokens.** `useVerificationToken` deletes and returns the token in one statement (`DELETE ... RETURNING`), so a token works once.
 - **Passkeys.** WebAuthn authenticators are not stored.

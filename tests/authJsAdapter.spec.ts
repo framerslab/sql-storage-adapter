@@ -1,4 +1,4 @@
-import { describe } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
   createAuthJsAdapter,
   createBetterSqliteAdapter,
@@ -29,8 +29,10 @@ describe.each(engines)('createAuthJsAdapter on %s', (_engine, makeAdapter) => {
   const tablePrefix = `authjs_${Math.random().toString(36).slice(2, 8)}_`;
   const t = (name: string): string => `${tablePrefix}${name}`;
 
+  const adapter = createAuthJsAdapter(db, { tablePrefix });
+
   runBasicTests({
-    adapter: createAuthJsAdapter(db, { tablePrefix }),
+    adapter,
     db: {
       connect: async () => {
         await db.open();
@@ -82,5 +84,19 @@ describe.each(engines)('createAuthJsAdapter on %s', (_engine, makeAdapter) => {
         return row ? { identifier: row.identifier, token: row.token, expires: toDate(row.expires) } : null;
       },
     },
+  });
+
+  it('getUserByEmail finds a user whatever the case of the address', async () => {
+    const user = await adapter.createUser({ email: 'Person@Example.test', emailVerified: null, name: 'Person' });
+    expect(await adapter.getUserByEmail('person@example.TEST')).toEqual(user);
+    expect(await adapter.getUserByEmail('Person@Example.test')).toEqual(user);
+    expect(await adapter.getUserByEmail('person@example.test.other')).toBeNull();
+  });
+
+  it('getUserByEmail returns the exact spelling first when two users differ only in case', async () => {
+    const upper = await adapter.createUser({ email: 'Twin@Example.test', emailVerified: null, name: 'Upper' });
+    const lower = await adapter.createUser({ email: 'twin@example.test', emailVerified: null, name: 'Lower' });
+    expect(await adapter.getUserByEmail('twin@example.test')).toEqual(lower);
+    expect(await adapter.getUserByEmail('Twin@Example.test')).toEqual(upper);
   });
 });

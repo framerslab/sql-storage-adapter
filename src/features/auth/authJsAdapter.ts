@@ -237,7 +237,13 @@ export function createAuthJsAdapter(db: StorageAdapter, options: AuthJsAdapterOp
     getUser,
 
     async getUserByEmail(email) {
-      const row = await db.get<Row>(`SELECT * FROM ${t.users} WHERE email = ?`, [email]);
+      // Case-insensitive, so Person@Example.test and person@example.test are one
+      // mailbox. The column stays case-sensitive, so rows that differ only in
+      // case can exist; the exact spelling is returned first.
+      const row = await db.get<Row>(
+        `SELECT * FROM ${t.users} WHERE lower(email) = lower(CAST(? AS TEXT)) ORDER BY CASE WHEN email = ? THEN 0 ELSE 1 END, id LIMIT 1`,
+        [email, email],
+      );
       return row ? toUser(row) : null;
     },
 
