@@ -92,4 +92,11 @@ describe.each(engines)('createAuthJsAdapter on %s', (_engine, makeAdapter) => {
     expect(await adapter.getUserByEmail('Person@Example.test')).toEqual(user);
     expect(await adapter.getUserByEmail('person@example.test.other')).toBeNull();
   });
+
+  it('getUserByEmail returns the exact spelling first when two users differ only in case', async () => {
+    const upper = await adapter.createUser({ email: 'Twin@Example.test', emailVerified: null, name: 'Upper' });
+    const lower = await adapter.createUser({ email: 'twin@example.test', emailVerified: null, name: 'Lower' });
+    expect(await adapter.getUserByEmail('twin@example.test')).toEqual(lower);
+    expect(await adapter.getUserByEmail('Twin@Example.test')).toEqual(upper);
+  });
 });
