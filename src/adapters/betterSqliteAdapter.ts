@@ -37,7 +37,18 @@ export interface BetterSqliteAdapterOptions {
    * default path and for a path given to `open()`. `:memory:` stays as it is.
    */
   segment?: string;
+  /**
+   * How long a statement waits for another connection's lock on the file
+   * before it fails with `SQLITE_BUSY`, in milliseconds: better-sqlite3's
+   * `timeout`, which sets SQLite's busy timeout. Default 5000. A transaction
+   * waits this long at its `BEGIN IMMEDIATE` for another connection's write
+   * transaction to end.
+   */
+  busyTimeoutMs?: number;
 }
+
+/** The busy timeout when `busyTimeoutMs` is not given, in milliseconds. */
+const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 
 type BetterSqliteModule = typeof import('better-sqlite3');
 type BetterSqliteDatabase = import('better-sqlite3').Database;
@@ -158,7 +169,12 @@ const normaliseRowId = (rowId: number | bigint | null | undefined): string | num
  * - Single writer at a time
  * - Opens the file in its own journal mode: no `journal_mode` pragma is set, so a file made by this adapter runs SQLite's
  *   default rollback journal unless the caller set WAL on it; a reader holding a read transaction (a backup, an inspection)
- *   can therefore make a writer's commit wait out `timeout` (5,000 ms) and fail `SQLITE_BUSY`
+ *   can therefore make a writer's commit wait out the busy timeout (`busyTimeoutMs`, 5,000 ms) and fail `SQLITE_BUSY`
+ * - `transaction()` and `batch()` begin with `BEGIN IMMEDIATE` (plain `BEGIN` on a read-only connection), so a
+ *   transaction takes the write lock before its first read and waits out the busy timeout for another connection's
+ *   write transaction. A deferred `BEGIN` would start as a reader, and its first write would fail at once with
+ *   `SQLITE_BUSY` (or `SQLITE_BUSY_SNAPSHOT` in WAL) once another connection had written, since SQLite does not call
+ *   the busy handler for a reader asking to become a writer
  * - No network access (local files only)
  * - Platform-specific native binaries required
  *
@@ -206,17 +222,21 @@ export class BetterSqliteAdapter implements StorageAdapter {
    */
   private gate: ConnectionGate = createConnectionGate(null);
   private readonly segment: string | undefined;
+  private readonly busyTimeoutMs: number;
+  /** Whether the open connection is read-only: its transactions begin with a plain BEGIN. */
+  private readOnly = false;
 
   /**
    * Creates a new better-sqlite3 adapter instance.
    *
    * @param defaultFilePath - Absolute path to the SQLite database file.
    *                         Will be created if it doesn't exist.
-   * @param options - The adapter's segment.
+   * @param options - The adapter's segment and busy timeout.
    * @throws {Error} When `options.segment` is not a name a segment can take.
    */
   constructor(private readonly defaultFilePath: string, options: BetterSqliteAdapterOptions = {}) {
     this.segment = options.segment === undefined ? undefined : validateSegment(options.segment);
+    this.busyTimeoutMs = options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS;
   }
 
   /**
@@ -257,9 +277,13 @@ export class BetterSqliteAdapter implements StorageAdapter {
       }
     }
 
-    const databaseOptions = options?.readOnly ? { readonly: true } : undefined;
+    const readOnly = options?.readOnly === true;
+    const databaseOptions = readOnly
+      ? { readonly: true, timeout: this.busyTimeoutMs }
+      : { timeout: this.busyTimeoutMs };
     this.gate = createConnectionGate(await loadTransactionContext());
     this.db = new DatabaseCtor(resolvedPath, databaseOptions);
+    this.readOnly = readOnly;
     if (options?.foreignKeys !== undefined) {
       this.db.exec(`PRAGMA foreign_keys = ${options.foreignKeys ? 'ON' : 'OFF'}`);
     }
@@ -352,7 +376,13 @@ export class BetterSqliteAdapter implements StorageAdapter {
     return this.runSerializedTransaction(() =>
       this.gate.hold(async (token) => {
         this.ensureOpen();
-        this.db!.exec('BEGIN');
+        // IMMEDIATE takes the write lock now, waiting out the busy timeout for
+        // another connection's write transaction. A deferred BEGIN starts as a
+        // reader, and SQLite fails its first write at once with SQLITE_BUSY
+        // (SQLITE_BUSY_SNAPSHOT in WAL) when another connection has written
+        // since, without calling the busy handler. A read-only connection
+        // cannot take the write lock, so it begins deferred.
+        this.db!.exec(this.readOnly ? 'BEGIN' : 'BEGIN IMMEDIATE');
         const transactionAdapter = createSharedConnectionTransactionAdapter(this.handleStatements(token));
         try {
           const result = await fn(transactionAdapter);
@@ -375,6 +405,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
       this.db.close();
       this.db = null;
     }
+    this.readOnly = false;
   }
 
   /**
@@ -431,7 +462,13 @@ export class BetterSqliteAdapter implements StorageAdapter {
     });
 
     try {
-      transaction();
+      // BEGIN IMMEDIATE, as transaction() begins, so a batch whose statements
+      // read before they write waits for another connection's write lock.
+      if (this.readOnly) {
+        transaction();
+      } else {
+        transaction.immediate();
+      }
     } catch (error) {
       // Transaction failed, all operations rolled back
       return {
@@ -478,6 +515,8 @@ export class BetterSqliteAdapter implements StorageAdapter {
  * - Special values like ':memory:' and 'file:' URIs are passed through.
  * - With `options.segment`, the file's name carries the segment
  *   (`app.sqlite3` becomes `app-agentos.sqlite3`).
+ * - `options.busyTimeoutMs` sets how long a statement waits for another
+ *   connection's lock (default 5000).
  *
  * @throws {Error} When `options.segment` is not a name a segment can take.
  */
