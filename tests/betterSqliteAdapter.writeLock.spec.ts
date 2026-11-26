@@ -339,8 +339,13 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     held.release();
     await held.done;
 
-    await expect(add).resolves.toMatchObject({ changes: 1 });
-    await expect(seen).resolves.toEqual({ n: 10 });
+    try {
+      await expect(add).resolves.toMatchObject({ changes: 1 });
+      await expect(seen).resolves.toEqual({ n: 10 });
+    } finally {
+      // The transaction ends before the adapters close.
+      await seen.catch(() => undefined);
+    }
   });
 
   it('keeps a busy timeout set by SQL', async () => {
