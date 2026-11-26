@@ -129,7 +129,7 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
       // With a deferred BEGIN the other process reads the same value now. With
       // BEGIN IMMEDIATE its transaction waits for this one's write lock and
       // reads nothing until this one commits.
-      await writer.waitFor('read', 1_500).catch(() => undefined);
+      await writer.waitFor('read ', 1_500).catch(() => undefined);
       await trx.run('UPDATE counter SET n = ? WHERE id = 1', [Number(row?.n) + 1]);
     });
     writer.send('committed');
