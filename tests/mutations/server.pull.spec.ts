@@ -4,7 +4,8 @@ import { PullCancelled } from '../../src/features/sync/mutations/handOver';
 import { MutationServer } from '../../src/features/sync/mutations/server';
 import { parsePullResponse } from '../../src/features/sync/mutations/wire';
 import { backends } from './backends';
-import { A, B, hex, pullOf, pulled, pushOf, world, type World } from './harness';
+import type { StorageAdapter } from '../../src/core/contracts';
+import { A, B, hex, pullOf, pulled, pullWhole, pushOf, world, type World } from './harness';
 
 const BACKENDS = await backends();
 
@@ -44,6 +45,27 @@ describe.each(BACKENDS.map((backend) => [backend.name, backend] as const))('the 
     const later = await pulled(w, A, '1');
     expect(later.patch.map((entry) => entry.id)).toEqual([hex(7)]);
     expect(later).toMatchObject({ cookie: '2', full: false, lastMutationIds: { [B]: '7' } });
+  });
+
+  it('reads in a transaction begun with readOnly, so it holds no write lock on another connection', async () => {
+    await rows(w, 3);
+    const asked: unknown[] = [];
+    const target = w.opened.adapter;
+    const adapter = new Proxy(target, {
+      get(object, key) {
+        if (key === 'transaction') {
+          return (fn: (trx: StorageAdapter) => Promise<unknown>, options?: unknown) => {
+            asked.push(options);
+            return (object.transaction as (fn: (trx: StorageAdapter) => Promise<unknown>, options?: unknown) => Promise<unknown>).call(object, fn, options);
+          };
+        }
+        const value = Reflect.get(object, key, object);
+        return typeof value === 'function' ? value.bind(object) : value;
+      },
+    });
+    const answer = await pullWhole(w, pullOf(w, A), new MutationServer({ ...w.options, adapter }));
+    expect(answer).toMatchObject({ cookie: '1' });
+    expect(asked).toEqual([{ readOnly: true }]);
   });
 
   it('keeps nothing of a stream dropped before its end, and the next pull reads whole', async () => {

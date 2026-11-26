@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { StorageAdapter } from '../src/core/contracts';
 
 // Two processes writing one SQLite file through the better-sqlite3 adapter, as
 // two containers write one per-world memory file. A transaction that reads and
@@ -176,6 +177,68 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     const batch = await adapter.batch!([{ statement: "INSERT INTO notes (body) VALUES ('refused')" }]);
     expect(batch.successful).toBe(0);
     expect(batch.errors?.map((e) => e.index)).toEqual([0]);
+  });
+
+  it('lets another connection write while a transaction opened with readOnly reads', async () => {
+    const { createBetterSqliteAdapter } = await import('../src/index.js');
+    const file = tempFile();
+    const reader = createBetterSqliteAdapter(file, { busyTimeoutMs: 2_000 });
+    const writer = createBetterSqliteAdapter(file, { busyTimeoutMs: 250 });
+    await reader.open();
+    await writer.open();
+    cleanups.push(() => reader.close(), () => writer.close());
+    await reader.exec(`
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE notes (body TEXT);
+      INSERT INTO notes (body) VALUES ('kept');
+    `);
+
+    let read!: () => void;
+    const hasRead = new Promise<void>((resolve) => {
+      read = resolve;
+    });
+    const reading = (reader.transaction as (fn: (trx: StorageAdapter) => Promise<unknown>, options: unknown) => Promise<unknown>).call(
+      reader,
+      async (trx: StorageAdapter) => {
+        const rows = await trx.all<{ body: string }>('SELECT body FROM notes');
+        read();
+        // A long read, as an export or a sync pull streaming to a slow reader is.
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        return rows;
+      },
+      { readOnly: true },
+    );
+    await hasRead;
+
+    // In WAL a reader holds no lock a writer needs. A transaction begun with
+    // BEGIN IMMEDIATE holds the write lock, and this write would wait in
+    // SQLite's busy handler, which holds the thread, so the reading callback
+    // could not reach its COMMIT and the write would fail with SQLITE_BUSY.
+    await expect(writer.run("INSERT INTO notes (body) VALUES ('added')")).resolves.toMatchObject({ changes: 1 });
+    expect(await reading).toEqual([{ body: 'kept' }]);
+    expect(await writer.all('SELECT body FROM notes ORDER BY rowid')).toEqual([{ body: 'kept' }, { body: 'added' }]);
+  }, 15_000);
+
+  it('refuses a write in a transaction opened with readOnly, and leaves the connection as it was', async () => {
+    const { createBetterSqliteAdapter } = await import('../src/index.js');
+    const adapter = createBetterSqliteAdapter(tempFile());
+    await adapter.open();
+    cleanups.push(() => adapter.close());
+    await adapter.exec('CREATE TABLE notes (body TEXT);');
+    const readOnlyTransaction = (fn: (trx: StorageAdapter) => Promise<unknown>): Promise<unknown> =>
+      (adapter.transaction as (fn: (trx: StorageAdapter) => Promise<unknown>, options: unknown) => Promise<unknown>).call(adapter, fn, { readOnly: true });
+
+    // PostgreSQL refuses a write in a READ ONLY transaction; this adapter
+    // refuses it too, rather than letting it fail later as a lost write.
+    await expect(readOnlyTransaction((trx) => trx.run("INSERT INTO notes (body) VALUES ('refused')"))).rejects.toThrow(/readonly/i);
+    await expect(adapter.run("INSERT INTO notes (body) VALUES ('kept')")).resolves.toMatchObject({ changes: 1 });
+    expect(await adapter.all('SELECT body FROM notes')).toEqual([{ body: 'kept' }]);
+
+    // A connection the caller set to query_only keeps the setting.
+    await adapter.exec('PRAGMA query_only = ON;');
+    expect(await readOnlyTransaction((trx) => trx.all('SELECT body FROM notes'))).toEqual([{ body: 'kept' }]);
+    const row = await adapter.get<Record<string, number>>('PRAGMA query_only');
+    expect(Object.values(row ?? {})).toEqual([1]);
   });
 
   it('lets a second adapter on the same file in this process wait for an open transaction without stopping it', async () => {
