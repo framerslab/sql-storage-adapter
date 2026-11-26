@@ -15,7 +15,9 @@ const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'u
 
 import type { StorageAdapter, StorageOpenOptions, StorageParameters, StorageRunResult, StorageCapability, StorageTransactionOptions, BatchOperation, BatchResult } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
+import { firstKeyword } from '../shared/queryWrites';
 import { integersAsBigInt, toSqliteStatement } from '../shared/sqlPlaceholders';
+import { sqliteStatementSpans } from '../shared/splitSqlStatements';
 import { checkFunctionName, type SqlFunction, type SqlFunctionOptions } from '../shared/sqlFunctions';
 import {
   createSerializedTransactionRunner,
@@ -64,6 +66,22 @@ const sqliteCode = (error: unknown): string => {
 };
 
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const pauseBeforeBusyRetry = (attempt: number, left: number): Promise<void> =>
+  pause(Math.min(BUSY_RETRY_DELAYS_MS[Math.min(attempt, BUSY_RETRY_DELAYS_MS.length - 1)], left));
+
+const readBusyTimeout = (db: BetterSqliteDatabase): number =>
+  Math.max(0, Number(db.pragma('busy_timeout', { simple: true })) || 0);
+
+const hasBusyTimeoutPragma = (sql: string): boolean =>
+  /\bbusy_timeout\b/i.test(sql) && sqliteStatementSpans(sql).some(({ start, end }) => {
+    const statement = sql.slice(start, end);
+    return firstKeyword(statement) === 'PRAGMA' && /\bbusy_timeout\b/i.test(statement);
+  });
+
+// The row counter can check these statements for changes. Earlier statements
+// of other kinds may have effects it cannot see, such as schema or PRAGMA changes.
+const COUNTED_EXEC_PREFIX = new Set(['SELECT', 'VALUES', 'EXPLAIN', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'REPLACE']);
 
 /** The result of a batch that `error` stopped at its BEGIN or its COMMIT: none of its operations was kept. */
 const failedBatch = (operations: BatchOperation[], error: unknown): BatchResult => ({
@@ -196,9 +214,8 @@ const normaliseRowId = (rowId: number | bigint | null | undefined): string | num
  *   `PRAGMA query_only`), so a transaction takes the write lock before its first read and waits out the busy timeout
  *   for another connection's write transaction. A deferred `BEGIN` would start as a reader, and its first write would
  *   fail at once with `SQLITE_BUSY` (or `SQLITE_BUSY_SNAPSHOT` in WAL) once another connection had written, since
- *   SQLite does not call the busy handler for a reader asking to become a writer. The wait at `BEGIN` runs on timers
- *   and leaves the event loop free; a write outside a transaction waits in SQLite's busy handler, which holds the
- *   thread
+ *   SQLite does not call the busy handler for a reader asking to become a writer. The wait at `BEGIN` and for a
+ *   write outside a transaction runs on timers and leaves the event loop free.
  * - A transaction that only reads takes the write lock too, so a long one on a writable connection holds other
  *   connections' writes, unless it is begun with `transaction(fn, { readOnly: true })`: that one begins with a plain
  *   `BEGIN`, takes no write lock, and refuses a write inside it with `SQLITE_READONLY`
@@ -317,51 +334,144 @@ export class BetterSqliteAdapter implements StorageAdapter {
   }
 
   public async run(statement: string, parameters?: StorageParameters): Promise<StorageRunResult> {
-    return whenAdmitted(this.gate, () => this.runNow(statement, parameters));
+    return this.runStatement(statement, parameters);
   }
 
   public async get<T = unknown>(statement: string, parameters?: StorageParameters): Promise<T | null> {
-    return whenAdmitted(this.gate, () => this.getNow<T>(statement, parameters));
+    return this.getStatement<T>(statement, parameters);
   }
 
   public async all<T>(statement: string, parameters?: StorageParameters): Promise<T[]> {
-    return whenAdmitted(this.gate, () => this.allNow<T>(statement, parameters));
+    return this.allStatement<T>(statement, parameters);
   }
 
   public async exec(script: string): Promise<void> {
-    return whenAdmitted(this.gate, () => this.execNow(script));
+    return this.execScript(script);
   }
 
-  private runNow(statement: string, parameters?: StorageParameters): StorageRunResult {
-    ({ statement, parameters } = toSqliteStatement(statement, parameters));
-    parameters = integersAsBigInt(parameters);
-    const stmt = this.prepareInternal(statement);
-    const { named, positional } = normaliseParameters(parameters);
-    const result = named ? stmt.run(named) : stmt.run(positional ?? []);
-    return { changes: result.changes, lastInsertRowid: normaliseRowId(result.lastInsertRowid) };
+  private runStatement(statement: string, parameters?: StorageParameters, token?: symbol): Promise<StorageRunResult> {
+    return this.executePrepared(statement, parameters, (stmt, args) => {
+      const result = stmt.run(args);
+      return { changes: result.changes, lastInsertRowid: normaliseRowId(result.lastInsertRowid) };
+    }, token);
   }
 
-  private getNow<T>(statement: string, parameters?: StorageParameters): T | null {
-    ({ statement, parameters } = toSqliteStatement(statement, parameters));
-    parameters = integersAsBigInt(parameters);
-    const stmt = this.prepareInternal(statement);
-    const { named, positional } = normaliseParameters(parameters);
-    const row = named ? stmt.get(named) : stmt.get(positional ?? []);
-    return (row as T) ?? null;
+  private getStatement<T>(statement: string, parameters?: StorageParameters, token?: symbol): Promise<T | null> {
+    return this.executePrepared(statement, parameters, (stmt, args, retryOnBusy) => {
+      // The driver's get() can return a RETURNING row before a commit fails.
+      // Step the write to completion so the retry sees any commit-time BUSY.
+      const row = retryOnBusy && stmt.reader && !stmt.readonly ? stmt.all(args)[0] : stmt.get(args);
+      return (row as T) ?? null;
+    }, token);
   }
 
-  private allNow<T>(statement: string, parameters?: StorageParameters): T[] {
-    ({ statement, parameters } = toSqliteStatement(statement, parameters));
-    parameters = integersAsBigInt(parameters);
-    const stmt = this.prepareInternal(statement);
-    const { named, positional } = normaliseParameters(parameters);
-    const rows = named ? stmt.all(named) : stmt.all(positional ?? []);
-    return rows as T[];
+  private allStatement<T>(statement: string, parameters?: StorageParameters, token?: symbol): Promise<T[]> {
+    return this.executePrepared(statement, parameters, (stmt, args) => stmt.all(args) as T[], token);
   }
 
-  private execNow(script: string): void {
-    this.ensureOpen();
-    this.db!.exec(script);
+  private executePrepared<T>(
+    statement: string,
+    parameters: StorageParameters | undefined,
+    execute: (stmt: BetterSqliteStatement, args: unknown[] | Record<string, unknown>, retryOnBusy: boolean) => T,
+    token?: symbol,
+  ): Promise<T> {
+    return whenAdmitted(this.gate, () => {
+      this.ensureOpen();
+      const db = this.db!;
+      const prepared = toSqliteStatement(statement, parameters);
+      const { named, positional } = normaliseParameters(integersAsBigInt(prepared.parameters));
+      const args = named ?? positional ?? [];
+      const cached = this.preparedStatements.get(prepared.statement);
+      const work = (retryOnBusy: boolean) => execute(cached ?? this.prepareInternal(prepared.statement), args, retryOnBusy);
+
+      // A statement can return rows and still write, as INSERT RETURNING does.
+      // Include cold prepares in the retry because preparing can also hit a lock.
+      if (this.readOnly || db.inTransaction || this.gate.openToken() !== null ||
+          (cached?.reader && cached.readonly) || hasBusyTimeoutPragma(prepared.statement)) {
+        return work(false);
+      }
+      return this.retryStatement(db, () => work(true));
+    }, token);
+  }
+
+  private execScript(script: string, token?: symbol): Promise<void> {
+    return whenAdmitted(this.gate, () => {
+      this.ensureOpen();
+      const db = this.db!;
+      if (this.readOnly || db.inTransaction || this.gate.openToken() !== null) {
+        db.exec(script);
+        return;
+      }
+
+      // A script that manages the busy timeout uses SQLite's setting directly.
+      if (hasBusyTimeoutPragma(script)) {
+        db.exec(script);
+        return;
+      }
+
+      let totalChanges: BetterSqliteStatement | undefined;
+      let replayable = true;
+      let replayablePrefix: boolean | undefined;
+      return this.retryStatement(db, () => {
+        totalChanges ??= db.prepare('SELECT total_changes()').pluck().safeIntegers();
+        const before = totalChanges.get();
+        try {
+          db.exec(script);
+        } catch (error) {
+          if (sqliteCode(error).startsWith('SQLITE_BUSY') && !db.inTransaction) {
+            // Keep SQLite's script semantics, including caller-owned transactions.
+            // Replay only if no rows changed and no earlier statement could have
+            // made a change that total_changes() misses.
+            try {
+              replayable = totalChanges.get() === before && (replayablePrefix ??= sqliteStatementSpans(script)
+                .map(({ start, end }) => firstKeyword(script.slice(start, end)))
+                .filter(Boolean).slice(0, -1).every((keyword) => COUNTED_EXEC_PREFIX.has(keyword)));
+            } catch {
+              // A failed replay check leaves the original script error intact.
+              replayable = false;
+            }
+          }
+          throw error;
+        }
+      }, () => replayable);
+    }, token);
+  }
+
+  private async retryStatement<T>(
+    db: BetterSqliteDatabase,
+    work: () => T,
+    canReplay?: () => boolean,
+  ): Promise<T> {
+    const gate = this.gate;
+    const busyTimeout = readBusyTimeout(db);
+    const deadline = performance.now() + busyTimeout;
+
+    const tryOnce = (timeout: number) => {
+      if (timeout > 0) db.pragma('busy_timeout = 0');
+      try {
+        return { ok: true as const, value: work() };
+      } catch (error) {
+        if (!sqliteCode(error).startsWith('SQLITE_BUSY') || db.inTransaction || canReplay?.() === false) throw error;
+        return { ok: false as const, error };
+      } finally {
+        if (timeout > 0 && db.open) db.pragma(`busy_timeout = ${timeout}`);
+      }
+    };
+
+    let result = tryOnce(busyTimeout);
+    for (let attempt = 0; !result.ok; attempt++) {
+      const { error } = result;
+      const left = deadline - performance.now();
+      if (left <= 0) throw error;
+      await pauseBeforeBusyRetry(attempt, left);
+      if (!db.open || performance.now() >= deadline) throw error;
+      // The check and the attempt run in one turn, as in whenAdmitted().
+      // If a caller started a managed transaction, wait within this deadline.
+      if (gate.openToken() !== null) continue;
+      if (db.inTransaction) throw error;
+      result = tryOnce(readBusyTimeout(db));
+    }
+    return result.value;
   }
 
   /**
@@ -375,12 +485,10 @@ export class BetterSqliteAdapter implements StorageAdapter {
       capabilities: this.capabilities,
       open: async () => {},
       close: async () => {},
-      run: (statement, parameters) => whenAdmitted(this.gate, () => this.runNow(statement, parameters), token),
-      get: <T>(statement: string, parameters?: StorageParameters) =>
-        whenAdmitted(this.gate, () => this.getNow<T>(statement, parameters), token),
-      all: <T>(statement: string, parameters?: StorageParameters) =>
-        whenAdmitted(this.gate, () => this.allNow<T>(statement, parameters), token),
-      exec: (script) => whenAdmitted(this.gate, () => this.execNow(script), token),
+      run: (statement, parameters) => this.runStatement(statement, parameters, token),
+      get: <T>(statement: string, parameters?: StorageParameters) => this.getStatement<T>(statement, parameters, token),
+      all: <T>(statement: string, parameters?: StorageParameters) => this.allStatement<T>(statement, parameters, token),
+      exec: (script) => this.execScript(script, token),
       batch: (operations) => whenAdmitted(this.gate, () => this.batchNow(operations), token),
       // The handle answers a nested transaction() itself and never calls this.
       transaction: (fn) => fn(this),
@@ -447,7 +555,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
       db.exec('BEGIN');
       return;
     }
-    const busyTimeout = Math.max(0, Number(db.pragma('busy_timeout', { simple: true })) || 0);
+    const busyTimeout = readBusyTimeout(db);
     const deadline = Date.now() + busyTimeout;
     db.pragma('busy_timeout = 0');
     try {
@@ -463,7 +571,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
           }
           const left = deadline - Date.now();
           if (!code.startsWith('SQLITE_BUSY') || left <= 0) throw error;
-          await pause(Math.min(BUSY_RETRY_DELAYS_MS[Math.min(attempt, BUSY_RETRY_DELAYS_MS.length - 1)], left));
+          await pauseBeforeBusyRetry(attempt, left);
         }
       }
     } finally {
