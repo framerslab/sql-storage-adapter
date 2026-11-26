@@ -138,6 +138,24 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     return { ready, done };
   };
 
+  // Holds the write lock until release() is called. The holder commits in
+  // microtasks after release(), before any timer of a statement waiting for it.
+  const holdUntilReleased = (adapter: StorageAdapter) => {
+    let begun!: () => void;
+    let release!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      begun = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const done = adapter.transaction(async () => {
+      begun();
+      await released;
+    });
+    return { ready, release, done };
+  };
+
   it('lets a second adapter\'s write outside a transaction wait without stopping the open transaction', async () => {
     const { first, second } = await openCounters();
     const { ready, done } = holdWriteLock(first, 200);
@@ -222,39 +240,112 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 111 });
   });
 
-  it('does not replay an exec script that changed the temp database before SQLITE_BUSY', async () => {
+  it('runs the statements of an exec script once each when a later one waits after the temp database changed', async () => {
     const { first, second } = await openCounters();
     await second.exec('CREATE TEMP TABLE log (n INTEGER);');
     const { ready, done } = holdWriteLock(first, 200);
     await ready;
 
     try {
-      await expect(second.exec('INSERT INTO log (n) VALUES (1); UPDATE counter SET n = n + 10;'))
-        .rejects.toMatchObject({ code: 'SQLITE_BUSY' });
+      await second.exec('INSERT INTO log (n) VALUES (1); UPDATE counter SET n = n + 10;');
     } finally {
       await done;
     }
     expect(await second.all('SELECT n FROM log')).toEqual([{ n: 1 }]);
-    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 1 });
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
   });
 
-  it('does not replay an exec script that changed the schema before SQLITE_BUSY', async () => {
+  it('runs the statements of an exec script once each when a later one waits after the schema changed', async () => {
     const { first, second } = await openCounters();
     const { ready, done } = holdWriteLock(first, 200);
     await ready;
 
     try {
-      await expect(second.exec('CREATE TEMP TABLE log (n INTEGER); UPDATE counter SET n = n + 10;'))
-        .rejects.toMatchObject({ code: 'SQLITE_BUSY' });
+      // Run again from the start, the CREATE would fail: the table exists.
+      await second.exec('CREATE TEMP TABLE log (n INTEGER); UPDATE counter SET n = n + 10;');
     } finally {
       await done;
     }
     expect(await second.all('SELECT n FROM log')).toEqual([]);
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
+  });
+
+  it('waits for the lock at the BEGIN IMMEDIATE of an exec script', async () => {
+    const { first, second } = await openCounters();
+    const { ready, done } = holdWriteLock(first, 200);
+    await ready;
+
+    try {
+      await second.exec('BEGIN IMMEDIATE; UPDATE counter SET n = n + 10 WHERE id = 1; COMMIT;');
+    } finally {
+      await done;
+    }
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
+  });
+
+  it('waits on timers for a write in an exec script after a PRAGMA whose comment names the busy timeout', async () => {
+    const { first, second } = await openCounters();
+    const { ready, done } = holdWriteLock(first, 200);
+    await ready;
+
+    try {
+      await second.exec('PRAGMA foreign_keys = ON /* not busy_timeout */; UPDATE counter SET n = n + 10 WHERE id = 1;');
+    } finally {
+      await done;
+    }
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
+    expect(await second.get('PRAGMA busy_timeout')).toEqual({ timeout: 2_000 });
+  });
+
+  it('runs a script that creates a trigger whole', async () => {
+    const { second } = await openCounters();
+    await second.exec(`
+      CREATE TABLE event (id INTEGER PRIMARY KEY);
+      CREATE TRIGGER event_count AFTER INSERT ON event BEGIN UPDATE counter SET n = n + 1 WHERE id = 1; END;
+      INSERT INTO event DEFAULT VALUES;
+    `);
     expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 1 });
+  });
+
+  it('runs one adapter\'s statements outside a transaction in the order issued while one waits for the lock', async () => {
+    const { first, second } = await openCounters();
+    const held = holdUntilReleased(first);
+    await held.ready;
+
+    const add = second.run('UPDATE counter SET n = n + 10 WHERE id = 1');
+    held.release();
+    await held.done;
+    // The lock is free, and the first write still waits for its timer.
+    const double = second.run('UPDATE counter SET n = n * 2 WHERE id = 1');
+    const read = second.get('SELECT n FROM counter WHERE id = 1');
+
+    await Promise.all([add, double]);
+    await expect(read).resolves.toEqual({ n: 20 });
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 20 });
+  });
+
+  it('begins the adapter\'s own transaction after its earlier write that waits for the lock, and does not fail that write', async () => {
+    const { first, second } = await openCounters(300);
+    const held = holdUntilReleased(first);
+    await held.ready;
+
+    const add = second.run('UPDATE counter SET n = n + 10 WHERE id = 1');
+    const seen = second.transaction(async (trx) => {
+      const row = await trx.get('SELECT n FROM counter WHERE id = 1');
+      // Longer than the busy timeout of the write issued before it.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      return row;
+    });
+    held.release();
+    await held.done;
+
+    await expect(add).resolves.toMatchObject({ changes: 1 });
+    await expect(seen).resolves.toEqual({ n: 10 });
   });
 
   it('keeps a busy timeout set by SQL', async () => {
     const { second } = await openCounters();
+    expect(await second.get('SELECT timeout FROM pragma_busy_timeout')).toEqual({ timeout: 2_000 });
     await second.exec('SELECT 1; PRAGMA /* timeout for the connection */ main."busy_timeout" = 0;');
     expect(await second.get('PRAGMA busy_timeout')).toEqual({ timeout: 0 });
     await second.get('; PRAGMA busy_timeout = 300');
