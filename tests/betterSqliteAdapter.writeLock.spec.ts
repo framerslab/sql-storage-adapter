@@ -153,6 +153,12 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     cleanups.push(() => reader.close());
     const rows = await reader.transaction((trx) => trx.all<{ body: string }>('SELECT body FROM notes'));
     expect(rows).toEqual([{ body: 'kept' }]);
+
+    // A batch there begins too, and refuses its write as an operation's error,
+    // not as a BEGIN that failed (index -1).
+    const batch = await reader.batch!([{ statement: "INSERT INTO notes (body) VALUES ('refused')" }]);
+    expect(batch.successful).toBe(0);
+    expect(batch.errors?.map((e) => e.index)).toEqual([0]);
   });
 
   it('waits 5,000 ms for a locked file by default', async () => {
