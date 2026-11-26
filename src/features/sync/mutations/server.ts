@@ -37,7 +37,11 @@ export interface GroupRow {
 
 /** The tables the server reads and writes, each call inside the transaction handle it is given. */
 export interface MutationServerStore {
-  /** Runs first in every transaction: isolation (`pull`), lock and statement timeouts (`push`, `replay`). */
+  /**
+   * Runs first in every transaction: isolation (`pull`), lock and statement timeouts (`push`, `replay`). A pull's
+   * transaction is begun with `{ readOnly: true }`: it only reads, so it holds no write lock on a SQLite file while it
+   * streams, and a write in it is refused.
+   */
   begin(trx: StorageAdapter, purpose: 'push' | 'pull' | 'replay'): Promise<void>;
   /** The scope's group with its row locked until the transaction ends; null when the scope has none. */
   lockGroup(trx: StorageAdapter, scope: string): Promise<GroupRow | null>;
@@ -314,7 +318,7 @@ export class MutationServer {
         const last: Record<string, string> = { [request.clientId]: '0' };
         for (const client of await store.clients(trx, context.scope, group.group)) last[client.clientId] = writeCounter(client.lastMutationId);
         await handOver.offer(`],"results":${JSON.stringify(results)},"lastMutationIds":${JSON.stringify(last)}}`);
-      })
+      }, { readOnly: true })
       .then(
         () => handOver.finish(),
         (error: unknown) => {

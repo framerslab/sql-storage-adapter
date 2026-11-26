@@ -13,7 +13,7 @@ const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'u
 // file side-effect free and friendly to ESM + pre-bundling analyzers.
 // Path resolution is simplified to process.cwd() relative resolution.
 
-import type { StorageAdapter, StorageOpenOptions, StorageParameters, StorageRunResult, StorageCapability, BatchOperation, BatchResult } from '../core/contracts';
+import type { StorageAdapter, StorageOpenOptions, StorageParameters, StorageRunResult, StorageCapability, StorageTransactionOptions, BatchOperation, BatchResult } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
 import { integersAsBigInt, toSqliteStatement } from '../shared/sqlPlaceholders';
 import { checkFunctionName, type SqlFunction, type SqlFunctionOptions } from '../shared/sqlFunctions';
@@ -200,7 +200,8 @@ const normaliseRowId = (rowId: number | bigint | null | undefined): string | num
  *   and leaves the event loop free; a write outside a transaction waits in SQLite's busy handler, which holds the
  *   thread
  * - A transaction that only reads takes the write lock too, so a long one on a writable connection holds other
- *   connections' writes; read through a connection opened with `readOnly`
+ *   connections' writes, unless it is begun with `transaction(fn, { readOnly: true })`: that one begins with a plain
+ *   `BEGIN`, takes no write lock, and refuses a write inside it with `SQLITE_READONLY`
  * - No network access (local files only)
  * - Platform-specific native binaries required
  *
@@ -386,7 +387,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
     };
   }
 
-  public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
+  public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>, options?: StorageTransactionOptions): Promise<T> {
     this.ensureOpen();
     const openToken = this.gate.inside() ? this.gate.openToken() : null;
     if (openToken) {
@@ -402,15 +403,20 @@ export class BetterSqliteAdapter implements StorageAdapter {
     return this.runSerializedTransaction(() =>
       this.gate.hold(async (token) => {
         this.ensureOpen();
-        await this.beginTransaction();
+        const readsOnly = options?.readOnly === true;
+        await this.beginTransaction(readsOnly);
         const transactionAdapter = createSharedConnectionTransactionAdapter(this.handleStatements(token));
+        let restoreQueryOnly: (() => void) | null = null;
         try {
+          if (readsOnly) restoreQueryOnly = this.holdQueryOnly();
           const result = await fn(transactionAdapter);
           this.db!.exec('COMMIT');
           return result;
         } catch (error) {
           try { this.db!.exec('ROLLBACK'); } catch { /* ignore rollback errors */ }
           throw error;
+        } finally {
+          restoreQueryOnly?.();
         }
       }),
     );
@@ -431,11 +437,13 @@ export class BetterSqliteAdapter implements StorageAdapter {
    *
    * A connection that cannot take the write lock begins deferred: one opened
    * read-only, and one under `PRAGMA query_only`, whose BEGIN IMMEDIATE SQLite
-   * refuses with SQLITE_READONLY. It only reads, so it loses no write.
+   * refuses with SQLITE_READONLY. It only reads, so it loses no write. So does
+   * a transaction begun with `readOnly` (`readsOnly`), which holds
+   * `PRAGMA query_only` until it ends.
    */
-  private async beginTransaction(): Promise<void> {
+  private async beginTransaction(readsOnly = false): Promise<void> {
     const db = this.db!;
-    if (this.readOnly) {
+    if (this.readOnly || readsOnly) {
       db.exec('BEGIN');
       return;
     }
@@ -461,6 +469,23 @@ export class BetterSqliteAdapter implements StorageAdapter {
     } finally {
       if (db.open) db.pragma(`busy_timeout = ${busyTimeout}`);
     }
+  }
+
+  /**
+   * Turns `PRAGMA query_only` on for a transaction begun with `readOnly`, so a
+   * write inside it fails with SQLITE_READONLY, as PostgreSQL refuses one in a
+   * READ ONLY transaction, instead of failing later as a lost write: a
+   * deferred transaction's write fails with SQLITE_BUSY_SNAPSHOT once another
+   * connection has written. Returns the step that turns it off again; a
+   * connection the caller set to query_only keeps the setting.
+   */
+  private holdQueryOnly(): () => void {
+    const db = this.db!;
+    if (Number(db.pragma('query_only', { simple: true })) === 1) return () => undefined;
+    db.pragma('query_only = ON');
+    return () => {
+      if (db.open) db.pragma('query_only = OFF');
+    };
   }
 
   public async close(): Promise<void> {

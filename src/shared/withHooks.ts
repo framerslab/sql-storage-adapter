@@ -1,4 +1,4 @@
-import type { StorageAdapter, StorageParameters, StorageRunResult } from '../core/contracts';
+import type { StorageAdapter, StorageParameters, StorageRunResult, StorageTransactionOptions } from '../core/contracts';
 import {
   generateOperationId,
   type OperationContext,
@@ -94,7 +94,7 @@ export function withHooks<A extends StorageAdapter>(adapter: A, hooks: StorageHo
       }
     },
 
-    transaction: async <T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> => {
+    transaction: async <T>(fn: (trx: StorageAdapter) => Promise<T>, options?: StorageTransactionOptions): Promise<T> => {
       let at: TransactionContext = { ...context('transaction') };
       if (hooks.onBeforeTransaction) {
         const next = await hooks.onBeforeTransaction(at);
@@ -102,7 +102,7 @@ export function withHooks<A extends StorageAdapter>(adapter: A, hooks: StorageHo
         at = next;
       }
       try {
-        const result = await adapter.transaction((trx) => fn(withHooks(trx, hooks)));
+        const result = await adapter.transaction((trx) => fn(withHooks(trx, hooks)), options);
         await hooks.onAfterTransaction?.({ ...at, outcome: 'committed' });
         return result;
       } catch (error) {
