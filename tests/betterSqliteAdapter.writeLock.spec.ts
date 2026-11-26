@@ -108,6 +108,159 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     return path.join(dir, 'memory.sqlite3');
   };
 
+  const openCounters = async (secondTimeoutMs = 2_000, journalMode: 'WAL' | 'DELETE' = 'WAL') => {
+    const { createBetterSqliteAdapter } = await import('../src/index.js');
+    const file = tempFile();
+    const first = createBetterSqliteAdapter(file, { busyTimeoutMs: 2_000 });
+    const second = createBetterSqliteAdapter(file, { busyTimeoutMs: secondTimeoutMs });
+    await first.open();
+    cleanups.push(() => first.close());
+    await first.exec(`
+      PRAGMA journal_mode = ${journalMode};
+      CREATE TABLE counter (id INTEGER PRIMARY KEY, n INTEGER NOT NULL);
+      INSERT INTO counter (id, n) VALUES (1, 0);
+    `);
+    await second.open();
+    cleanups.push(() => second.close());
+    return { first, second };
+  };
+
+  const holdWriteLock = (adapter: StorageAdapter, ms: number) => {
+    let begun!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      begun = resolve;
+    });
+    const done = adapter.transaction(async (trx) => {
+      begun();
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      await trx.run('UPDATE counter SET n = n + 1 WHERE id = 1');
+    });
+    return { ready, done };
+  };
+
+  it('lets a second adapter\'s write outside a transaction wait without stopping the open transaction', async () => {
+    const { first, second } = await openCounters();
+    const { ready, done } = holdWriteLock(first, 200);
+    await ready;
+
+    try {
+      await expect(second.run('UPDATE counter SET n = n + 10 WHERE id = 1')).resolves.toMatchObject({ changes: 1 });
+    } finally {
+      await done;
+    }
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
+    expect(await second.get('PRAGMA busy_timeout')).toEqual({ timeout: 2_000 });
+  });
+
+  it('fails a write outside a transaction with SQLITE_BUSY once the busy timeout passes, without holding the event loop', async () => {
+    const { first, second } = await openCounters(300);
+    const { ready, done } = holdWriteLock(first, 1_000);
+    await ready;
+
+    let ticks = 0;
+    const interval = setInterval(() => { ticks += 1; }, 20);
+    const started = performance.now();
+    try {
+      await expect(second.run('UPDATE counter SET n = n + 10 WHERE id = 1')).rejects.toMatchObject({ code: 'SQLITE_BUSY' });
+      const elapsed = performance.now() - started;
+      expect(elapsed).toBeGreaterThanOrEqual(275);
+      expect(elapsed).toBeLessThan(1_000);
+      expect(ticks).toBeGreaterThan(2);
+      expect(await second.get('PRAGMA busy_timeout')).toEqual({ timeout: 300 });
+    } finally {
+      clearInterval(interval);
+      await done;
+    }
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 1 });
+  });
+
+  it.each(['get', 'all'] as const)('retries a write with RETURNING through %s outside a transaction', async (method) => {
+    const { first, second } = await openCounters();
+    const { ready, done } = holdWriteLock(first, 200);
+    await ready;
+
+    try {
+      const row = { n: 11 };
+      await expect(second[method]('UPDATE counter SET n = n + 10 WHERE id = 1 RETURNING n'))
+        .resolves.toEqual(method === 'get' ? row : [row]);
+    } finally {
+      await done;
+    }
+  });
+
+  it('retries get with RETURNING when a rollback-journal reader blocks the commit', async () => {
+    const { first, second } = await openCounters(2_000, 'DELETE');
+    let read!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      read = resolve;
+    });
+    const done = first.transaction(async (trx) => {
+      await trx.get('SELECT n FROM counter WHERE id = 1');
+      read();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }, { readOnly: true });
+    await ready;
+
+    try {
+      await expect(second.get('UPDATE counter SET n = n + 10 WHERE id = 1 RETURNING n')).resolves.toEqual({ n: 10 });
+    } finally {
+      await done;
+    }
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 10 });
+  });
+
+  it('retries an exec script when SQLITE_BUSY occurs before any changes', async () => {
+    const { first, second } = await openCounters();
+    const { ready, done } = holdWriteLock(first, 200);
+    await ready;
+
+    try {
+      await second.exec('SELECT n FROM counter; UPDATE counter SET n = n + 10; UPDATE counter SET n = n + 100;');
+    } finally {
+      await done;
+    }
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 111 });
+  });
+
+  it('does not replay an exec script that changed the temp database before SQLITE_BUSY', async () => {
+    const { first, second } = await openCounters();
+    await second.exec('CREATE TEMP TABLE log (n INTEGER);');
+    const { ready, done } = holdWriteLock(first, 200);
+    await ready;
+
+    try {
+      await expect(second.exec('INSERT INTO log (n) VALUES (1); UPDATE counter SET n = n + 10;'))
+        .rejects.toMatchObject({ code: 'SQLITE_BUSY' });
+    } finally {
+      await done;
+    }
+    expect(await second.all('SELECT n FROM log')).toEqual([{ n: 1 }]);
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 1 });
+  });
+
+  it('does not replay an exec script that changed the schema before SQLITE_BUSY', async () => {
+    const { first, second } = await openCounters();
+    const { ready, done } = holdWriteLock(first, 200);
+    await ready;
+
+    try {
+      await expect(second.exec('CREATE TEMP TABLE log (n INTEGER); UPDATE counter SET n = n + 10;'))
+        .rejects.toMatchObject({ code: 'SQLITE_BUSY' });
+    } finally {
+      await done;
+    }
+    expect(await second.all('SELECT n FROM log')).toEqual([]);
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 1 });
+  });
+
+  it('keeps a busy timeout set by SQL', async () => {
+    const { second } = await openCounters();
+    await second.exec('SELECT 1; PRAGMA /* timeout for the connection */ main."busy_timeout" = 0;');
+    expect(await second.get('PRAGMA busy_timeout')).toEqual({ timeout: 0 });
+    await second.get('; PRAGMA busy_timeout = 300');
+    expect(await second.get('PRAGMA main.busy_timeout')).toEqual({ timeout: 300 });
+  });
+
   it('keeps both writes when another process reads and writes the same row during an open transaction', async () => {
     const { createBetterSqliteAdapter } = await import('../src/index.js');
     const file = tempFile();
@@ -210,10 +363,8 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     );
     await hasRead;
 
-    // In WAL a reader holds no lock a writer needs. A transaction begun with
-    // BEGIN IMMEDIATE holds the write lock, and this write would wait in
-    // SQLite's busy handler, which holds the thread, so the reading callback
-    // could not reach its COMMIT and the write would fail with SQLITE_BUSY.
+    // In WAL a reader holds no lock a writer needs. This write can finish
+    // while the reader's callback still has its transaction open.
     await expect(writer.run("INSERT INTO notes (body) VALUES ('added')")).resolves.toMatchObject({ changes: 1 });
     expect(await reading).toEqual([{ body: 'kept' }]);
     expect(await writer.all('SELECT body FROM notes ORDER BY rowid')).toEqual([{ body: 'kept' }, { body: 'added' }]);
