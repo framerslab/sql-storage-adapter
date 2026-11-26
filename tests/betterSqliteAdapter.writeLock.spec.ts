@@ -161,6 +161,62 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     expect(batch.errors?.map((e) => e.index)).toEqual([0]);
   });
 
+  it('runs a transaction and a batch on a connection under PRAGMA query_only', async () => {
+    const { createBetterSqliteAdapter } = await import('../src/index.js');
+    const adapter = createBetterSqliteAdapter(tempFile());
+    await adapter.open();
+    cleanups.push(() => adapter.close());
+    await adapter.exec("CREATE TABLE notes (body TEXT); INSERT INTO notes (body) VALUES ('kept'); PRAGMA query_only = ON;");
+
+    // SQLite refuses BEGIN IMMEDIATE there with SQLITE_READONLY, as it refuses
+    // any write; the transaction reads, as it does on a read-only connection.
+    const rows = await adapter.transaction((trx) => trx.all<{ body: string }>('SELECT body FROM notes'));
+    expect(rows).toEqual([{ body: 'kept' }]);
+
+    const batch = await adapter.batch!([{ statement: "INSERT INTO notes (body) VALUES ('refused')" }]);
+    expect(batch.successful).toBe(0);
+    expect(batch.errors?.map((e) => e.index)).toEqual([0]);
+  });
+
+  it('lets a second adapter on the same file in this process wait for an open transaction without stopping it', async () => {
+    const { createBetterSqliteAdapter } = await import('../src/index.js');
+    const file = tempFile();
+    const first = createBetterSqliteAdapter(file, { busyTimeoutMs: 2_000 });
+    const second = createBetterSqliteAdapter(file, { busyTimeoutMs: 2_000 });
+    await first.open();
+    await second.open();
+    cleanups.push(() => first.close(), () => second.close());
+    await first.exec(`
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE counter (id INTEGER PRIMARY KEY, n INTEGER NOT NULL);
+      INSERT INTO counter (id, n) VALUES (1, 0);
+    `);
+
+    let begun!: () => void;
+    const firstBegun = new Promise<void>((resolve) => {
+      begun = resolve;
+    });
+    const firstDone = first.transaction(async (trx) => {
+      begun();
+      // Work outside the database: the callback needs the event loop to reach
+      // its write and the COMMIT that lets the second adapter in.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await trx.run('UPDATE counter SET n = n + 1 WHERE id = 1');
+    });
+    await firstBegun;
+
+    // A wait in SQLite's busy handler would sleep the thread for the whole
+    // busy timeout, so the first callback could not go on, and the second
+    // adapter's transaction and batch would each fail with SQLITE_BUSY.
+    const secondDone = second.transaction((trx) => trx.run('UPDATE counter SET n = n + 10 WHERE id = 1'));
+    const batch = second.batch!([{ statement: 'UPDATE counter SET n = n + 100 WHERE id = 1' }]);
+
+    await firstDone;
+    await secondDone;
+    expect(await batch).toMatchObject({ successful: 1, failed: 0 });
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 111 });
+  }, 15_000);
+
   it('waits 5,000 ms for a locked file by default', async () => {
     const { createBetterSqliteAdapter } = await import('../src/index.js');
     const adapter = createBetterSqliteAdapter(tempFile());
