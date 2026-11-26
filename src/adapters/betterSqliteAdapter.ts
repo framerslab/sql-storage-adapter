@@ -13,7 +13,7 @@ const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'u
 // file side-effect free and friendly to ESM + pre-bundling analyzers.
 // Path resolution is simplified to process.cwd() relative resolution.
 
-import type { StorageAdapter, StorageOpenOptions, StorageParameters, StorageRunResult, StorageCapability, BatchOperation, BatchResult } from '../core/contracts';
+import type { StorageAdapter, StorageOpenOptions, StorageParameters, StorageRunResult, StorageCapability, StorageTransactionOptions, BatchOperation, BatchResult } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
 import { integersAsBigInt, toSqliteStatement } from '../shared/sqlPlaceholders';
 import { checkFunctionName, type SqlFunction, type SqlFunctionOptions } from '../shared/sqlFunctions';
@@ -37,7 +37,40 @@ export interface BetterSqliteAdapterOptions {
    * default path and for a path given to `open()`. `:memory:` stays as it is.
    */
   segment?: string;
+  /**
+   * How long a statement waits for another connection's lock on the file
+   * before it fails with `SQLITE_BUSY`, in milliseconds: better-sqlite3's
+   * `timeout`, which sets SQLite's busy timeout. Default 5000. A transaction
+   * waits this long at its `BEGIN IMMEDIATE` for another connection's write
+   * transaction to end.
+   */
+  busyTimeoutMs?: number;
 }
+
+/** The busy timeout when `busyTimeoutMs` is not given, in milliseconds. */
+const DEFAULT_BUSY_TIMEOUT_MS = 5000;
+
+/**
+ * The waits between tries for another connection's write lock, in
+ * milliseconds: those of SQLite's own busy handler (sqliteDefaultBusyCallback).
+ * The last repeats until the busy timeout passes.
+ */
+const BUSY_RETRY_DELAYS_MS = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+
+/** A SQLite error's code (`SQLITE_BUSY`, `SQLITE_READONLY`, ...), or '' for anything else. */
+const sqliteCode = (error: unknown): string => {
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  return typeof code === 'string' ? code : '';
+};
+
+const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** The result of a batch that `error` stopped at its BEGIN or its COMMIT: none of its operations was kept. */
+const failedBatch = (operations: BatchOperation[], error: unknown): BatchResult => ({
+  successful: 0,
+  failed: operations.length,
+  errors: [{ index: -1, error: error instanceof Error ? error : new Error(String(error)) }],
+});
 
 type BetterSqliteModule = typeof import('better-sqlite3');
 type BetterSqliteDatabase = import('better-sqlite3').Database;
@@ -158,7 +191,17 @@ const normaliseRowId = (rowId: number | bigint | null | undefined): string | num
  * - Single writer at a time
  * - Opens the file in its own journal mode: no `journal_mode` pragma is set, so a file made by this adapter runs SQLite's
  *   default rollback journal unless the caller set WAL on it; a reader holding a read transaction (a backup, an inspection)
- *   can therefore make a writer's commit wait out `timeout` (5,000 ms) and fail `SQLITE_BUSY`
+ *   can therefore make a writer's commit wait out the busy timeout (`busyTimeoutMs`, 5,000 ms) and fail `SQLITE_BUSY`
+ * - `transaction()` and `batch()` begin with `BEGIN IMMEDIATE` (plain `BEGIN` on a read-only connection or one under
+ *   `PRAGMA query_only`), so a transaction takes the write lock before its first read and waits out the busy timeout
+ *   for another connection's write transaction. A deferred `BEGIN` would start as a reader, and its first write would
+ *   fail at once with `SQLITE_BUSY` (or `SQLITE_BUSY_SNAPSHOT` in WAL) once another connection had written, since
+ *   SQLite does not call the busy handler for a reader asking to become a writer. The wait at `BEGIN` runs on timers
+ *   and leaves the event loop free; a write outside a transaction waits in SQLite's busy handler, which holds the
+ *   thread
+ * - A transaction that only reads takes the write lock too, so a long one on a writable connection holds other
+ *   connections' writes, unless it is begun with `transaction(fn, { readOnly: true })`: that one begins with a plain
+ *   `BEGIN`, takes no write lock, and refuses a write inside it with `SQLITE_READONLY`
  * - No network access (local files only)
  * - Platform-specific native binaries required
  *
@@ -206,17 +249,21 @@ export class BetterSqliteAdapter implements StorageAdapter {
    */
   private gate: ConnectionGate = createConnectionGate(null);
   private readonly segment: string | undefined;
+  private readonly busyTimeoutMs: number;
+  /** Whether the open connection is read-only: its transactions begin with a plain BEGIN. */
+  private readOnly = false;
 
   /**
    * Creates a new better-sqlite3 adapter instance.
    *
    * @param defaultFilePath - Absolute path to the SQLite database file.
    *                         Will be created if it doesn't exist.
-   * @param options - The adapter's segment.
+   * @param options - The adapter's segment and busy timeout.
    * @throws {Error} When `options.segment` is not a name a segment can take.
    */
   constructor(private readonly defaultFilePath: string, options: BetterSqliteAdapterOptions = {}) {
     this.segment = options.segment === undefined ? undefined : validateSegment(options.segment);
+    this.busyTimeoutMs = options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS;
   }
 
   /**
@@ -257,9 +304,13 @@ export class BetterSqliteAdapter implements StorageAdapter {
       }
     }
 
-    const databaseOptions = options?.readOnly ? { readonly: true } : undefined;
+    const readOnly = options?.readOnly === true;
+    const databaseOptions = readOnly
+      ? { readonly: true, timeout: this.busyTimeoutMs }
+      : { timeout: this.busyTimeoutMs };
     this.gate = createConnectionGate(await loadTransactionContext());
     this.db = new DatabaseCtor(resolvedPath, databaseOptions);
+    this.readOnly = readOnly;
     if (options?.foreignKeys !== undefined) {
       this.db.exec(`PRAGMA foreign_keys = ${options.foreignKeys ? 'ON' : 'OFF'}`);
     }
@@ -336,7 +387,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
     };
   }
 
-  public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
+  public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>, options?: StorageTransactionOptions): Promise<T> {
     this.ensureOpen();
     const openToken = this.gate.inside() ? this.gate.openToken() : null;
     if (openToken) {
@@ -352,18 +403,89 @@ export class BetterSqliteAdapter implements StorageAdapter {
     return this.runSerializedTransaction(() =>
       this.gate.hold(async (token) => {
         this.ensureOpen();
-        this.db!.exec('BEGIN');
+        const readsOnly = options?.readOnly === true;
+        await this.beginTransaction(readsOnly);
         const transactionAdapter = createSharedConnectionTransactionAdapter(this.handleStatements(token));
+        let restoreQueryOnly: (() => void) | null = null;
         try {
+          if (readsOnly) restoreQueryOnly = this.holdQueryOnly();
           const result = await fn(transactionAdapter);
           this.db!.exec('COMMIT');
           return result;
         } catch (error) {
           try { this.db!.exec('ROLLBACK'); } catch { /* ignore rollback errors */ }
           throw error;
+        } finally {
+          restoreQueryOnly?.();
         }
       }),
     );
+  }
+
+  /**
+   * Begins a top-level transaction. IMMEDIATE takes the file's write lock now.
+   * A deferred BEGIN starts as a reader, and SQLite fails its first write at
+   * once with SQLITE_BUSY (SQLITE_BUSY_SNAPSHOT in WAL) when another
+   * connection has written since, without calling the busy handler.
+   *
+   * While another connection holds the lock, the adapter tries again on timers
+   * until the connection's busy timeout passes, with SQLite's busy timeout at 0
+   * for each try, and then throws the last SQLITE_BUSY. SQLite's own busy
+   * handler sleeps the thread: a second adapter on the same file in this
+   * process, waiting in it, would hold the first adapter's callback, and the
+   * COMMIT that ends the wait, until its own wait ran out.
+   *
+   * A connection that cannot take the write lock begins deferred: one opened
+   * read-only, and one under `PRAGMA query_only`, whose BEGIN IMMEDIATE SQLite
+   * refuses with SQLITE_READONLY. It only reads, so it loses no write. So does
+   * a transaction begun with `readOnly` (`readsOnly`), which holds
+   * `PRAGMA query_only` until it ends.
+   */
+  private async beginTransaction(readsOnly = false): Promise<void> {
+    const db = this.db!;
+    if (this.readOnly || readsOnly) {
+      db.exec('BEGIN');
+      return;
+    }
+    const busyTimeout = Math.max(0, Number(db.pragma('busy_timeout', { simple: true })) || 0);
+    const deadline = Date.now() + busyTimeout;
+    db.pragma('busy_timeout = 0');
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          db.exec('BEGIN IMMEDIATE');
+          return;
+        } catch (error) {
+          const code = sqliteCode(error);
+          if (code.startsWith('SQLITE_READONLY')) {
+            db.exec('BEGIN');
+            return;
+          }
+          const left = deadline - Date.now();
+          if (!code.startsWith('SQLITE_BUSY') || left <= 0) throw error;
+          await pause(Math.min(BUSY_RETRY_DELAYS_MS[Math.min(attempt, BUSY_RETRY_DELAYS_MS.length - 1)], left));
+        }
+      }
+    } finally {
+      if (db.open) db.pragma(`busy_timeout = ${busyTimeout}`);
+    }
+  }
+
+  /**
+   * Turns `PRAGMA query_only` on for a transaction begun with `readOnly`, so a
+   * write inside it fails with SQLITE_READONLY, as PostgreSQL refuses one in a
+   * READ ONLY transaction, instead of failing later as a lost write: a
+   * deferred transaction's write fails with SQLITE_BUSY_SNAPSHOT once another
+   * connection has written. Returns the step that turns it off again; a
+   * connection the caller set to query_only keeps the setting.
+   */
+  private holdQueryOnly(): () => void {
+    const db = this.db!;
+    if (Number(db.pragma('query_only', { simple: true })) === 1) return () => undefined;
+    db.pragma('query_only = ON');
+    return () => {
+      if (db.open) db.pragma('query_only = OFF');
+    };
   }
 
   public async close(): Promise<void> {
@@ -375,6 +497,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
       this.db.close();
       this.db = null;
     }
+    this.readOnly = false;
   }
 
   /**
@@ -387,7 +510,34 @@ export class BetterSqliteAdapter implements StorageAdapter {
    * @returns Results of the batch operation
    */
   public async batch(operations: BatchOperation[]): Promise<BatchResult> {
-    return whenAdmitted(this.gate, () => this.batchNow(operations));
+    // On a read-only connection, and from code an open transaction runs, the
+    // batch runs in place: a deferred transaction, or a savepoint in the open one.
+    if (this.readOnly || this.gate.inside()) {
+      return whenAdmitted(this.gate, () => this.batchNow(operations));
+    }
+    // Otherwise it takes its turn and begins as transaction() does, so its wait
+    // for another connection's write lock does not stop the event loop.
+    return this.runSerializedTransaction(() =>
+      this.gate.hold(async () => {
+        this.ensureOpen();
+        // A transaction a caller began with BEGIN through run() or exec(): the
+        // batch runs in it, as a savepoint.
+        if (this.db!.inTransaction) return this.batchNow(operations);
+        try {
+          await this.beginTransaction();
+        } catch (error) {
+          return failedBatch(operations, error);
+        }
+        const result = this.batchNow(operations);
+        try {
+          this.db!.exec('COMMIT');
+        } catch (error) {
+          try { this.db!.exec('ROLLBACK'); } catch { /* the COMMIT's error is the one reported */ }
+          return failedBatch(operations, error);
+        }
+        return result;
+      }),
+    );
   }
 
   /**
@@ -431,17 +581,18 @@ export class BetterSqliteAdapter implements StorageAdapter {
     });
 
     try {
-      transaction();
+      // Inside a transaction both run as a savepoint; batch() has begun the
+      // top-level one on a writable connection. A handle whose transaction
+      // has ended gets here outside one, and begins IMMEDIATE, as
+      // transaction() begins.
+      if (this.readOnly) {
+        transaction();
+      } else {
+        transaction.immediate();
+      }
     } catch (error) {
       // Transaction failed, all operations rolled back
-      return {
-        successful: 0,
-        failed: operations.length,
-        errors: [{
-          index: -1,
-          error: error instanceof Error ? error : new Error(String(error))
-        }]
-      };
+      return failedBatch(operations, error);
     }
 
     return { successful, failed, results, errors };
@@ -478,6 +629,8 @@ export class BetterSqliteAdapter implements StorageAdapter {
  * - Special values like ':memory:' and 'file:' URIs are passed through.
  * - With `options.segment`, the file's name carries the segment
  *   (`app.sqlite3` becomes `app-agentos.sqlite3`).
+ * - `options.busyTimeoutMs` sets how long a statement waits for another
+ *   connection's lock (default 5000).
  *
  * @throws {Error} When `options.segment` is not a name a segment can take.
  */

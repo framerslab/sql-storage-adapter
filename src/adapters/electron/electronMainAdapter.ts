@@ -44,6 +44,7 @@ import type {
   StorageOpenOptions,
   StorageParameters,
   StorageRunResult,
+  StorageTransactionOptions,
   BatchOperation,
   BatchResult,
   PreparedStatement,
@@ -354,8 +355,8 @@ export class ElectronMainAdapter implements StorageAdapter {
     }
   }
 
-  public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T> {
-    const result = await this.innerAdapter.transaction(fn);
+  public async transaction<T>(fn: (trx: StorageAdapter) => Promise<T>, options?: StorageTransactionOptions): Promise<T> {
+    const result = await this.innerAdapter.transaction(fn, options);
 
     // Broadcast change after transaction
     if (this.multiWindowConfig.enabled && this.multiWindowConfig.broadcastChanges) {

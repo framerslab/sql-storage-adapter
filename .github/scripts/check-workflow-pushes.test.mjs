@@ -1688,7 +1688,9 @@ describe('the command, against what bash and git do', () => {
   // a runner runs it, under bash -e (a composite action's bash step under bash --noprofile --norc -eo pipefail), from
   // a root cloned from a bare remote's side branch, with base a clone of its master, each a commit ahead of the
   // remote. The command must report the steps after which the remote's master has moved, each on its step's line,
-  // and no other. Beside git it needs bash and GNU env (env -C), which GitHub's Ubuntu runners carry.
+  // and no other. Beside git it needs bash and env -C. The steps that give env -C twice run only where env takes a
+  // second -C, as GNU env does (it keeps the last); uutils' env, the env of GitHub's Ubuntu 26.04 runners, refuses it
+  // with status 125. The findings tests above check the command's reading of those steps on every runner.
   /** @type {{ name: string, pushes: boolean, run: string }[]} */
   const steps = [
     // Each checkout keeps a branch of its own: the root's is the pull request's, base's is master.
@@ -1837,7 +1839,8 @@ describe('the command, against what bash and git do', () => {
     const files = {};
     /** @type {{ name: string, pushes: boolean, file: string, line: number, run: string, options: string[] }[]} */
     const cases = [];
-    for (const { name, pushes, run } of steps) {
+    const repeatedChdir = spawnSync('env', ['-C', '/', '-C', '/', 'true']).status === 0;
+    for (const { name, pushes, run } of steps.filter((step) => repeatedChdir || !/\benv -C [^\n]* -C /.test(step.run))) {
       files[`.github/workflows/${name}.yml`] = job(`- run: |\n${run.split('\n').map((line) => `    ${line}`).join('\n')}`);
       // The step's line, after the trigger's two, the job's four and the two checkouts' five.
       cases.push({ name, pushes, file: `.github/workflows/${name}.yml`, line: 12, run, options: ['-e'] });

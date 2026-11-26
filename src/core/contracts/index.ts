@@ -114,6 +114,18 @@ export interface StorageOpenOptions {
  * Adapters should document their thread-safety guarantees. SQLite adapters
  * typically don't support concurrent writes, while PostgreSQL does.
  */
+/** How `transaction()` begins. An adapter with no use for an option ignores it. */
+export interface StorageTransactionOptions {
+  /**
+   * The callback only reads. The better-sqlite3 adapter begins with a deferred `BEGIN`, so the transaction takes no
+   * write lock and other connections' writes go on beside it, and it refuses a write inside it with `SQLITE_READONLY`
+   * (`PRAGMA query_only` for the transaction's length). The PostgreSQL adapter begins `READ ONLY`. The other adapters
+   * run their transactions on one connection of their own and ignore it. A nested `transaction()` joins the open
+   * transaction and its options do nothing.
+   */
+  readOnly?: boolean;
+}
+
 export interface StorageAdapter {
   /** Identifier for logging/diagnostics (e.g., 'better-sqlite3', 'postgres'). */
   readonly kind: string;
@@ -193,6 +205,7 @@ export interface StorageAdapter {
    * on error. Nested transactions may not be supported by all adapters.
    *
    * @param fn - Async callback to execute within the transaction
+   * @param options - How the transaction begins: `{ readOnly: true }` for one that only reads
    * @returns Result of the callback function
    * @throws {Error} Transaction is rolled back and error is re-thrown
    * @example
@@ -202,7 +215,7 @@ export interface StorageAdapter {
    *   return { success: true };
    * });
    */
-  transaction<T>(fn: (trx: StorageAdapter) => Promise<T>): Promise<T>;
+  transaction<T>(fn: (trx: StorageAdapter) => Promise<T>, options?: StorageTransactionOptions): Promise<T>;
 
   /**
    * Closes the underlying connection and releases resources.
