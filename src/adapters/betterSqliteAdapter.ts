@@ -517,6 +517,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
       const countsChanges = COUNTS_CHANGES.has(leadingKeywords(sql)[0]);
       if (route === 'write') return this.writeUnderLock(db, () => execute(this.prepareInternal(sql), issued), countsChanges);
       const stmt = await this.prepareWithoutWaiting(db, sql);
+      this.refuseAfterClose(db);
       // better-sqlite3's `readonly` is SQLite's sqlite3_stmt_readonly(): true
       // when the statement writes nothing to the file.
       return stmt.readonly ? execute(stmt, issued) : this.writeUnderLock(db, () => execute(stmt, issued), countsChanges);
@@ -541,6 +542,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
     return this.inTurn(async (db) => {
       const sole =
         this.readOnly || db.inTransaction || SCRIPT_RUNS_AS_WRITTEN.test(script) ? null : await this.soleStatement(db, script);
+      this.refuseAfterClose(db);
       if (sole === null || sole.readonly || routeOf(script) === 'as-written') {
         db.exec(script);
         return;
@@ -558,22 +560,32 @@ export class BetterSqliteAdapter implements StorageAdapter {
    * prepares a script of one statement and refuses one of more.
    */
   private async soleStatement(db: BetterSqliteDatabase, script: string): Promise<BetterSqliteStatement | null> {
+    let stmt: BetterSqliteStatement | null;
     try {
-      return await this.retryWhileBusy(db, () => db.prepare(script));
+      stmt = await this.retryWhileBusy(db, () => db.prepare(script));
     } catch (error) {
       if (sqliteCode(error).startsWith('SQLITE_BUSY')) throw error;
-      return null;
+      stmt = null;
     }
+    // A refusal from retryWhileBusy carries no SQLite code: it is thrown here,
+    // after the catch, with the refusal of a script whose connection closed
+    // while it was prepared.
+    this.refuseAfterClose(db);
+    return stmt;
   }
 
   /**
    * Prepares a statement without waiting in SQLite's busy handler for the
-   * schema it reads (retryWhileBusy), and keeps it for reuse.
+   * schema it reads (retryWhileBusy), and keeps it for reuse. A preparation
+   * whose connection close() ended while it awaited is refused and keeps
+   * nothing: close() has cleared the cache, and the next connection must not
+   * find the closed one's statement in it.
    */
   private async prepareWithoutWaiting(db: BetterSqliteDatabase, statement: string): Promise<BetterSqliteStatement> {
     const cached = this.preparedStatements.get(statement);
     if (cached) return cached;
     const stmt = await this.retryWhileBusy(db, () => db.prepare(statement));
+    this.refuseAfterClose(db);
     this.preparedStatements.set(statement, stmt);
     return stmt;
   }
