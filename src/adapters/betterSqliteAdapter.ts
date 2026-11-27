@@ -15,9 +15,8 @@ const isBrowser = typeof window !== 'undefined' && typeof window.document !== 'u
 
 import type { StorageAdapter, StorageOpenOptions, StorageParameters, StorageRunResult, StorageCapability, StorageTransactionOptions, BatchOperation, BatchResult } from '../core/contracts';
 import { normaliseParameters } from '../shared/parameterUtils';
-import { firstKeyword } from '../shared/queryWrites';
 import { integersAsBigInt, toSqliteStatement } from '../shared/sqlPlaceholders';
-import { sqliteStatementSpans } from '../shared/splitSqlStatements';
+import { sqliteStatementSpans, withoutSqliteComments } from '../shared/splitSqlStatements';
 import { checkFunctionName, type SqlFunction, type SqlFunctionOptions } from '../shared/sqlFunctions';
 import {
   createSerializedTransactionRunner,
@@ -73,23 +72,76 @@ const pauseBeforeBusyRetry = (attempt: number, left: number): Promise<void> =>
 const readBusyTimeout = (db: BetterSqliteDatabase): number =>
   Math.max(0, Number(db.pragma('busy_timeout', { simple: true })) || 0);
 
+const NAMES_NATIVE_WAIT = /busy_timeout|wal_checkpoint/i;
+
 /**
- * Whether SQL names the busy timeout (`PRAGMA busy_timeout`, `main.busy_timeout`,
- * `pragma_busy_timeout`). Such a statement runs with the connection's setting as
- * it stands, so it neither reads nor keeps the 0 a retry sets for its tries.
+ * Whether a statement runs with SQLite's busy handler as it stands, outside
+ * the timer retry. One that names the busy timeout (`PRAGMA busy_timeout`,
+ * `main.busy_timeout`, `pragma_busy_timeout`) neither reads nor keeps the 0 a
+ * retry sets for its tries. `PRAGMA wal_checkpoint` waits in the handler for
+ * the writer and the readers (FULL, RESTART, TRUNCATE) and reports a wait cut
+ * short in its result row, not as an error a retry would see. A name inside a
+ * comment does not count. One inside a string does: SQLite takes a string for
+ * a name where a PRAGMA's or a table's name goes.
  */
-const namesBusyTimeout = (sql: string): boolean => /busy_timeout/i.test(sql);
+const keepsBusyHandler = (sql: string): boolean =>
+  NAMES_NATIVE_WAIT.test(sql) && NAMES_NATIVE_WAIT.test(withoutSqliteComments(sql));
+
+/** The head of a statement that creates a trigger, after an EXPLAIN if there is one. */
+const CREATE_TRIGGER = /^\s*(?:EXPLAIN\s+(?:QUERY\s+PLAN\s+)?)?CREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\b/i;
 
 /**
  * Whether a script creates a trigger. A trigger's body holds semicolons of its
  * own, where the statement splitter would cut it, so such a script runs whole.
+ * The word alone does not make one: `DEFAULT 'trigger'` is a table's column.
  */
 const createsTrigger = (script: string): boolean =>
-  /\btrigger\b/i.test(script) && sqliteStatementSpans(script).some(({ start, end }) => {
-    const statement = script.slice(start, end);
-    const keyword = firstKeyword(statement);
-    return (keyword === 'CREATE' || keyword === 'EXPLAIN') && /\btrigger\b/i.test(statement);
-  });
+  /\btrigger\b/i.test(script) &&
+  sqliteStatementSpans(script).some(({ start, end }) => CREATE_TRIGGER.test(withoutSqliteComments(script.slice(start, end))));
+
+/**
+ * SQL after which the views and triggers that read the busy timeout may be
+ * others: it names the setting, as the view or trigger it creates does, or it
+ * attaches or detaches a database.
+ */
+const MAY_CHANGE_TIMEOUT_READERS = /busy_timeout|\b(?:at|de)tach\b/i;
+
+/**
+ * Whether a view or a trigger in one of the connection's schemas (main, temp,
+ * attached) names the busy timeout. A statement that reads such a view, or
+ * fires such a trigger, reads the setting without naming it.
+ */
+const schemaReadsBusyTimeout = (db: BetterSqliteDatabase): boolean =>
+  (db.pragma('database_list') as Array<{ name: string }>).some(({ name }) =>
+    db.prepare(
+      `SELECT 1 FROM "${name.replace(/"/g, '""')}".sqlite_master ` +
+        "WHERE type IN ('view', 'trigger') AND instr(lower(sql), 'busy_timeout') > 0 LIMIT 1",
+    ).get() !== undefined);
+
+/**
+ * Errors that functions made with registerFunction() threw. better-sqlite3
+ * throws such an error from the statement that called the function, so one that
+ * carries the code SQLITE_BUSY would read as a lock to wait for.
+ */
+const thrownByFunctions = new WeakSet<object>();
+
+/** A statement's values as the driver binds them. */
+type BoundValues = unknown[] | Record<string, unknown>;
+
+/** A value as it is now. Bytes are copied, since their owner can write to them again; no other bound value can change. */
+const snapshotValue = (value: unknown): unknown =>
+  ArrayBuffer.isView(value)
+    ? new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength))
+    : value;
+
+/**
+ * The values of a statement that runs after its caller's turn, as they are
+ * now: the caller may reuse its array, its object or its buffers meanwhile.
+ */
+const snapshotValues = (values: BoundValues): BoundValues =>
+  Array.isArray(values)
+    ? values.map(snapshotValue)
+    : Object.fromEntries(Object.entries(values).map(([name, value]) => [name, snapshotValue(value)]));
 
 /** One try of a statement without SQLite's busy handler: its value, or the SQLITE_BUSY that stopped it. */
 type BusyTry<T> = { ok: true; value: T } | { ok: false; error: unknown };
@@ -98,14 +150,16 @@ type BusyTry<T> = { ok: true; value: T } | { ok: false; error: unknown };
  * Runs `attempt` once with SQLite's busy timeout at 0, then sets `busyTimeout`
  * back. A SQLITE_BUSY that leaves no transaction open comes back for a retry:
  * SQLite took no lock, or rolled the statement back when its commit was busy.
- * Any other error is thrown.
+ * Any other error is thrown, and so is one a registered function threw,
+ * whatever its code: the statement ran, and it fails once.
  */
 const tryWithoutBusyHandler = <T>(db: BetterSqliteDatabase, attempt: () => T, busyTimeout: number): BusyTry<T> => {
   if (busyTimeout > 0) db.pragma('busy_timeout = 0');
   try {
     return { ok: true, value: attempt() };
   } catch (error) {
-    if (!sqliteCode(error).startsWith('SQLITE_BUSY') || db.inTransaction) throw error;
+    const fromFunction = typeof error === 'object' && error !== null && thrownByFunctions.has(error);
+    if (!sqliteCode(error).startsWith('SQLITE_BUSY') || db.inTransaction || fromFunction) throw error;
     return { ok: false, error };
   } finally {
     if (busyTimeout > 0 && db.open) db.pragma(`busy_timeout = ${busyTimeout}`);
@@ -262,8 +316,9 @@ const normaliseRowId = (rowId: number | bigint | null | undefined): string | num
  *   fail at once with `SQLITE_BUSY` (or `SQLITE_BUSY_SNAPSHOT` in WAL) once another connection had written, since
  *   SQLite does not call the busy handler for a reader asking to become a writer. The wait at `BEGIN` and for a
  *   statement outside a transaction runs on timers and leaves the event loop free. A statement inside a transaction
- *   the caller began with `BEGIN` through `run()` or `exec()`, one that names `busy_timeout`, and a script that
- *   creates a trigger wait in SQLite's busy handler, which holds the thread
+ *   the caller began with `BEGIN` through `run()` or `exec()`, one that names `busy_timeout`, `PRAGMA wal_checkpoint`,
+ *   any statement while a view or trigger of the connection reads the busy timeout, and a script that creates a
+ *   trigger wait in SQLite's busy handler, which holds the thread
  * - A transaction that only reads takes the write lock too, so a long one on a writable connection holds other
  *   connections' writes, unless it is begun with `transaction(fn, { readOnly: true })`: that one begins with a plain
  *   `BEGIN`, takes no write lock, and refuses a write inside it with `SQLITE_READONLY`
@@ -321,6 +376,18 @@ export class BetterSqliteAdapter implements StorageAdapter {
    * held the thread.
    */
   private lockWaits: Promise<void> | null = null;
+  /**
+   * Whether a view or trigger of the connection reads the busy timeout; null
+   * when that is not known: after open(), and after SQL that may have added or
+   * removed one. Top-level work then keeps SQLite's busy handler, so what it
+   * reads through the view or trigger is the setting and not a retry's 0.
+   */
+  private timeoutReaders: boolean | null = null;
+  /**
+   * The top-level transactions and batches, issued and not yet ended, that
+   * took no place in the lock-wait line when they were issued.
+   */
+  private unplacedTransactions = 0;
   private readonly segment: string | undefined;
   private readonly busyTimeoutMs: number;
   /** Whether the open connection is read-only: its transactions begin with a plain BEGIN. */
@@ -384,6 +451,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
     this.gate = createConnectionGate(await loadTransactionContext());
     this.db = new DatabaseCtor(resolvedPath, databaseOptions);
     this.readOnly = readOnly;
+    this.timeoutReaders = null;
     if (options?.foreignKeys !== undefined) {
       this.db.exec(`PRAGMA foreign_keys = ${options.foreignKeys ? 'ON' : 'OFF'}`);
     }
@@ -427,7 +495,8 @@ export class BetterSqliteAdapter implements StorageAdapter {
    * Runs one statement once the gate admits it. A statement outside a
    * transaction waits for another connection's lock on timers, behind any
    * earlier top-level work of this adapter that waits; `queued` marks the
-   * statement's own turn in that line.
+   * statement's own turn in that line. A statement that waits either way binds
+   * the values it was issued with.
    */
   private executePrepared<T>(
     statement: string,
@@ -440,21 +509,31 @@ export class BetterSqliteAdapter implements StorageAdapter {
       this.ensureOpen();
       const db = this.db!;
       const topLevel = !this.readOnly && !db.inTransaction && this.gate.openToken() === null;
-      if (topLevel && !queued && this.lockWaits !== null) {
-        return this.afterLockWaits(() => this.executePrepared(statement, parameters, execute, token, true));
-      }
       const prepared = toSqliteStatement(statement, parameters);
       const { named, positional } = normaliseParameters(integersAsBigInt(prepared.parameters));
-      const args = named ?? positional ?? [];
+      let args: BoundValues = named ?? positional ?? [];
+      if (topLevel && !queued && this.lockWaits !== null) {
+        const issued = snapshotValues(args);
+        return this.afterLockWaits(() => this.executePrepared(prepared.statement, issued, execute, token, true));
+      }
       const cached = this.preparedStatements.get(prepared.statement);
-      const work = (retryOnBusy: boolean) => execute(cached ?? this.prepareInternal(prepared.statement), args, retryOnBusy);
+      const forgetsTimeoutReaders = MAY_CHANGE_TIMEOUT_READERS.test(prepared.statement);
+      const work = (retryOnBusy: boolean) => {
+        try {
+          return execute(cached ?? this.prepareInternal(prepared.statement), args, retryOnBusy);
+        } finally {
+          if (forgetsTimeoutReaders) this.timeoutReaders = null;
+        }
+      };
 
       // A statement can return rows and still write, as INSERT RETURNING does.
       // A cold prepare retries too: preparing reads the schema, which can be locked.
-      if (!topLevel || (cached?.reader && cached.readonly) || namesBusyTimeout(prepared.statement)) {
+      if (!topLevel || (cached?.reader && cached.readonly) || keepsBusyHandler(prepared.statement)) {
         return work(false);
       }
-      const ran = this.retryOnBusy(db, () => work(true));
+      const ran = this.retryOnBusy(db, () => work(true), () => {
+        args = snapshotValues(args);
+      });
       return queued ? ran : this.holdLaterWork(ran);
     }, token);
   }
@@ -470,14 +549,14 @@ export class BetterSqliteAdapter implements StorageAdapter {
       this.ensureOpen();
       const db = this.db!;
       if (this.readOnly || db.inTransaction || this.gate.openToken() !== null) {
-        db.exec(script);
+        this.execNow(db, script);
         return;
       }
       if (!queued && this.lockWaits !== null) {
         return this.afterLockWaits(() => this.execScript(script, token, true));
       }
       if (createsTrigger(script)) {
-        db.exec(script);
+        this.execNow(db, script);
         return;
       }
       const statements = sqliteStatementSpans(script).map(({ start, end }) => script.slice(start, end));
@@ -488,35 +567,72 @@ export class BetterSqliteAdapter implements StorageAdapter {
 
   /**
    * Runs a script's statements in order from `index`. A statement inside a
-   * transaction the script began, and one that names the busy timeout, runs in
-   * SQLite's busy handler; any other waits for a lock on timers.
+   * transaction the script began, one that names the busy timeout and a
+   * `PRAGMA wal_checkpoint` run in SQLite's busy handler; any other waits for
+   * a lock on timers.
    */
   private execStatementsFrom(db: BetterSqliteDatabase, statements: string[], index: number): void | Promise<void> {
     for (let at = index; at < statements.length; at++) {
       const statement = statements[at];
-      if (db.inTransaction || namesBusyTimeout(statement)) {
-        db.exec(statement);
+      if (db.inTransaction || keepsBusyHandler(statement)) {
+        this.execNow(db, statement);
         continue;
       }
-      const ran = this.retryOnBusy(db, () => {
-        db.exec(statement);
-      });
+      const ran = this.retryOnBusy(db, () => this.execNow(db, statement));
       if (ran instanceof Promise) return ran.then(() => this.execStatementsFrom(db, statements, at + 1));
     }
     return undefined;
+  }
+
+  /** Runs a script, or one statement of one, as written. */
+  private execNow(db: BetterSqliteDatabase, sql: string): void {
+    try {
+      db.exec(sql);
+    } finally {
+      if (MAY_CHANGE_TIMEOUT_READERS.test(sql)) this.timeoutReaders = null;
+    }
   }
 
   /**
    * Runs `attempt` with SQLite's busy timeout at 0. While another connection
    * holds the lock it needs, tries again on timers until the connection's busy
    * timeout passes, then throws the last SQLITE_BUSY. The value comes back at
-   * once when the first try succeeds.
+   * once when the first try succeeds; `onWait` is called, in the caller's turn,
+   * when it does not.
    */
-  private retryOnBusy<T>(db: BetterSqliteDatabase, attempt: () => T): T | Promise<T> {
+  private retryOnBusy<T>(db: BetterSqliteDatabase, attempt: () => T, onWait?: () => void): T | Promise<T> {
     const busyTimeout = readBusyTimeout(db);
     const deadline = performance.now() + busyTimeout;
-    const first = tryWithoutBusyHandler(db, attempt, busyTimeout);
-    return first.ok ? first.value : this.retryAfterBusy(db, attempt, first.error, deadline);
+    const first = this.tryOnce(db, attempt, busyTimeout);
+    if (first.ok) return first.value;
+    onWait?.();
+    return this.retryAfterBusy(db, attempt, first.error, deadline);
+  }
+
+  /**
+   * One try of top-level work, with SQLite's busy timeout at 0. While a view
+   * or trigger of the connection reads the busy timeout, the work runs with
+   * the setting as it stands instead, in SQLite's busy handler, as a statement
+   * that names the setting does: it may read that view or fire that trigger.
+   * Whether one does is read from the schemas once and again after SQL that
+   * may have changed it; a locked schema makes this a busy try.
+   */
+  private tryOnce<T>(db: BetterSqliteDatabase, attempt: () => T, busyTimeout: number): BusyTry<T> {
+    if (this.timeoutReaders === null) {
+      const read = tryWithoutBusyHandler(db, (): boolean | null => {
+        try {
+          return schemaReadsBusyTimeout(db);
+        } catch (error) {
+          if (sqliteCode(error).startsWith('SQLITE_BUSY')) throw error;
+          // A schema that cannot be read: the work itself reports why.
+          return null;
+        }
+      }, busyTimeout);
+      if (!read.ok) return read;
+      this.timeoutReaders = read.value;
+    }
+    if (this.timeoutReaders === true) return { ok: true, value: attempt() };
+    return tryWithoutBusyHandler(db, attempt, busyTimeout);
   }
 
   private async retryAfterBusy<T>(
@@ -538,21 +654,68 @@ export class BetterSqliteAdapter implements StorageAdapter {
         while (gate.openToken() !== null) await gate.ended();
         deadline += performance.now() - heldFrom;
       }
-      // The checks and the try run in one turn, as in whenAdmitted().
-      if (!db.open || performance.now() >= deadline || db.inTransaction) throw error;
-      const result = tryWithoutBusyHandler(db, attempt, readBusyTimeout(db));
+      // The checks and the try run in one turn, as in whenAdmitted(). Every
+      // wait ends in a try, as in SQLite's busy handler: a timer that fires
+      // late, past the deadline, still finds a lock released meanwhile.
+      if (!db.open || db.inTransaction) throw error;
+      const result = this.tryOnce(db, attempt, readBusyTimeout(db));
       if (result.ok) return result.value;
       error = result.error;
     }
   }
 
-  /** Runs `work` after the top-level work that waits for a lock, holding later work behind it; at once when none waits. */
+  /**
+   * Runs `work` after the top-level work that waits for a lock, holding later
+   * work behind it; at once when none waits. Work that waits belongs to the
+   * connection open now: once close() has ended that connection, the work is
+   * refused, whatever open() has opened since.
+   */
   private afterLockWaits<T>(work: () => Promise<T>): Promise<T> {
     const waiting = this.lockWaits;
     if (waiting === null) return work();
-    const queued = waiting.then(work);
+    const db = this.db;
+    const queued = waiting.then(() => {
+      this.refuseAfterClose(db);
+      return work();
+    });
     this.holdLaterWork(queued);
     return queued;
+  }
+
+  /** Refuses work that waited its turn on `db` once close() has ended that connection. */
+  private refuseAfterClose(db: BetterSqliteDatabase | null): void {
+    if (this.db !== db) {
+      throw new Error('The storage adapter was closed while this work waited for its turn.');
+    }
+  }
+
+  /**
+   * Runs a top-level transaction or batch in its turn among the adapter's
+   * transactions. While top-level work waits for a lock, it also takes its
+   * place behind that work now, as it is issued, so a statement issued after
+   * it runs after it. It takes that place only when none of the adapter's
+   * transactions is open and none is queued without a place: one that is
+   * queued so, ahead of it, joins the line at the line's end when its own turn
+   * comes, and would wait for this one behind it. Then, and when nothing waits
+   * for a lock, it runs behind a statement that began to wait meanwhile.
+   */
+  private inTurn<T>(body: () => Promise<T>): Promise<T> {
+    const ahead = this.lockWaits;
+    if (ahead === null || this.unplacedTransactions > 0 || this.gate.openToken() !== null) {
+      this.unplacedTransactions += 1;
+      return this.runSerializedTransaction(() => this.afterLockWaits(body)).finally(() => {
+        this.unplacedTransactions -= 1;
+      });
+    }
+    const db = this.db;
+    const ran = this.runSerializedTransaction(() =>
+      ahead.then(() => {
+        this.refuseAfterClose(db);
+        return body();
+      }),
+    );
+    this.holdLaterWork(ran);
+    return ran;
   }
 
   /** Holds later top-level work behind `work` when it waits for a lock. */
@@ -602,7 +765,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
     // overlapping callers cannot issue a second BEGIN inside the first tx, and
     // hold the gate so other callers' statements wait for its end. A statement
     // issued before it that waits for a lock runs first.
-    return this.runSerializedTransaction(() => this.afterLockWaits(() =>
+    return this.inTurn(() =>
       this.gate.hold(async (token) => {
         this.ensureOpen();
         const readsOnly = options?.readOnly === true;
@@ -621,7 +784,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
           restoreQueryOnly?.();
         }
       }),
-    ));
+    );
   }
 
   /**
@@ -700,6 +863,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
       this.db = null;
     }
     this.readOnly = false;
+    this.timeoutReaders = null;
   }
 
   /**
@@ -719,7 +883,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
     }
     // Otherwise it takes its turn and begins as transaction() does, so its wait
     // for another connection's write lock does not stop the event loop.
-    return this.runSerializedTransaction(() => this.afterLockWaits(() =>
+    return this.inTurn(() =>
       this.gate.hold(async () => {
         this.ensureOpen();
         // A transaction a caller began with BEGIN through run() or exec(): the
@@ -739,7 +903,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
         }
         return result;
       }),
-    ));
+    );
   }
 
   /**
@@ -748,7 +912,18 @@ export class BetterSqliteAdapter implements StorageAdapter {
    */
   public registerFunction(name: string, fn: SqlFunction, options: SqlFunctionOptions = {}): void {
     this.ensureOpen();
-    this.db!.function(checkFunctionName(name), { deterministic: options.deterministic ?? false }, fn);
+    // An error the function throws is its own, never a lock to wait for.
+    const guarded: SqlFunction = (...args) => {
+      try {
+        return fn(...args);
+      } catch (error) {
+        if (typeof error === 'object' && error !== null) thrownByFunctions.add(error);
+        throw error;
+      }
+    };
+    // better-sqlite3 reads the function's length as its number of arguments.
+    Object.defineProperty(guarded, 'length', { value: fn.length });
+    this.db!.function(checkFunctionName(name), { deterministic: options.deterministic ?? false }, guarded);
   }
 
   private batchNow(operations: BatchOperation[]): BatchResult {
@@ -795,6 +970,8 @@ export class BetterSqliteAdapter implements StorageAdapter {
     } catch (error) {
       // Transaction failed, all operations rolled back
       return failedBatch(operations, error);
+    } finally {
+      if (operations.some((op) => MAY_CHANGE_TIMEOUT_READERS.test(op.statement))) this.timeoutReaders = null;
     }
 
     return { successful, failed, results, errors };

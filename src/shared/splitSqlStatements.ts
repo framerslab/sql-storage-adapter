@@ -189,6 +189,15 @@ export const splitSqlStatements = (script: string): string[] => {
   return statements;
 };
 
+/**
+ * Whether SQLite's tokenizer skips `ch` as whitespace (tokenize.c, `CC_SPACE`
+ * and `CC_BOM`): a space, a tab, a line feed, a form feed, a carriage return
+ * and a byte-order mark. Any other character JavaScript calls whitespace, a
+ * no-break space among them, is part of a name to SQLite.
+ */
+const isSqliteSpace = (ch: string): boolean =>
+  ch === ' ' || ch === '\t' || ch === '\n' || ch === '\f' || ch === '\r' || ch === '\uFEFF';
+
 /** A statement's place in a script: offsets into the script, with the whitespace around the statement left out. */
 export interface StatementSpan {
   start: number;
@@ -199,7 +208,8 @@ export interface StatementSpan {
  * The statements of a SQLite script, as offsets into it: the script is cut at
  * the semicolons outside SQLite's strings, quoted names and comments (`'...'`,
  * `"..."`, `` `...` ``, `[...]`, `--` to the end of the line, `/* ... *\/`), and
- * each statement's whitespace is left out of its span. A caller that must hand
+ * each statement's whitespace, as SQLite's tokenizer reads whitespace, is left
+ * out of its span: a name that ends in a no-break space keeps it. A caller that must hand
  * a part of the script on as written (the Capacitor adapter's exec(), whose
  * plugin splits the script itself) slices the script by these spans and never
  * rejoins statements. SQLite has no dollar quoting: `$name` is a parameter.
@@ -214,8 +224,8 @@ export const sqliteStatementSpans = (script: string): StatementSpan[] => {
   const push = (to: number): void => {
     let start = from;
     let end = to;
-    while (start < end && /\s/.test(script[start])) start += 1;
-    while (end > start && /\s/.test(script[end - 1])) end -= 1;
+    while (start < end && isSqliteSpace(script[start])) start += 1;
+    while (end > start && isSqliteSpace(script[end - 1])) end -= 1;
     if (end > start) spans.push({ start, end });
     from = to + 1;
   };
@@ -255,4 +265,56 @@ export const sqliteStatementSpans = (script: string): StatementSpan[] => {
   }
   push(length);
   return spans;
+};
+
+/**
+ * SQLite SQL with each comment (`--` to the end of its line, `/* ... *\/`)
+ * replaced by a space, which is how SQLite's tokenizer reads one. Strings and
+ * quoted names (`'...'`, `"..."`, `` `...` ``, `[...]`) stay as written, so a
+ * `--` inside one is no comment.
+ *
+ * @param sql - A statement or a script of SQLite statements.
+ */
+export const withoutSqliteComments = (sql: string): string => {
+  const length = sql.length;
+  let out = '';
+  let i = 0;
+  while (i < length) {
+    const ch = sql[i];
+    const next = sql[i + 1];
+    if (ch === '-' && next === '-') {
+      const end = sql.indexOf('\n', i + 2);
+      out += ' ';
+      i = end < 0 ? length : end;
+    } else if (ch === '/' && next === '*') {
+      const end = sql.indexOf('*/', i + 2);
+      out += ' ';
+      i = end < 0 ? length : end + 2;
+    } else if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+      const start = i;
+      if (ch === '[') {
+        const end = sql.indexOf(']', i + 1);
+        i = end < 0 ? length : end + 1;
+      } else {
+        // The quote character inside is written twice.
+        i += 1;
+        while (i < length) {
+          if (sql[i] === ch) {
+            if (sql[i + 1] === ch) {
+              i += 2;
+              continue;
+            }
+            break;
+          }
+          i += 1;
+        }
+        i = Math.min(i + 1, length);
+      }
+      out += sql.slice(start, i);
+    } else {
+      out += ch;
+      i += 1;
+    }
+  }
+  return out;
 };
