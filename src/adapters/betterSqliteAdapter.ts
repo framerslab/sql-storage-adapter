@@ -26,7 +26,6 @@ import {
   type ConnectionGate,
   type TransactionContextStore,
 } from '../shared/connectionGate';
-import { firstKeyword } from '../shared/queryWrites';
 import { segmentFilePath, validateSegment } from '../shared/segment';
 
 /** Options of the better-sqlite3 adapter. */
@@ -90,23 +89,44 @@ const SCRIPT_RUNS_AS_WRITTEN = new RegExp(`\\b(?:${RUNS_AS_WRITTEN.join('|')})\\
 /** The whitespace, comments and empty statements (`;`) SQLite skips before a statement's first keyword. */
 const LEADING_EMPTY_STATEMENTS = /^(?:[\s;]+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/;
 
-/** A statement's first keyword, upper-cased, past what SQLite skips before it; '' when it has none. */
-const leadingKeyword = (statement: string): string => firstKeyword(statement.replace(LEADING_EMPTY_STATEMENTS, ''));
+/** The whitespace and comments SQLite skips between two keywords. */
+const SPACE_BETWEEN_KEYWORDS = /^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/;
+
+/** A keyword at the start of `text`, upper-cased; '' when there is none. */
+const keywordAt = (text: string): string => (/^[A-Za-z]+/.exec(text)?.[0] ?? '').toUpperCase();
+
+/** A statement's first two keywords, upper-cased, past what SQLite skips before and between them; '' for one it lacks. */
+const leadingKeywords = (statement: string): [string, string] => {
+  const rest = statement.replace(LEADING_EMPTY_STATEMENTS, '');
+  const first = keywordAt(rest);
+  return [first, first ? keywordAt(rest.slice(first.length).replace(SPACE_BETWEEN_KEYWORDS, '')) : ''];
+};
+
+/** Statements that write nothing to the file: a read, and EXPLAIN, which reads a plan whatever it explains. */
+const READS = new Set(['SELECT', 'VALUES', 'EXPLAIN']);
+
+/** Statements that write, by their first keyword. The adapter prepares them once it holds the write lock. */
+const WRITES = new Set(['INSERT', 'UPDATE', 'DELETE', 'REPLACE', 'CREATE', 'DROP', 'ALTER', 'ANALYZE', 'REINDEX']);
+
+/** Statements whose rows SQLite counts in changes(): INSERT, UPDATE, DELETE and REPLACE, and WITH that leads one. */
+const COUNTS_CHANGES = new Set(['INSERT', 'UPDATE', 'DELETE', 'REPLACE', 'WITH']);
 
 /**
- * Whether a script is one statement that writes nothing. better-sqlite3
- * prepares a script of one statement and refuses one of more, and the adapter
- * does not cut a script into statements, so a script of more than one takes
- * the write lock even when it only reads.
+ * How a statement outside a transaction runs: `as-written` as SQLite runs it;
+ * `write` under the write lock, prepared once the lock is held; `ask` as its
+ * prepared form says (`stmt.readonly`), for SQL whose first keyword does not
+ * tell (`WITH`, ...). `CREATE TEMP` writes only the connection's own temp
+ * database, so it does not wait for main's lock.
  */
-const scriptOnlyReads = (db: BetterSqliteDatabase, script: string): boolean => {
-  try {
-    return db.prepare(script).readonly;
-  } catch {
-    // More than one statement, none, or SQL that fails: exec() reports a failure itself.
-    return false;
-  }
+const routeOf = (statement: string): 'as-written' | 'write' | 'ask' => {
+  const [first, second] = leadingKeywords(statement);
+  if (STATEMENT_RUNS_AS_WRITTEN.has(first) || READS.has(first)) return 'as-written';
+  if (first === 'CREATE' && (second === 'TEMP' || second === 'TEMPORARY')) return 'as-written';
+  return WRITES.has(first) ? 'write' : 'ask';
 };
+
+/** A table of the adapter's own in the connection's temp database: a DELETE of none of its rows sets changes() to 0. */
+const CHANGES_RESET_TABLE = '"sql_storage_adapter_changes"';
 
 /**
  * Whether the connection has a database attached. `PRAGMA database_list`
@@ -127,11 +147,14 @@ const snapshotValue = (value: unknown): unknown =>
 /**
  * The values of a statement that runs after its caller's turn, as they are
  * now: the caller may reuse its array, its object or its buffers meanwhile.
+ * Every own property of an object counts, as the driver binds a named value
+ * from any own property, enumerable or not.
  */
-const snapshotValues = (values: BoundValues): BoundValues =>
-  Array.isArray(values)
-    ? values.map(snapshotValue)
-    : Object.fromEntries(Object.entries(values).map(([name, value]) => [name, snapshotValue(value)]));
+const snapshotValues = (values: BoundValues): BoundValues => {
+  if (Array.isArray(values)) return values.map(snapshotValue);
+  const named: Record<string, unknown> = values;
+  return Object.fromEntries(Object.getOwnPropertyNames(named).map((name) => [name, snapshotValue(named[name])]));
+};
 
 /** The result of a batch that `error` stopped at its BEGIN or its COMMIT: none of its operations was kept. */
 const failedBatch = (operations: BatchOperation[], error: unknown): BatchResult => ({
@@ -266,14 +289,15 @@ const normaliseRowId = (rowId: number | bigint | null | undefined): string | num
  *   fail at once with `SQLITE_BUSY` (or `SQLITE_BUSY_SNAPSHOT` in WAL) once another connection had written, since
  *   SQLite does not call the busy handler for a reader asking to become a writer. The wait at `BEGIN` runs on timers
  *   and leaves the event loop free
- * - A write outside a transaction (`run()`, a write through `get()` or `all()`, an `exec()` script) takes the write
- *   lock the same way first, with `BEGIN IMMEDIATE` on timers, then runs once and commits. Its `COMMIT` waits in
- *   SQLite's busy handler, which holds the thread, in rollback-journal mode while another connection reads, for up to
- *   the busy timeout; in WAL it does not wait. The rest runs as SQLite runs it and waits in the busy handler: a
- *   statement that writes nothing, a script of one such statement, a statement that is or a script that names
- *   `BEGIN`, `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `PRAGMA`, `VACUUM`, `ATTACH` or `DETACH`, anything on
- *   a read-only connection or inside a transaction the caller began with `BEGIN`, and a write on a connection with a
- *   database attached when the lock is not free at once
+ * - A write outside a transaction (`run()`, a write through `get()` or `all()`, an `exec()` script of one statement)
+ *   takes the write lock the same way first, with `BEGIN IMMEDIATE` on timers, then is prepared, runs once and
+ *   commits. Its `COMMIT` waits in SQLite's busy handler, which holds the thread, in rollback-journal mode while
+ *   another connection reads, for up to the busy timeout; in WAL it does not wait. The rest runs as SQLite runs it and
+ *   waits in the busy handler: a statement that writes nothing (`EXPLAIN` included), `CREATE TEMP`, an `exec()` script
+ *   of more than one statement or of none, a script of one statement that writes nothing, a statement that is or a
+ *   script that names `BEGIN`, `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `PRAGMA`, `VACUUM`, `ATTACH` or
+ *   `DETACH`, anything on a read-only connection or inside a transaction the caller began with `BEGIN`, and a write on
+ *   a connection with a database attached when the lock is not free at once
  * - Statements, scripts, transactions and batches that are not an open transaction's own run one at a time, in the
  *   order issued
  * - A transaction that only reads takes the write lock too, so a long one on a writable connection holds other
@@ -433,7 +457,11 @@ export class BetterSqliteAdapter implements StorageAdapter {
    * caller's turn. Any other takes its turn in the queue with the values it
    * was issued with, and runs as SQLite runs it, or, when it writes, under the
    * write lock (writeUnderLock). It is prepared in its turn, after the work
-   * issued before it, which may create what it names.
+   * issued before it, which may create what it names. Preparing reads the
+   * schema, which another connection's exclusive lock holds off in SQLite's
+   * busy handler, so a write is prepared once the lock is taken, and a
+   * statement whose first keyword does not say whether it writes is prepared
+   * on timers (prepareWithoutWaiting).
    */
   private async statement<T>(
     statement: string,
@@ -448,23 +476,27 @@ export class BetterSqliteAdapter implements StorageAdapter {
       return execute(this.prepareInternal(prepared.statement), values);
     }
     const issued = snapshotValues(values);
-    return this.inTurn((db) => {
-      const stmt = this.prepareInternal(prepared.statement);
+    const sql = prepared.statement;
+    return this.inTurn(async (db) => {
+      const route = this.readOnly || db.inTransaction ? 'as-written' : routeOf(sql);
+      if (route === 'as-written') return execute(this.prepareInternal(sql), issued);
+      const countsChanges = COUNTS_CHANGES.has(leadingKeywords(sql)[0]);
+      if (route === 'write') return this.writeUnderLock(db, () => execute(this.prepareInternal(sql), issued), countsChanges);
+      const stmt = await this.prepareWithoutWaiting(db, sql);
       // better-sqlite3's `readonly` is SQLite's sqlite3_stmt_readonly(): true
-      // when the statement writes nothing to the file, as a plain read
-      // (`stmt.reader && stmt.readonly`) does, and for the statements that only
-      // set the connection's state (BEGIN, COMMIT, ATTACH, most PRAGMAs).
-      const asWritten =
-        this.readOnly || db.inTransaction || stmt.readonly || STATEMENT_RUNS_AS_WRITTEN.has(leadingKeyword(prepared.statement));
-      return asWritten ? execute(stmt, issued) : this.writeUnderLock(db, () => execute(stmt, issued));
+      // when the statement writes nothing to the file.
+      return stmt.readonly ? execute(stmt, issued) : this.writeUnderLock(db, () => execute(stmt, issued), countsChanges);
     });
   }
 
   /**
    * Runs a script, whole, as better-sqlite3's exec() reads it. An open
    * transaction's own script runs in it. Any other takes its turn in the
-   * queue, and runs under the write lock unless it names a word that keeps it
-   * out of a transaction or is one statement that writes nothing.
+   * queue. A script of one statement that writes runs under the write lock;
+   * the rest run as SQLite runs them: a script of more than one statement or
+   * of none, each statement in its own autocommit as on any connection, one
+   * that names a word that keeps it out of a transaction, and one statement
+   * that writes nothing or that `routeOf` runs as written.
    */
   private async execScript(script: string, token?: symbol): Promise<void> {
     if (this.joinsOpenTransaction(token)) {
@@ -472,15 +504,44 @@ export class BetterSqliteAdapter implements StorageAdapter {
       this.db!.exec(script);
       return;
     }
-    return this.inTurn((db) => {
-      if (this.readOnly || db.inTransaction || SCRIPT_RUNS_AS_WRITTEN.test(script) || scriptOnlyReads(db, script)) {
+    return this.inTurn(async (db) => {
+      const sole =
+        this.readOnly || db.inTransaction || SCRIPT_RUNS_AS_WRITTEN.test(script) ? null : await this.soleStatement(db, script);
+      if (sole === null || sole.readonly || routeOf(script) === 'as-written') {
         db.exec(script);
         return;
       }
       return this.writeUnderLock(db, () => {
         db.exec(script);
-      });
+      }, COUNTS_CHANGES.has(leadingKeywords(script)[0]));
     });
+  }
+
+  /**
+   * The one statement a script holds, prepared on timers
+   * (prepareWithoutWaiting), or null when it holds none, more than one, or
+   * SQL SQLite refuses, which exec() then reports itself. better-sqlite3
+   * prepares a script of one statement and refuses one of more.
+   */
+  private async soleStatement(db: BetterSqliteDatabase, script: string): Promise<BetterSqliteStatement | null> {
+    try {
+      return await this.retryWhileBusy(db, () => db.prepare(script));
+    } catch (error) {
+      if (sqliteCode(error).startsWith('SQLITE_BUSY')) throw error;
+      return null;
+    }
+  }
+
+  /**
+   * Prepares a statement without waiting in SQLite's busy handler for the
+   * schema it reads (retryWhileBusy), and keeps it for reuse.
+   */
+  private async prepareWithoutWaiting(db: BetterSqliteDatabase, statement: string): Promise<BetterSqliteStatement> {
+    const cached = this.preparedStatements.get(statement);
+    if (cached) return cached;
+    const stmt = await this.retryWhileBusy(db, () => db.prepare(statement));
+    this.preparedStatements.set(statement, stmt);
+    return stmt;
   }
 
   /**
@@ -524,16 +585,17 @@ export class BetterSqliteAdapter implements StorageAdapter {
    * SQLite runs it and reports what it meets itself.
    *
    * A write that fails is committed all the same, as autocommit does: SQLite
-   * has undone a statement that failed (or kept the rows before the failure,
-   * for OR FAIL), and what a script ran before it stays; then the write's own
-   * error is thrown. A failure that ended the transaction (a ROLLBACK conflict
-   * resolution, a full disk) left nothing to commit, and undid what the script
-   * ran before it. A COMMIT that fails is rolled back and reported, so no row
-   * of a write SQLite did not keep is returned: in rollback-journal mode it
-   * waits in SQLite's busy handler for other connections' reads to end, for up
-   * to the busy timeout.
+   * has undone a statement that failed, or kept the rows before the failure
+   * for OR FAIL; then the write's own error is thrown. A failure that ended
+   * the transaction (a ROLLBACK conflict resolution, a full disk) left nothing
+   * to commit. A COMMIT that fails is rolled back and its error is thrown, in
+   * place of the write's own error when the write failed too, so no row of a
+   * write SQLite did not keep is returned: in rollback-journal mode it waits
+   * in SQLite's busy handler for other connections' reads to end, for up to
+   * the busy timeout. With `countsChanges`, for a statement whose rows SQLite
+   * counts, changes() then reads 0, as autocommit leaves it.
    */
-  private async writeUnderLock<T>(db: BetterSqliteDatabase, write: () => T): Promise<T> {
+  private async writeUnderLock<T>(db: BetterSqliteDatabase, write: () => T, countsChanges: boolean): Promise<T> {
     const locked = await this.takeWriteLock(db, true);
     this.refuseAfterClose(db);
     if (!locked) return write();
@@ -541,24 +603,30 @@ export class BetterSqliteAdapter implements StorageAdapter {
     try {
       result = write();
     } catch (error) {
-      if (db.inTransaction) {
-        try {
-          this.commitWrite(db);
-        } catch { /* the write's own error is the one reported */ }
-      }
+      if (db.inTransaction) this.commitWrite(db, countsChanges);
       throw error;
     }
-    this.commitWrite(db);
+    this.commitWrite(db, countsChanges);
     return result;
   }
 
-  /** Commits the write transaction; a COMMIT that fails is rolled back and its error thrown. */
-  private commitWrite(db: BetterSqliteDatabase): void {
+  /**
+   * Commits the write transaction. A COMMIT that fails is rolled back and its
+   * error thrown. The write counted its rows in changes() when it ran, and
+   * neither the COMMIT nor the ROLLBACK sets the count, so with
+   * `countsChanges` a DELETE of none of the rows of the adapter's own temp
+   * table sets it to 0; the temp database is the connection's alone, so that
+   * takes no lock another connection holds.
+   */
+  private commitWrite(db: BetterSqliteDatabase, countsChanges: boolean): void {
     try {
       db.exec('COMMIT');
     } catch (error) {
       try {
         if (db.inTransaction) db.exec('ROLLBACK');
+        if (countsChanges) {
+          db.exec(`CREATE TEMP TABLE IF NOT EXISTS ${CHANGES_RESET_TABLE} (unused); DELETE FROM temp.${CHANGES_RESET_TABLE} WHERE 0;`);
+        }
       } catch { /* the COMMIT's error is the one reported */ }
       throw error;
     }
@@ -579,9 +647,10 @@ export class BetterSqliteAdapter implements StorageAdapter {
       get: <T>(statement: string, parameters?: StorageParameters) => this.getStatement<T>(statement, parameters, token),
       all: <T>(statement: string, parameters?: StorageParameters) => this.allStatement<T>(statement, parameters, token),
       exec: (script) => this.execScript(script, token),
-      // A handle whose transaction has ended batches as the adapter does.
+      // A handle whose transaction has ended batches in its own turn, after
+      // any transaction open now, never in it.
       batch: async (operations) =>
-        this.joinsOpenTransaction(token) ? this.batchNow(operations) : this.batch(operations),
+        this.joinsOpenTransaction(token) ? this.batchNow(operations) : this.batchInTurn(operations),
       // The handle answers a nested transaction() itself and never calls this.
       transaction: (fn) => fn(this),
     };
@@ -646,14 +715,13 @@ export class BetterSqliteAdapter implements StorageAdapter {
    * refuses the lock with SQLITE_READONLY.
    *
    * While another connection holds the lock, the adapter tries again on timers
-   * until the connection's busy timeout passes, and then throws the last
-   * SQLITE_BUSY. SQLite's own busy handler sleeps the thread: a second adapter
-   * on the same file in this process, waiting in it, would hold the first
-   * adapter's callback, and the COMMIT that ends the wait, until its own wait
-   * ran out. SQLite's busy timeout is 0 for each BEGIN IMMEDIATE alone and set
-   * back before anything else runs, so no statement reads it as 0. Every wait
-   * ends in a try: a timer that fires late, past the busy timeout, still finds
-   * a lock released meanwhile.
+   * (retryWhileBusy) until the connection's busy timeout passes, and then
+   * throws the last SQLITE_BUSY. SQLite's own busy handler sleeps the thread:
+   * a second adapter on the same file in this process, waiting in it, would
+   * hold the first adapter's callback, and the COMMIT that ends the wait,
+   * until its own wait ran out. SQLite's busy timeout is 0 for each BEGIN
+   * IMMEDIATE alone and set back before anything else runs, so no statement
+   * reads it as 0.
    *
    * BEGIN IMMEDIATE asks for the write lock of main and of every attached
    * database, and a write outside a transaction (`outsideTransaction`) may need
@@ -661,20 +729,38 @@ export class BetterSqliteAdapter implements StorageAdapter {
    * is not free at once resolves false for such a write: it runs as SQLite runs
    * it, and waits in the busy handler for what it needs.
    */
-  private async takeWriteLock(db: BetterSqliteDatabase, outsideTransaction = false): Promise<boolean> {
-    const busyTimeout = Math.max(0, Number(db.pragma('busy_timeout', { simple: true })) || 0);
-    const deadline = Date.now() + busyTimeout;
-    for (let attempt = 0; ; attempt++) {
-      let wait = 0;
-      db.pragma('busy_timeout = 0');
+  private takeWriteLock(db: BetterSqliteDatabase, outsideTransaction = false): Promise<boolean> {
+    return this.retryWhileBusy(db, (attempt) => {
       try {
         db.exec('BEGIN IMMEDIATE');
         return true;
       } catch (error) {
         const code = sqliteCode(error);
         if (code.startsWith('SQLITE_READONLY')) return false;
-        if (!code.startsWith('SQLITE_BUSY')) throw error;
-        if (outsideTransaction && attempt === 0 && hasAttachedDatabase(db)) return false;
+        if (code.startsWith('SQLITE_BUSY') && outsideTransaction && attempt === 0 && hasAttachedDatabase(db)) return false;
+        throw error;
+      }
+    });
+  }
+
+  /**
+   * Runs `step` with SQLite's busy timeout at 0, and while it fails with
+   * SQLITE_BUSY tries again on timers until the connection's busy timeout
+   * passes; then throws the last SQLITE_BUSY. The busy timeout is set back
+   * after each try, before anything else runs. Any other failure is thrown at
+   * once. Every wait ends in a try, so a timer that fires late, past the busy
+   * timeout, still finds a lock released meanwhile.
+   */
+  private async retryWhileBusy<T>(db: BetterSqliteDatabase, step: (attempt: number) => T): Promise<T> {
+    const busyTimeout = Math.max(0, Number(db.pragma('busy_timeout', { simple: true })) || 0);
+    const deadline = Date.now() + busyTimeout;
+    for (let attempt = 0; ; attempt++) {
+      let wait = 0;
+      db.pragma('busy_timeout = 0');
+      try {
+        return step(attempt);
+      } catch (error) {
+        if (!sqliteCode(error).startsWith('SQLITE_BUSY')) throw error;
         const left = deadline - Date.now();
         if (left <= 0) throw error;
         wait = Math.min(BUSY_RETRY_DELAYS_MS[Math.min(attempt, BUSY_RETRY_DELAYS_MS.length - 1)], left);
@@ -703,17 +789,18 @@ export class BetterSqliteAdapter implements StorageAdapter {
   }
 
   public async close(): Promise<void> {
+    if (this.db) {
+      // better-sqlite3 refuses to close while the connection runs a statement
+      // (close() from a registered function): the adapter then stays as it was.
+      this.db.close();
+      this.db = null;
+      this.preparedStatements.clear();
+    }
     this.gate.dispose();
     this.gate = createConnectionGate(null);
     // Work still waiting for its turn on this connection is refused when the
     // turn comes; the next connection's work does not wait behind it.
     this.runSerializedTransaction = createSerializedTransactionRunner();
-    if (this.db) {
-      // Finalize all prepared statements
-      this.preparedStatements.clear();
-      this.db.close();
-      this.db = null;
-    }
     this.readOnly = false;
   }
 
@@ -729,8 +816,14 @@ export class BetterSqliteAdapter implements StorageAdapter {
   public async batch(operations: BatchOperation[]): Promise<BatchResult> {
     // From code an open transaction runs, the batch runs in it, as a savepoint.
     if (this.gate.inside()) return this.batchNow(operations);
-    // Otherwise it takes its turn and begins as transaction() does, so its wait
-    // for another connection's write lock does not stop the event loop.
+    return this.batchInTurn(operations);
+  }
+
+  /**
+   * A batch in its own turn, begun as transaction() begins, so its wait for
+   * another connection's write lock does not stop the event loop.
+   */
+  private batchInTurn(operations: BatchOperation[]): Promise<BatchResult> {
     return this.inTurn((db) =>
       this.gate.hold(async () => {
         // On a read-only connection it runs as a deferred transaction, and in a
