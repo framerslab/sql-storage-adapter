@@ -1,4 +1,4 @@
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach, vi } from 'vitest';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
@@ -47,9 +47,9 @@ interface Writer {
   kill(): void;
 }
 
-const startWriter = (file: string): Writer => {
+const startWriter = (file: string, env: Record<string, string> = {}): Writer => {
   const proc: ChildProcessWithoutNullStreams = spawn(process.execPath, [viteNode(), childScript], {
-    env: { ...process.env, SQLITE_WRITER_FILE: file },
+    env: { ...process.env, SQLITE_WRITER_FILE: file, ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let output = '';
@@ -345,6 +345,203 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     } finally {
       // The transaction ends before the adapters close.
       await seen.catch(() => undefined);
+    }
+  });
+
+  it.each(['transaction', 'batch'] as const)('runs a %s issued while a write waits for the lock before the statements issued after it', async (kind) => {
+    const { first, second } = await openCounters();
+    const held = holdUntilReleased(first);
+    await held.ready;
+
+    const add = second.run('UPDATE counter SET n = n + 10 WHERE id = 1');
+    const double = 'UPDATE counter SET n = n * 2 WHERE id = 1';
+    const doubled = kind === 'transaction'
+      ? second.transaction((trx) => trx.run(double))
+      : second.batch!([{ statement: double }]);
+    // Issued in the same turn as the transaction or batch, after it.
+    const read = second.get('SELECT n FROM counter WHERE id = 1');
+    const addOne = second.run('UPDATE counter SET n = n + 1 WHERE id = 1');
+    held.release();
+    await held.done;
+
+    await Promise.all([add, doubled, addOne]);
+    await expect(read).resolves.toEqual({ n: 20 });
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 21 });
+  });
+
+  it('waits on timers for a write whose comment names the busy timeout', async () => {
+    const { first, second } = await openCounters();
+    const { ready, done } = holdWriteLock(first, 200);
+    await ready;
+
+    try {
+      await expect(second.run('UPDATE counter /* not PRAGMA busy_timeout */ SET n = n + 10 WHERE id = 1'))
+        .resolves.toMatchObject({ changes: 1 });
+    } finally {
+      await done;
+    }
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
+  });
+
+  it('waits on timers for a script whose table has a column that defaults to the word trigger', async () => {
+    const { first, second } = await openCounters();
+    const { ready, done } = holdWriteLock(first, 200);
+    await ready;
+
+    try {
+      await second.exec("CREATE TABLE audit (event TEXT DEFAULT 'trigger'); UPDATE counter SET n = n + 10 WHERE id = 1;");
+    } finally {
+      await done;
+    }
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
+  });
+
+  it('stores the busy timeout as set when a write reads it through a view', async () => {
+    const { second } = await openCounters();
+    await second.exec(`
+      CREATE TABLE settings_log (timeout INTEGER);
+      CREATE VIEW live_settings AS SELECT timeout FROM pragma_busy_timeout;
+    `);
+
+    await second.run('INSERT INTO settings_log SELECT timeout FROM live_settings');
+    expect(await second.all('SELECT timeout FROM settings_log')).toEqual([{ timeout: 2_000 }]);
+    expect(await second.get('SELECT timeout FROM live_settings')).toEqual({ timeout: 2_000 });
+  });
+
+  it('runs a statement once when a registered function throws an error that carries the code SQLITE_BUSY', async () => {
+    const { second } = await openCounters(300);
+    let calls = 0;
+    second.registerFunction!('refuse', () => {
+      calls += 1;
+      throw Object.assign(new Error('the upstream is busy'), { code: 'SQLITE_BUSY' });
+    });
+
+    await expect(second.get('SELECT refuse() AS value')).rejects.toThrow('the upstream is busy');
+    expect(calls).toBe(1);
+  });
+
+  it('binds the values a write was issued with when it runs after waiting for the lock', async () => {
+    const { first, second } = await openCounters();
+    await second.exec('CREATE TABLE notes (body TEXT, bytes BLOB);');
+    const held = holdUntilReleased(first);
+    await held.ready;
+
+    const waitedValues: unknown[] = ['waited', Buffer.from('waited')];
+    const waited = second.run('INSERT INTO notes (body, bytes) VALUES (?, ?)', waitedValues);
+    const queuedValues = { body: 'queued', bytes: Buffer.from('queued') };
+    const queued = second.run('INSERT INTO notes (body, bytes) VALUES (@body, @bytes)', queuedValues);
+    // The caller uses its array, its object and its buffers again while the writes wait.
+    (waitedValues[1] as Buffer).write('reused');
+    waitedValues[0] = 'reused';
+    queuedValues.bytes.write('reused');
+    queuedValues.body = 'reused';
+    held.release();
+    await held.done;
+
+    await Promise.all([waited, queued]);
+    expect(await second.all('SELECT body, CAST(bytes AS TEXT) AS bytes FROM notes ORDER BY rowid')).toEqual([
+      { body: 'waited', bytes: 'waited' },
+      { body: 'queued', bytes: 'queued' },
+    ]);
+  });
+
+  it('hands a name that ends in a no-break space to SQLite as written in an exec script', async () => {
+    const { second } = await openCounters();
+    await second.exec('CREATE TABLE ledger (n INTEGER); CREATE TABLE "ledger " (n INTEGER);');
+
+    // SQLite reads the no-break space as part of the name: this drops the second table.
+    await second.exec('DROP TABLE ledger ;');
+    expect(await second.all("SELECT name FROM sqlite_master WHERE name LIKE 'ledger%'")).toEqual([{ name: 'ledger' }]);
+  });
+
+  it('waits in an exec script for a WAL checkpoint that another process\'s write transaction holds off', async () => {
+    const { createBetterSqliteAdapter } = await import('../src/index.js');
+    const file = tempFile();
+    const adapter = createBetterSqliteAdapter(file);
+    await adapter.open();
+    cleanups.push(() => adapter.close());
+    await adapter.exec(`
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE counter (id INTEGER PRIMARY KEY, n INTEGER NOT NULL);
+      INSERT INTO counter (id, n) VALUES (1, 0);
+    `);
+
+    const writer = startWriter(file, { SQLITE_WRITER_COMMIT_AFTER_MS: '500' });
+    cleanups.push(() => writer.kill());
+    await writer.waitFor('ready', 30_000);
+    writer.send('go');
+    // The other process holds the write lock from here and commits by itself 500 ms on.
+    await writer.waitFor('read ', 10_000);
+
+    // With the busy timeout at 0 SQLite answers this in a row (busy = 1) and
+    // leaves the log as it is, and exec() has no row to read.
+    await adapter.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+    expect(fs.statSync(`${file}-wal`).size).toBe(0);
+
+    const ended = await writer.exited;
+    expect(ended.code, ended.output).toBe(0);
+    expect(await adapter.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 1 });
+  }, 60_000);
+
+  it('tries a waiting write again when its retry timer fires after the busy timeout has passed', async () => {
+    const { first, second } = await openCounters(300);
+    const held = holdUntilReleased(first);
+    await held.ready;
+
+    const add = second.run('UPDATE counter SET n = n + 10 WHERE id = 1');
+    held.release();
+    await held.done;
+    // The lock is free. The thread is busy past the write's busy timeout, so
+    // its first retry timer fires late.
+    const until = performance.now() + 400;
+    while (performance.now() < until) {
+      // Busy on purpose.
+    }
+
+    await expect(add).resolves.toMatchObject({ changes: 1 });
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 10 });
+  });
+
+  it('refuses a write queued behind a waiting write once the adapter has closed, whatever file it opened since', async () => {
+    const { createBetterSqliteAdapter } = await import('../src/index.js');
+    const { first, second } = await openCounters(5_000);
+    const other = tempFile();
+    const setup = createBetterSqliteAdapter(other);
+    await setup.open();
+    await setup.exec('CREATE TABLE counter (id INTEGER PRIMARY KEY, n INTEGER NOT NULL); INSERT INTO counter (id, n) VALUES (1, 0);');
+    await setup.close();
+
+    const held = holdUntilReleased(first);
+    await held.ready;
+    // Resolves when the waiting write sets a 100 ms retry timer: nothing of it
+    // runs for that long, which leaves time to close and open.
+    const setTimer = globalThis.setTimeout;
+    let longWait!: () => void;
+    const waitsLong = new Promise<void>((resolve) => {
+      longWait = resolve;
+    });
+    const timers = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void, ms?: number) => {
+      if (ms === 100) longWait();
+      return setTimer(handler, ms);
+    }) as typeof setTimeout);
+
+    try {
+      const waiting = second.run('UPDATE counter SET n = n + 10 WHERE id = 1');
+      const queued = second.run('UPDATE counter SET n = n + 100 WHERE id = 1');
+      const outcomes = Promise.allSettled([waiting, queued]);
+      await waitsLong;
+      await second.close();
+      await second.open({ filePath: other });
+
+      const [waited, later] = await outcomes;
+      expect(waited.status).toBe('rejected');
+      expect(later.status).toBe('rejected');
+      // The connection is to the other file now, which neither write was issued on.
+      expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 0 });
+    } finally {
+      timers.mockRestore();
+      held.release();
+      await held.done;
     }
   });
 

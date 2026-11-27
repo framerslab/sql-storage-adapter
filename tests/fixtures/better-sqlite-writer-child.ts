@@ -2,7 +2,9 @@
 // vite-node: a second process writing the same SQLite file through the
 // better-sqlite3 adapter. It opens SQLITE_WRITER_FILE and prints "ready". On a
 // "go" line it runs one transaction that reads the counter, prints "read <n>",
-// waits for a "committed" line, and writes n + 1. It prints "done" and ends 0
+// waits for a "committed" line, and writes n + 1. With SQLITE_WRITER_COMMIT_AFTER_MS
+// set it waits that many milliseconds in place of the "committed" line, so it
+// holds the write lock for that long by itself. It prints "done" and ends 0
 // when the transaction committed, and prints "failed <code> <message>" and
 // ends 1 when it did not.
 import { createInterface } from 'node:readline';
@@ -35,6 +37,8 @@ const until = async (expected: string): Promise<void> => {
   }
 };
 
+const commitAfterMs = Number(process.env.SQLITE_WRITER_COMMIT_AFTER_MS);
+
 const main = async (): Promise<void> => {
   const adapter = createBetterSqliteAdapter(process.env.SQLITE_WRITER_FILE as string);
   await adapter.open();
@@ -44,7 +48,11 @@ const main = async (): Promise<void> => {
     await adapter.transaction(async (trx) => {
       const row = await trx.get<{ n: number }>('SELECT n FROM counter WHERE id = 1');
       process.stdout.write(`read ${row?.n}\n`);
-      await until('committed');
+      if (commitAfterMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, commitAfterMs));
+      } else {
+        await until('committed');
+      }
       await trx.run('UPDATE counter SET n = ? WHERE id = 1', [Number(row?.n) + 1]);
     });
     process.stdout.write('done\n');
