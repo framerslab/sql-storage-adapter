@@ -175,9 +175,9 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     const held = holdUntilReleased(first);
     await held.ready;
 
-    // The clock and the retry timers move only when the test moves them, and
+    // The clocks and the retry timers move only when the test moves them, and
     // the lock stays held throughout.
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date', 'performance'] });
     try {
       let settled = false;
       const outcome = second.run('UPDATE counter SET n = n + 10 WHERE id = 1').then(
@@ -200,6 +200,41 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
       await held.done;
     }
     expect(await second.get('PRAGMA busy_timeout')).toEqual({ timeout: 300 });
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 0 });
+  });
+
+  it.each([
+    ['back', -3_600_000],
+    ['forward', 3_600_000],
+  ])('measures the busy timeout of a waiting write on a monotonic clock when the system clock moves %s an hour', async (_way, shift) => {
+    const { first, second } = await openCounters(300);
+    const held = holdUntilReleased(first);
+    await held.ready;
+
+    // performance.now() moves only with the timers; Date moves with them and
+    // with setSystemTime, as the wall clock does when the system clock is set.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date', 'performance'] });
+    try {
+      let settled = false;
+      const outcome = second.run('UPDATE counter SET n = n + 10 WHERE id = 1').then(
+        () => { settled = true; return null; },
+        (error: unknown) => { settled = true; return error; },
+      );
+      // The try at 0 ms has failed and the wait's deadline is set; the system clock then moves.
+      await vi.advanceTimersByTimeAsync(1);
+      vi.setSystemTime(Date.now() + shift);
+
+      // 300 ms of the busy timeout, as the timers count them, whatever the wall clock says.
+      await vi.advanceTimersByTimeAsync(298);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      await expect(outcome).resolves.toMatchObject({ code: 'SQLITE_BUSY' });
+    } finally {
+      vi.useRealTimers();
+      held.release();
+      await held.done;
+    }
     expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 0 });
   });
 
@@ -598,6 +633,33 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     expect(await second.all('SELECT body, CAST(bytes AS TEXT) AS bytes FROM notes ORDER BY rowid')).toEqual([
       { body: 'waited', bytes: 'waited' },
       { body: 'queued', bytes: 'queued' },
+    ]);
+  });
+
+  it('binds the values each operation of a batch was issued with when the batch runs after waiting for the lock', async () => {
+    const { first, second } = await openCounters();
+    await second.exec('CREATE TABLE notes (body TEXT, bytes BLOB);');
+    const held = holdUntilReleased(first);
+    await held.ready;
+
+    const positional: unknown[] = ['positional', Buffer.from('positional')];
+    const named = { body: 'named', bytes: new Uint8Array(Buffer.from('named')) };
+    const batched = second.batch!([
+      { statement: 'INSERT INTO notes (body, bytes) VALUES (?, ?)', parameters: positional },
+      { statement: 'INSERT INTO notes (body, bytes) VALUES (@body, @bytes)', parameters: named },
+    ]);
+    // The caller uses its array, its object and its bytes again while the batch waits.
+    (positional[1] as Buffer).write('reused');
+    positional[0] = 'reused';
+    named.bytes.set(Buffer.from('reuse'));
+    named.body = 'reused';
+    held.release();
+    await held.done;
+
+    await expect(batched).resolves.toMatchObject({ successful: 2, failed: 0 });
+    expect(await second.all('SELECT body, CAST(bytes AS TEXT) AS bytes FROM notes ORDER BY rowid')).toEqual([
+      { body: 'positional', bytes: 'positional' },
+      { body: 'named', bytes: 'named' },
     ]);
   });
 
@@ -1029,6 +1091,23 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     await expect(second.run('INSERT INTO child (parent_id) VALUES (7)')).rejects.toThrow(/FOREIGN KEY constraint failed/);
     expect(await second.get('SELECT changes() AS n')).toEqual({ n: 0 });
     expect(await second.all('SELECT parent_id FROM child')).toEqual([]);
+  });
+
+  it('leaves no table of its own that shadows an application table when a write fails at its COMMIT', async () => {
+    const { second } = await openCounters();
+    await second.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE parent (id INTEGER PRIMARY KEY);
+      CREATE TABLE child (parent_id INTEGER REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED);
+      CREATE TABLE sql_storage_adapter_changes (body TEXT);
+      INSERT INTO sql_storage_adapter_changes (body) VALUES ('kept');
+    `);
+
+    await expect(second.run('INSERT INTO child (parent_id) VALUES (7)')).rejects.toThrow(/FOREIGN KEY constraint failed/);
+    expect(await second.get('SELECT changes() AS n')).toEqual({ n: 0 });
+    // SQLite finds a table named alone in temp before main: the application's table answers.
+    expect(await second.all('SELECT body FROM sql_storage_adapter_changes')).toEqual([{ body: 'kept' }]);
+    expect(await second.all('SELECT name FROM temp.sqlite_master')).toEqual([]);
   });
 
   it('runs EXPLAIN and an exec script of no statement at once while another connection holds the write lock', async () => {
