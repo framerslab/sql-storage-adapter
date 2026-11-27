@@ -122,7 +122,7 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     `);
     await second.open();
     cleanups.push(() => second.close());
-    return { first, second };
+    return { first, second, file };
   };
 
   const holdWriteLock = (adapter: StorageAdapter, ms: number) => {
@@ -192,7 +192,7 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 1 });
   });
 
-  it.each(['get', 'all'] as const)('retries a write with RETURNING through %s outside a transaction', async (method) => {
+  it.each(['get', 'all'] as const)('waits on timers for a write with RETURNING through %s outside a transaction', async (method) => {
     const { first, second } = await openCounters();
     const { ready, done } = holdWriteLock(first, 200);
     await ready;
@@ -206,8 +206,8 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     }
   });
 
-  it('retries get with RETURNING when a rollback-journal reader blocks the commit', async () => {
-    const { first, second } = await openCounters(2_000, 'DELETE');
+  it('fails get with RETURNING and keeps nothing when a rollback-journal reader holds the commit past the busy timeout', async () => {
+    const { first, second } = await openCounters(300, 'DELETE');
     let read!: () => void;
     const ready = new Promise<void>((resolve) => {
       read = resolve;
@@ -215,19 +215,44 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     const done = first.transaction(async (trx) => {
       await trx.get('SELECT n FROM counter WHERE id = 1');
       read();
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
     }, { readOnly: true });
     await ready;
 
     try {
-      await expect(second.get('UPDATE counter SET n = n + 10 WHERE id = 1 RETURNING n')).resolves.toEqual({ n: 10 });
+      // The write takes the lock and runs; its COMMIT waits for the reader in
+      // SQLite's busy handler, which holds this thread, so the reader here
+      // cannot end before the busy timeout runs out. No row of the write
+      // SQLite rolled back comes back.
+      await expect(second.get('UPDATE counter SET n = n + 10 WHERE id = 1 RETURNING n')).rejects.toMatchObject({ code: 'SQLITE_BUSY' });
     } finally {
       await done;
     }
-    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 10 });
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 0 });
   });
 
-  it('retries an exec script when SQLITE_BUSY occurs before any changes', async () => {
+  it('calls a registered function in a write once when a rollback-journal reader in another process holds its commit', async () => {
+    const { second, file } = await openCounters(5_000, 'DELETE');
+    const reader = startWriter(file, { SQLITE_WRITER_READ_ONLY: '1', SQLITE_WRITER_COMMIT_AFTER_MS: '400' });
+    cleanups.push(() => reader.kill());
+    await reader.waitFor('ready', 30_000);
+    let calls = 0;
+    second.registerFunction!('bump', () => {
+      calls += 1;
+      return 1;
+    });
+    reader.send('go');
+    // The other process holds a read from here and ends it by itself 400 ms on.
+    await reader.waitFor('read ', 10_000);
+
+    await expect(second.run('UPDATE counter SET n = n + bump() WHERE id = 1')).resolves.toMatchObject({ changes: 1 });
+    expect(calls).toBe(1);
+    const ended = await reader.exited;
+    expect(ended.code, ended.output).toBe(0);
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 1 });
+  }, 60_000);
+
+  it('waits on timers for an exec script, then runs it once', async () => {
     const { first, second } = await openCounters();
     const { ready, done } = holdWriteLock(first, 200);
     await ready;
@@ -240,7 +265,7 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 111 });
   });
 
-  it('runs the statements of an exec script once each when a later one waits after the temp database changed', async () => {
+  it('runs an exec script that writes the temp database and then main once, after it waits for the lock', async () => {
     const { first, second } = await openCounters();
     await second.exec('CREATE TEMP TABLE log (n INTEGER);');
     const { ready, done } = holdWriteLock(first, 200);
@@ -255,7 +280,7 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
   });
 
-  it('runs the statements of an exec script once each when a later one waits after the schema changed', async () => {
+  it('runs an exec script that creates a table and then writes main once, after it waits for the lock', async () => {
     const { first, second } = await openCounters();
     const { ready, done } = holdWriteLock(first, 200);
     await ready;
@@ -270,30 +295,28 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
   });
 
-  it('waits for the lock at the BEGIN IMMEDIATE of an exec script', async () => {
-    const { first, second } = await openCounters();
-    const { ready, done } = holdWriteLock(first, 200);
-    await ready;
+  it('runs a script or a statement that begins its own transaction as SQLite runs it', async () => {
+    const { second } = await openCounters();
 
-    try {
-      await second.exec('BEGIN IMMEDIATE; UPDATE counter SET n = n + 10 WHERE id = 1; COMMIT;');
-    } finally {
-      await done;
-    }
-    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
+    // Inside a transaction the adapter began, this BEGIN would fail.
+    await second.exec('BEGIN IMMEDIATE; UPDATE counter SET n = n + 10 WHERE id = 1; COMMIT;');
+    await second.run('/* opened by the caller */ ; BEGIN IMMEDIATE');
+    await second.run('UPDATE counter SET n = n + 10 WHERE id = 1');
+    await second.run('COMMIT');
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 20 });
   });
 
-  it('waits on timers for a write in an exec script after a PRAGMA whose comment names the busy timeout', async () => {
-    const { first, second } = await openCounters();
-    const { ready, done } = holdWriteLock(first, 200);
-    await ready;
+  it('runs a script with a PRAGMA as SQLite runs it, outside a transaction', async () => {
+    const { second } = await openCounters();
 
-    try {
-      await second.exec('PRAGMA foreign_keys = ON /* not busy_timeout */; UPDATE counter SET n = n + 10 WHERE id = 1;');
-    } finally {
-      await done;
-    }
-    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
+    // Inside a transaction SQLite would leave foreign keys as they were.
+    await second.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE parent (id INTEGER PRIMARY KEY);
+      CREATE TABLE child (parent_id INTEGER REFERENCES parent (id));
+    `);
+    expect(await second.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
+    await expect(second.run('INSERT INTO child (parent_id) VALUES (7)')).rejects.toThrow(/FOREIGN KEY constraint failed/);
     expect(await second.get('PRAGMA busy_timeout')).toEqual({ timeout: 2_000 });
   });
 
@@ -406,6 +429,150 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     await second.run('INSERT INTO settings_log SELECT timeout FROM live_settings');
     expect(await second.all('SELECT timeout FROM settings_log')).toEqual([{ timeout: 2_000 }]);
     expect(await second.get('SELECT timeout FROM live_settings')).toEqual({ timeout: 2_000 });
+  });
+
+  it('stores the busy timeout as set when a write reads it through a view another connection created', async () => {
+    const { first, second } = await openCounters();
+    await second.exec('CREATE TABLE settings_log (timeout INTEGER);');
+    // This adapter has written since it opened, before the view existed.
+    await second.run('UPDATE counter SET n = n WHERE id = 1');
+    await first.exec('CREATE VIEW live_settings AS SELECT timeout FROM pragma_busy_timeout;');
+
+    await second.run('INSERT INTO settings_log SELECT timeout FROM live_settings');
+    expect(await second.all('SELECT timeout FROM settings_log')).toEqual([{ timeout: 2_000 }]);
+  });
+
+  it('waits on timers for a write after a view that read the busy timeout is dropped', async () => {
+    const { first, second } = await openCounters();
+    await second.exec('CREATE VIEW live_settings AS SELECT timeout FROM pragma_busy_timeout;');
+    await second.run('UPDATE counter SET n = n WHERE id = 1');
+    await second.exec('DROP VIEW live_settings;');
+    const { ready, done } = holdWriteLock(first, 200);
+    await ready;
+
+    try {
+      await expect(second.run('UPDATE counter SET n = n + 10 WHERE id = 1')).resolves.toMatchObject({ changes: 1 });
+    } finally {
+      await done;
+    }
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
+  });
+
+  it('runs statements issued while a caller\'s own BEGIN is open in the order issued, one a function issued among them', async () => {
+    const { first, second } = await openCounters();
+    let deferred: Promise<unknown> | undefined;
+    second.registerFunction!('defer_write', () => {
+      queueMicrotask(() => {
+        deferred = second.run('UPDATE counter SET n = 2 WHERE id = 1');
+      });
+      return null;
+    });
+    const held = holdUntilReleased(first);
+    await held.ready;
+
+    const waiting = second.run('UPDATE counter SET n = n + 10 WHERE id = 1');
+    const begun = second.exec('BEGIN; SELECT defer_write();');
+    const one = second.run('UPDATE counter SET n = 1 WHERE id = 1');
+    held.release();
+    await held.done;
+
+    await Promise.all([waiting, begun, one]);
+    await deferred;
+    await second.exec('COMMIT');
+    // The function's write was issued after `one`, so it runs after it.
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 2 });
+  });
+
+  it('ends an exec script at an embedded NUL character, as better-sqlite3 does', async () => {
+    const { second } = await openCounters();
+    await second.exec('CREATE TABLE seen (n INTEGER);');
+
+    await second.exec('INSERT INTO seen (n) VALUES (1);\u0000;INSERT INTO seen (n) VALUES (2);');
+    expect(await second.all('SELECT n FROM seen')).toEqual([{ n: 1 }]);
+  });
+
+  it('runs an exec script that ends in a comment left open', async () => {
+    const { second } = await openCounters();
+    await second.exec('CREATE TABLE seen (n INTEGER);');
+
+    await second.exec('INSERT INTO seen (n) VALUES (1); /* ');
+    expect(await second.all('SELECT n FROM seen')).toEqual([{ n: 1 }]);
+  });
+
+  it('keeps what a failed write outside a transaction did before it failed, as autocommit does', async () => {
+    const { first, second } = await openCounters();
+    await second.exec('CREATE TABLE tag (name TEXT PRIMARY KEY);');
+
+    await expect(second.exec("INSERT INTO tag (name) VALUES ('a'); INSERT INTO tag (name) VALUES ('a');"))
+      .rejects.toThrow(/UNIQUE constraint failed/);
+    await expect(second.run("INSERT OR FAIL INTO tag (name) SELECT column1 FROM (VALUES ('b'), ('a'), ('c'))"))
+      .rejects.toThrow(/UNIQUE constraint failed/);
+    // Committed: the other connection reads them, and the next write commits on its own.
+    expect(await first.all('SELECT name FROM tag ORDER BY name')).toEqual([{ name: 'a' }, { name: 'b' }]);
+    await second.run("INSERT INTO tag (name) VALUES ('d')");
+    expect(await first.all('SELECT name FROM tag ORDER BY name')).toEqual([{ name: 'a' }, { name: 'b' }, { name: 'd' }]);
+  });
+
+  it('runs an exec script of one read without taking the write lock', async () => {
+    const { first, second } = await openCounters(300);
+    const { ready, done } = holdWriteLock(first, 1_000);
+    await ready;
+
+    try {
+      const started = performance.now();
+      await second.exec('SELECT n FROM counter WHERE id = 1;');
+      expect(performance.now() - started).toBeLessThan(250);
+    } finally {
+      await done;
+    }
+  });
+
+  it('writes main at once while another connection holds an attached database\'s exclusive lock', async () => {
+    const { createBetterSqliteAdapter } = await import('../src/index.js');
+    const { second } = await openCounters(300);
+    const auxFile = tempFile();
+    const aux = createBetterSqliteAdapter(auxFile);
+    await aux.open();
+    cleanups.push(() => aux.close());
+    await aux.exec('CREATE TABLE note (body TEXT);');
+    await second.exec(`ATTACH DATABASE '${auxFile}' AS aux;`);
+    expect(await second.all('SELECT name FROM aux.sqlite_master')).toEqual([{ name: 'note' }]);
+
+    // In rollback-journal mode an exclusive lock keeps other connections from reading the file too.
+    await aux.exec('BEGIN EXCLUSIVE;');
+    try {
+      expect(await second.get('PRAGMA busy_timeout')).toEqual({ timeout: 300 });
+      const started = performance.now();
+      await expect(second.run('UPDATE counter SET n = n + 10 WHERE id = 1')).resolves.toMatchObject({ changes: 1 });
+      expect(performance.now() - started).toBeLessThan(250);
+    } finally {
+      await aux.exec('COMMIT;');
+    }
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 10 });
+  });
+
+  it.each(['transaction', 'batch'] as const)('refuses a %s queued behind an open transaction once the adapter has closed, whatever file it opened since', async (kind) => {
+    const { createBetterSqliteAdapter } = await import('../src/index.js');
+    const { second } = await openCounters();
+    const other = tempFile();
+    const setup = createBetterSqliteAdapter(other);
+    await setup.open();
+    await setup.exec('CREATE TABLE counter (id INTEGER PRIMARY KEY, n INTEGER NOT NULL); INSERT INTO counter (id, n) VALUES (1, 0);');
+    await setup.close();
+
+    const held = holdUntilReleased(second);
+    await held.ready;
+    const add = 'UPDATE counter SET n = n + 100 WHERE id = 1';
+    const queued = kind === 'transaction' ? second.transaction((trx) => trx.run(add)) : second.batch!([{ statement: add }]);
+    const outcomes = Promise.allSettled([held.done, queued]);
+    await second.close();
+    await second.open({ filePath: other });
+    held.release();
+
+    const [, later] = await outcomes;
+    expect(later.status).toBe('rejected');
+    // The connection is to the other file now, which the work was not issued on.
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 0 });
   });
 
   it('runs a statement once when a registered function throws an error that carries the code SQLITE_BUSY', async () => {

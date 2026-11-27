@@ -4,9 +4,10 @@
 // "go" line it runs one transaction that reads the counter, prints "read <n>",
 // waits for a "committed" line, and writes n + 1. With SQLITE_WRITER_COMMIT_AFTER_MS
 // set it waits that many milliseconds in place of the "committed" line, so it
-// holds the write lock for that long by itself. It prints "done" and ends 0
-// when the transaction committed, and prints "failed <code> <message>" and
-// ends 1 when it did not.
+// holds the write lock for that long by itself. With SQLITE_WRITER_READ_ONLY=1
+// it begins the transaction with { readOnly: true } and writes nothing: it
+// holds a read for that long. It prints "done" and ends 0 when the transaction
+// committed, and prints "failed <code> <message>" and ends 1 when it did not.
 import { createInterface } from 'node:readline';
 import { createBetterSqliteAdapter } from '../../src/index.js';
 
@@ -38,6 +39,7 @@ const until = async (expected: string): Promise<void> => {
 };
 
 const commitAfterMs = Number(process.env.SQLITE_WRITER_COMMIT_AFTER_MS);
+const readOnly = process.env.SQLITE_WRITER_READ_ONLY === '1';
 
 const main = async (): Promise<void> => {
   const adapter = createBetterSqliteAdapter(process.env.SQLITE_WRITER_FILE as string);
@@ -53,8 +55,8 @@ const main = async (): Promise<void> => {
       } else {
         await until('committed');
       }
-      await trx.run('UPDATE counter SET n = ? WHERE id = 1', [Number(row?.n) + 1]);
-    });
+      if (!readOnly) await trx.run('UPDATE counter SET n = ? WHERE id = 1', [Number(row?.n) + 1]);
+    }, { readOnly });
     process.stdout.write('done\n');
     await adapter.close();
     process.exit(0);
