@@ -125,8 +125,16 @@ const routeOf = (statement: string): 'as-written' | 'write' | 'ask' => {
   return WRITES.has(first) ? 'write' : 'ask';
 };
 
-/** A table of the adapter's own in the connection's temp database: a DELETE of none of its rows sets changes() to 0. */
-const CHANGES_RESET_TABLE = '"sql_storage_adapter_changes"';
+/** Tables the adapter has made to reset changes(), counted so that each has a name of its own. */
+let changesResetTables = 0;
+
+/**
+ * A name for a table the adapter makes in the connection's temp database to
+ * reset changes(), and drops at once. Its random part keeps it off any name an
+ * application or an earlier failed drop has taken.
+ */
+const changesResetTableName = (): string =>
+  `"sql_storage_adapter_changes_${(changesResetTables += 1).toString(36)}_${Math.random().toString(36).slice(2, 12)}"`;
 
 /**
  * Whether the connection has a database attached. `PRAGMA database_list`
@@ -156,8 +164,34 @@ const snapshotValues = (values: BoundValues): BoundValues => {
   return Object.fromEntries(Object.getOwnPropertyNames(named).map((name) => [name, snapshotValue(named[name])]));
 };
 
+/**
+ * A batch operation as it was issued: its SQL and the values it binds, as
+ * SQLite takes them, or the error that turning it into that form met, which
+ * the batch reports at the operation's index.
+ */
+type IssuedOperation = { sql: string; values: BoundValues } | { error: unknown };
+
+/**
+ * A batch's operations as they are now. With `snapshot`, for a batch that runs
+ * after its caller's turn, the values are copied as a statement's are
+ * (snapshotValues): the caller may reuse its arrays, objects and bytes while
+ * the batch waits. Each is still prepared in its turn, after the work issued
+ * before it, which may create what it names.
+ */
+const issueOperations = (operations: BatchOperation[], snapshot: boolean): IssuedOperation[] =>
+  operations.map((op) => {
+    try {
+      const prepared = toSqliteStatement(op.statement, op.parameters);
+      const { named, positional } = normaliseParameters(integersAsBigInt(prepared.parameters));
+      const values: BoundValues = named ?? positional ?? [];
+      return { sql: prepared.statement, values: snapshot ? snapshotValues(values) : values };
+    } catch (error) {
+      return { error };
+    }
+  });
+
 /** The result of a batch that `error` stopped at its BEGIN or its COMMIT: none of its operations was kept. */
-const failedBatch = (operations: BatchOperation[], error: unknown): BatchResult => ({
+const failedBatch = (operations: ReadonlyArray<unknown>, error: unknown): BatchResult => ({
   successful: 0,
   failed: operations.length,
   errors: [{ index: -1, error: error instanceof Error ? error : new Error(String(error)) }],
@@ -614,9 +648,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
    * Commits the write transaction. A COMMIT that fails is rolled back and its
    * error thrown. The write counted its rows in changes() when it ran, and
    * neither the COMMIT nor the ROLLBACK sets the count, so with
-   * `countsChanges` a DELETE of none of the rows of the adapter's own temp
-   * table sets it to 0; the temp database is the connection's alone, so that
-   * takes no lock another connection holds.
+   * `countsChanges` it is set to 0 (resetChanges).
    */
   private commitWrite(db: BetterSqliteDatabase, countsChanges: boolean): void {
     try {
@@ -624,11 +656,29 @@ export class BetterSqliteAdapter implements StorageAdapter {
     } catch (error) {
       try {
         if (db.inTransaction) db.exec('ROLLBACK');
-        if (countsChanges) {
-          db.exec(`CREATE TEMP TABLE IF NOT EXISTS ${CHANGES_RESET_TABLE} (unused); DELETE FROM temp.${CHANGES_RESET_TABLE} WHERE 0;`);
-        }
+        if (countsChanges) this.resetChanges(db);
       } catch { /* the COMMIT's error is the one reported */ }
       throw error;
+    }
+  }
+
+  /**
+   * Sets changes() to 0 with a DELETE of no rows from a table the adapter
+   * makes in the connection's temp database for it, then drops the table,
+   * which leaves the count as the DELETE set it. The table's name is its own
+   * (changesResetTableName), so it never stands, even for these statements,
+   * in place of a table of the application's that SQLite would find after it,
+   * and since it is created without IF NOT EXISTS, a table of that name the
+   * adapter did not make is never dropped. The temp database is the
+   * connection's alone, so this takes no lock another connection holds.
+   */
+  private resetChanges(db: BetterSqliteDatabase): void {
+    const table = `temp.${changesResetTableName()}`;
+    db.exec(`CREATE TABLE ${table} (unused)`);
+    try {
+      db.exec(`DELETE FROM ${table} WHERE 0`);
+    } finally {
+      db.exec(`DROP TABLE ${table}`);
     }
   }
 
@@ -650,7 +700,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
       // A handle whose transaction has ended batches in its own turn, after
       // any transaction open now, never in it.
       batch: async (operations) =>
-        this.joinsOpenTransaction(token) ? this.batchNow(operations) : this.batchInTurn(operations),
+        this.joinsOpenTransaction(token) ? this.batchNow(issueOperations(operations, false)) : this.batchInTurn(operations),
       // The handle answers a nested transaction() itself and never calls this.
       transaction: (fn) => fn(this),
     };
@@ -749,11 +799,13 @@ export class BetterSqliteAdapter implements StorageAdapter {
    * passes; then throws the last SQLITE_BUSY. The busy timeout is set back
    * after each try, before anything else runs. Any other failure is thrown at
    * once. Every wait ends in a try, so a timer that fires late, past the busy
-   * timeout, still finds a lock released meanwhile.
+   * timeout, still finds a lock released meanwhile. The time is read from
+   * performance.now(), which only moves forward, so setting the system clock
+   * neither shortens nor lengthens the wait.
    */
   private async retryWhileBusy<T>(db: BetterSqliteDatabase, step: (attempt: number) => T): Promise<T> {
     const busyTimeout = Math.max(0, Number(db.pragma('busy_timeout', { simple: true })) || 0);
-    const deadline = Date.now() + busyTimeout;
+    const deadline = performance.now() + busyTimeout;
     for (let attempt = 0; ; attempt++) {
       let wait = 0;
       db.pragma('busy_timeout = 0');
@@ -761,7 +813,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
         return step(attempt);
       } catch (error) {
         if (!sqliteCode(error).startsWith('SQLITE_BUSY')) throw error;
-        const left = deadline - Date.now();
+        const left = deadline - performance.now();
         if (left <= 0) throw error;
         wait = Math.min(BUSY_RETRY_DELAYS_MS[Math.min(attempt, BUSY_RETRY_DELAYS_MS.length - 1)], left);
       } finally {
@@ -815,32 +867,34 @@ export class BetterSqliteAdapter implements StorageAdapter {
    */
   public async batch(operations: BatchOperation[]): Promise<BatchResult> {
     // From code an open transaction runs, the batch runs in it, as a savepoint.
-    if (this.gate.inside()) return this.batchNow(operations);
+    if (this.gate.inside()) return this.batchNow(issueOperations(operations, false));
     return this.batchInTurn(operations);
   }
 
   /**
    * A batch in its own turn, begun as transaction() begins, so its wait for
-   * another connection's write lock does not stop the event loop.
+   * another connection's write lock does not stop the event loop. It binds
+   * the values its operations were issued with (issueOperations).
    */
   private batchInTurn(operations: BatchOperation[]): Promise<BatchResult> {
+    const issued = issueOperations(operations, true);
     return this.inTurn((db) =>
       this.gate.hold(async () => {
         // On a read-only connection it runs as a deferred transaction, and in a
         // transaction a caller began with BEGIN through run() or exec() as a
         // savepoint in it.
-        if (this.readOnly || db.inTransaction) return this.batchNow(operations);
+        if (this.readOnly || db.inTransaction) return this.batchNow(issued);
         try {
           await this.beginTransaction(db);
         } catch (error) {
-          return failedBatch(operations, error);
+          return failedBatch(issued, error);
         }
-        const result = this.batchNow(operations);
+        const result = this.batchNow(issued);
         try {
           db.exec('COMMIT');
         } catch (error) {
           try { db.exec('ROLLBACK'); } catch { /* the COMMIT's error is the one reported */ }
-          return failedBatch(operations, error);
+          return failedBatch(issued, error);
         }
         return result;
       }),
@@ -856,7 +910,7 @@ export class BetterSqliteAdapter implements StorageAdapter {
     this.db!.function(checkFunctionName(name), { deterministic: options.deterministic ?? false }, fn);
   }
 
-  private batchNow(operations: BatchOperation[]): BatchResult {
+  private batchNow(operations: IssuedOperation[]): BatchResult {
     this.ensureOpen();
 
     const results: StorageRunResult[] = [];
@@ -868,10 +922,8 @@ export class BetterSqliteAdapter implements StorageAdapter {
     const transaction = this.db!.transaction(() => {
       operations.forEach((op, index) => {
         try {
-          const prepared = toSqliteStatement(op.statement, op.parameters);
-          const stmt = this.prepareInternal(prepared.statement);
-          const { named, positional } = normaliseParameters(integersAsBigInt(prepared.parameters));
-          const result = named ? stmt.run(named) : stmt.run(positional ?? []);
+          if ('error' in op) throw op.error;
+          const result = this.prepareInternal(op.sql).run(op.values);
           results.push({
             changes: result.changes,
             lastInsertRowid: normaliseRowId(result.lastInsertRowid)
