@@ -445,12 +445,15 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     ]);
   });
 
-  it('hands a name that ends in a no-break space to SQLite as written in an exec script', async () => {
+  it.each([
+    ['a no-break space', String.fromCharCode(0xa0)],
+    ['a byte-order mark', String.fromCharCode(0xfeff)],
+  ])('hands a name that ends in %s to SQLite as written in an exec script', async (_what, last) => {
     const { second } = await openCounters();
-    await second.exec('CREATE TABLE ledger (n INTEGER); CREATE TABLE "ledger " (n INTEGER);');
+    await second.exec(`CREATE TABLE ledger (n INTEGER); CREATE TABLE "ledger${last}" (n INTEGER);`);
 
-    // SQLite reads the no-break space as part of the name: this drops the second table.
-    await second.exec('DROP TABLE ledger ;');
+    // SQLite reads the character as part of the name: this drops the second table.
+    await second.exec(`DROP TABLE ledger${last};`);
     expect(await second.all("SELECT name FROM sqlite_master WHERE name LIKE 'ledger%'")).toEqual([{ name: 'ledger' }]);
   });
 
