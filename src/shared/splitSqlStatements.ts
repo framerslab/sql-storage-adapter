@@ -190,13 +190,20 @@ export const splitSqlStatements = (script: string): string[] => {
 };
 
 /**
- * Whether SQLite's tokenizer skips `ch` as whitespace (tokenize.c, `CC_SPACE`
- * and `CC_BOM`): a space, a tab, a line feed, a form feed, a carriage return
- * and a byte-order mark. Any other character JavaScript calls whitespace, a
- * no-break space among them, is part of a name to SQLite.
+ * Whether SQLite's tokenizer skips `ch` as whitespace (tokenize.c, `CC_SPACE`):
+ * a space, a tab, a line feed, a form feed or a carriage return. Any other
+ * character JavaScript calls whitespace, a no-break space among them, is part
+ * of a name to SQLite.
  */
 const isSqliteSpace = (ch: string): boolean =>
-  ch === ' ' || ch === '\t' || ch === '\n' || ch === '\f' || ch === '\r' || ch === '\uFEFF';
+  ch === ' ' || ch === '\t' || ch === '\n' || ch === '\f' || ch === '\r';
+
+/**
+ * A byte-order mark. SQLite skips one where a token begins (tokenize.c,
+ * `CC_BOM`), so one before a statement is whitespace; one that follows a name
+ * is part of the name.
+ */
+const BYTE_ORDER_MARK = String.fromCharCode(0xfeff);
 
 /** A statement's place in a script: offsets into the script, with the whitespace around the statement left out. */
 export interface StatementSpan {
@@ -209,7 +216,8 @@ export interface StatementSpan {
  * the semicolons outside SQLite's strings, quoted names and comments (`'...'`,
  * `"..."`, `` `...` ``, `[...]`, `--` to the end of the line, `/* ... *\/`), and
  * each statement's whitespace, as SQLite's tokenizer reads whitespace, is left
- * out of its span: a name that ends in a no-break space keeps it. A caller that must hand
+ * out of its span: a name that ends in a no-break space or a byte-order mark
+ * keeps it. A caller that must hand
  * a part of the script on as written (the Capacitor adapter's exec(), whose
  * plugin splits the script itself) slices the script by these spans and never
  * rejoins statements. SQLite has no dollar quoting: `$name` is a parameter.
@@ -224,7 +232,7 @@ export const sqliteStatementSpans = (script: string): StatementSpan[] => {
   const push = (to: number): void => {
     let start = from;
     let end = to;
-    while (start < end && isSqliteSpace(script[start])) start += 1;
+    while (start < end && (isSqliteSpace(script[start]) || script[start] === BYTE_ORDER_MARK)) start += 1;
     while (end > start && isSqliteSpace(script[end - 1])) end -= 1;
     if (end > start) spans.push({ start, end });
     from = to + 1;
