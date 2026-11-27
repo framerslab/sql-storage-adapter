@@ -5,7 +5,7 @@ import { createRequire } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { StorageAdapter } from '../src/core/contracts';
+import type { BatchResult, StorageAdapter } from '../src/core/contracts';
 
 // Two processes writing one SQLite file through the better-sqlite3 adapter, as
 // two containers write one per-world memory file. A transaction that reads and
@@ -172,24 +172,35 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
 
   it('fails a write outside a transaction with SQLITE_BUSY once the busy timeout passes, without holding the event loop', async () => {
     const { first, second } = await openCounters(300);
-    const { ready, done } = holdWriteLock(first, 1_000);
-    await ready;
+    const held = holdUntilReleased(first);
+    await held.ready;
 
-    let ticks = 0;
-    const interval = setInterval(() => { ticks += 1; }, 20);
-    const started = performance.now();
+    // The clock and the retry timers move only when the test moves them, and
+    // the lock stays held throughout.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     try {
-      await expect(second.run('UPDATE counter SET n = n + 10 WHERE id = 1')).rejects.toMatchObject({ code: 'SQLITE_BUSY' });
-      const elapsed = performance.now() - started;
-      expect(elapsed).toBeGreaterThanOrEqual(275);
-      expect(elapsed).toBeLessThan(1_000);
-      expect(ticks).toBeGreaterThan(2);
-      expect(await second.get('PRAGMA busy_timeout')).toEqual({ timeout: 300 });
+      let settled = false;
+      const outcome = second.run('UPDATE counter SET n = n + 10 WHERE id = 1').then(
+        () => { settled = true; return null; },
+        (error: unknown) => { settled = true; return error; },
+      );
+      let otherTimerRan = false;
+      setTimeout(() => { otherTimerRan = true; }, 100);
+
+      // The tries at 0, 1, 3, 8, ... 228 ms all fail; the next is at 300 ms.
+      await vi.advanceTimersByTimeAsync(299);
+      expect(otherTimerRan).toBe(true);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(outcome).resolves.toMatchObject({ code: 'SQLITE_BUSY' });
     } finally {
-      clearInterval(interval);
-      await done;
+      vi.useRealTimers();
+      held.release();
+      await held.done;
     }
-    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 1 });
+    expect(await second.get('PRAGMA busy_timeout')).toEqual({ timeout: 300 });
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 0 });
   });
 
   it.each(['get', 'all'] as const)('waits on timers for a write with RETURNING through %s outside a transaction', async (method) => {
@@ -252,46 +263,16 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 1 });
   }, 60_000);
 
-  it('waits on timers for an exec script, then runs it once', async () => {
+  it('waits on timers for an exec script of one write, then runs it once', async () => {
     const { first, second } = await openCounters();
     const { ready, done } = holdWriteLock(first, 200);
     await ready;
 
     try {
-      await second.exec('SELECT n FROM counter; UPDATE counter SET n = n + 10; UPDATE counter SET n = n + 100;');
+      await second.exec('UPDATE counter SET n = n + 10 WHERE id = 1;');
     } finally {
       await done;
     }
-    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 111 });
-  });
-
-  it('runs an exec script that writes the temp database and then main once, after it waits for the lock', async () => {
-    const { first, second } = await openCounters();
-    await second.exec('CREATE TEMP TABLE log (n INTEGER);');
-    const { ready, done } = holdWriteLock(first, 200);
-    await ready;
-
-    try {
-      await second.exec('INSERT INTO log (n) VALUES (1); UPDATE counter SET n = n + 10;');
-    } finally {
-      await done;
-    }
-    expect(await second.all('SELECT n FROM log')).toEqual([{ n: 1 }]);
-    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
-  });
-
-  it('runs an exec script that creates a table and then writes main once, after it waits for the lock', async () => {
-    const { first, second } = await openCounters();
-    const { ready, done } = holdWriteLock(first, 200);
-    await ready;
-
-    try {
-      // Run again from the start, the CREATE would fail: the table exists.
-      await second.exec('CREATE TEMP TABLE log (n INTEGER); UPDATE counter SET n = n + 10;');
-    } finally {
-      await done;
-    }
-    expect(await second.all('SELECT n FROM log')).toEqual([]);
     expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
   });
 
@@ -400,19 +381,6 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     try {
       await expect(second.run('UPDATE counter /* not PRAGMA busy_timeout */ SET n = n + 10 WHERE id = 1'))
         .resolves.toMatchObject({ changes: 1 });
-    } finally {
-      await done;
-    }
-    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 11 });
-  });
-
-  it('waits on timers for a script whose table has a column that defaults to the word trigger', async () => {
-    const { first, second } = await openCounters();
-    const { ready, done } = holdWriteLock(first, 200);
-    await ready;
-
-    try {
-      await second.exec("CREATE TABLE audit (event TEXT DEFAULT 'trigger'); UPDATE counter SET n = n + 10 WHERE id = 1;");
     } finally {
       await done;
     }
@@ -575,16 +543,37 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 0 });
   });
 
-  it('runs a statement once when a registered function throws an error that carries the code SQLITE_BUSY', async () => {
-    const { second } = await openCounters(300);
+  it('runs a write once, after it waited for the lock, when a registered function in it throws an error that carries the code SQLITE_BUSY', async () => {
+    const { first, second } = await openCounters();
     let calls = 0;
     second.registerFunction!('refuse', () => {
       calls += 1;
       throw Object.assign(new Error('the upstream is busy'), { code: 'SQLITE_BUSY' });
     });
+    const held = holdUntilReleased(first);
+    await held.ready;
+    // The write's first try for the lock fails; the holder commits when the
+    // write sets its first retry timer.
+    const setTimer = globalThis.setTimeout;
+    let waited = false;
+    const timers = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void, ms?: number) => {
+      if (ms === 1 && !waited) {
+        waited = true;
+        held.release();
+      }
+      return setTimer(handler, ms);
+    }) as typeof setTimeout);
 
-    await expect(second.get('SELECT refuse() AS value')).rejects.toThrow('the upstream is busy');
+    try {
+      await expect(second.run('UPDATE counter SET n = refuse() WHERE id = 1')).rejects.toThrow('the upstream is busy');
+    } finally {
+      timers.mockRestore();
+      held.release();
+      await held.done;
+    }
+    expect(waited).toBe(true);
     expect(calls).toBe(1);
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 0 });
   });
 
   it('binds the values a write was issued with when it runs after waiting for the lock', async () => {
@@ -893,6 +882,200 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     expect(await batch).toMatchObject({ successful: 1, failed: 0 });
     expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 111 });
   }, 15_000);
+
+  it('runs each statement of an exec script of more than one in its own autocommit, as SQLite runs it', async () => {
+    const { second } = await openCounters();
+    await second.exec('PRAGMA foreign_keys = ON;');
+    await second.exec(`
+      CREATE TABLE parent (id INTEGER PRIMARY KEY);
+      CREATE TABLE child (parent_id INTEGER REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED);
+      CREATE TABLE entry (x INTEGER);
+      CREATE TRIGGER entry_block BEFORE INSERT ON entry WHEN NEW.x = 2 BEGIN SELECT RAISE(ROLLBACK, 'blocked'); END;
+    `);
+
+    // The first INSERT commits on its own and fails its deferred foreign key;
+    // the second never runs.
+    await expect(second.exec('INSERT INTO child (parent_id) VALUES (7); INSERT INTO parent (id) VALUES (7);'))
+      .rejects.toThrow(/FOREIGN KEY constraint failed/);
+    expect(await second.all('SELECT parent_id FROM child')).toEqual([]);
+    expect(await second.all('SELECT id FROM parent')).toEqual([]);
+
+    // The first INSERT has committed when the second one's trigger rolls back.
+    await expect(second.exec('INSERT INTO entry (x) VALUES (1); INSERT INTO entry (x) VALUES (2);')).rejects.toThrow('blocked');
+    expect(await second.all('SELECT x FROM entry')).toEqual([{ x: 1 }]);
+  });
+
+  it('runs a batch through the handle of an ended transaction after the transaction open now, not in it', async () => {
+    const { second } = await openCounters();
+    await second.exec('CREATE TABLE seen (n INTEGER);');
+    let ended: StorageAdapter | undefined;
+    await second.transaction(async (trx) => {
+      ended = trx;
+    });
+
+    let pending: Promise<BatchResult> | undefined;
+    await expect(second.transaction(async () => {
+      pending = ended!.batch!([{ statement: 'INSERT INTO seen (n) VALUES (1)' }]);
+      throw new Error('undone');
+    })).rejects.toThrow('undone');
+
+    await expect(pending).resolves.toMatchObject({ successful: 1, failed: 0 });
+    expect(await second.all('SELECT n FROM seen')).toEqual([{ n: 1 }]);
+  });
+
+  it('throws the COMMIT\'s error when a failed write cannot commit', async () => {
+    const { first, second } = await openCounters(300, 'DELETE');
+    await second.exec('CREATE TABLE entry (id INTEGER PRIMARY KEY); INSERT INTO entry (id) VALUES (2);');
+    let read!: () => void;
+    const reading = new Promise<void>((resolve) => {
+      read = resolve;
+    });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const done = first.transaction(async (trx) => {
+      await trx.get('SELECT id FROM entry');
+      read();
+      await released;
+    }, { readOnly: true });
+    await reading;
+
+    try {
+      // Row 1 goes in and row 2 fails, which OR FAIL keeps row 1 through; the
+      // COMMIT then waits out the busy timeout for the reader and fails.
+      await expect(second.run('INSERT OR FAIL INTO entry (id) VALUES (1), (2)')).rejects.toMatchObject({ code: 'SQLITE_BUSY' });
+    } finally {
+      release();
+      await done;
+    }
+    expect(await second.all('SELECT id FROM entry ORDER BY id')).toEqual([{ id: 2 }]);
+  });
+
+  it.each([
+    ['a write its first keyword names', 'INSERT INTO counter (id, n) VALUES (2, 0)'],
+    ['a write that begins with WITH', 'WITH v (id) AS (VALUES (2)) INSERT INTO counter (id, n) SELECT id, 0 FROM v'],
+  ])('waits on timers before it prepares %s while another connection holds the exclusive lock', async (_what, write) => {
+    const { createBetterSqliteAdapter } = await import('../src/index.js');
+    const { first, file } = await openCounters(2_000, 'DELETE');
+    // A connection that has not read the schema: preparing a statement reads
+    // it, which the exclusive lock holds off.
+    const fresh = createBetterSqliteAdapter(file, { busyTimeoutMs: 1_000 });
+    await fresh.open();
+    cleanups.push(() => fresh.close());
+    await first.exec('BEGIN EXCLUSIVE;');
+
+    // The holder commits when the write sets its first retry timer.
+    let committed: Promise<void> | undefined;
+    const setTimer = globalThis.setTimeout;
+    const timers = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void, ms?: number) => {
+      if (ms === 1 && !committed) committed = first.exec('COMMIT;');
+      return setTimer(handler, ms);
+    }) as typeof setTimeout);
+    try {
+      await expect(fresh.run(write)).resolves.toMatchObject({ changes: 1 });
+    } finally {
+      timers.mockRestore();
+      await (committed ?? first.exec('COMMIT;'));
+    }
+    expect(await fresh.get('SELECT COUNT(*) AS rows FROM counter')).toEqual({ rows: 2 });
+  });
+
+  it('leaves the adapter as it was when close() is refused', async () => {
+    const { second } = await openCounters();
+    let refusal: unknown;
+    second.registerFunction!('close_now', () => {
+      // better-sqlite3 refuses to close a connection while it runs a statement.
+      second.close().catch((error: unknown) => {
+        refusal = error;
+      });
+      return 1;
+    });
+    let tried!: () => void;
+    const closeTried = new Promise<void>((resolve) => {
+      tried = resolve;
+    });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const outer = second.transaction(async (trx) => {
+      await trx.get('SELECT close_now() AS value');
+      tried();
+      await released;
+      await trx.run('UPDATE counter SET n = n + 1 WHERE id = 1');
+    });
+    await closeTried;
+    // Issued outside the open transaction: it waits for that one to end.
+    const later = second.transaction((trx) => trx.run('UPDATE counter SET n = n * 10 WHERE id = 1'));
+    release();
+
+    const [outerOutcome, laterOutcome] = await Promise.allSettled([outer, later]);
+    expect(outerOutcome.status).toBe('fulfilled');
+    expect(laterOutcome).toMatchObject({ status: 'fulfilled', value: { changes: 1 } });
+    expect(refusal).toBeInstanceOf(Error);
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 10 });
+  });
+
+  it('leaves changes() at 0 when a write fails at its COMMIT, as autocommit does', async () => {
+    const { second } = await openCounters();
+    await second.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE parent (id INTEGER PRIMARY KEY);
+      CREATE TABLE child (parent_id INTEGER REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED);
+    `);
+
+    await expect(second.run('INSERT INTO child (parent_id) VALUES (7)')).rejects.toThrow(/FOREIGN KEY constraint failed/);
+    expect(await second.get('SELECT changes() AS n')).toEqual({ n: 0 });
+    expect(await second.all('SELECT parent_id FROM child')).toEqual([]);
+  });
+
+  it('runs EXPLAIN and an exec script of no statement at once while another connection holds the write lock', async () => {
+    const { first, second } = await openCounters(0);
+    const held = holdUntilReleased(first);
+    await held.ready;
+
+    try {
+      const plan = await second.all('EXPLAIN UPDATE counter SET n = 1 WHERE id = 1');
+      expect(plan.length).toBeGreaterThan(0);
+      await second.exec('');
+      await second.exec(' -- nothing to run\n');
+    } finally {
+      held.release();
+      await held.done;
+    }
+    expect(await second.get('SELECT n FROM counter WHERE id = 1')).toEqual({ n: 0 });
+  });
+
+  it('creates a temp table at once while another connection holds the write lock', async () => {
+    const { first, second } = await openCounters(0);
+    const held = holdUntilReleased(first);
+    await held.ready;
+
+    try {
+      await second.run('CREATE TEMP TABLE scratch (x INTEGER)');
+      await second.run('/* local */ CREATE TEMPORARY TABLE scratch_two (x INTEGER)');
+      await second.exec('CREATE TEMP VIEW scratch_view AS SELECT x FROM scratch;');
+    } finally {
+      held.release();
+      await held.done;
+    }
+    expect(await second.all('SELECT name FROM temp.sqlite_master ORDER BY name')).toEqual([
+      { name: 'scratch' },
+      { name: 'scratch_two' },
+      { name: 'scratch_view' },
+    ]);
+  });
+
+  it('binds a named value that is an own property the object does not enumerate', async () => {
+    const { second } = await openCounters();
+    await second.exec('CREATE TABLE notes (body TEXT);');
+    const values = Object.defineProperty({}, 'body', { value: 'kept' });
+
+    await expect(second.run('INSERT INTO notes (body) VALUES (@body)', values)).resolves.toMatchObject({ changes: 1 });
+    expect(await second.all('SELECT body FROM notes')).toEqual([{ body: 'kept' }]);
+  });
 
   it('waits 5,000 ms for a locked file by default', async () => {
     const { createBetterSqliteAdapter } = await import('../src/index.js');
