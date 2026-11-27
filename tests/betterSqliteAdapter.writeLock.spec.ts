@@ -766,6 +766,45 @@ describe.skipIf(!betterSqliteAvailable)('BetterSqliteAdapter write transactions 
     }
   });
 
+  it.each([
+    ['all()', (adapter: StorageAdapter, sql: string) => adapter.all(sql), [{ n: 1 }]],
+    ['exec()', (adapter: StorageAdapter, sql: string) => adapter.exec(sql), undefined],
+  ] as const)(
+    'refuses %s of a statement prepared while close() ran, and keeps no statement of the closed connection for the next',
+    async (_what, issue, expected) => {
+      const { createBetterSqliteAdapter } = await import('../src/index.js');
+      const adapter = createBetterSqliteAdapter(tempFile());
+      cleanups.push(() => adapter.close());
+      // Its first keyword does not say whether it writes: it is prepared with
+      // the busy timeout at 0, after an await, before it runs.
+      const sql = 'WITH v (n) AS (VALUES (1)) SELECT n FROM v';
+      const refused = 'The storage adapter was closed while this work waited for its turn.';
+      const outcomes: string[] = [];
+      // close() comes after each number of microtasks in turn, so one of them
+      // lands while the statement's preparation is suspended.
+      for (let ticks = 0; ticks < 30; ticks++) {
+        await adapter.open();
+        const issued = issue(adapter, sql);
+        const settled = Promise.allSettled([issued]);
+        for (let tick = 0; tick < ticks; tick++) await Promise.resolve();
+        await adapter.close();
+        await adapter.open();
+        await expect(issue(adapter, sql)).resolves.toEqual(expected);
+        const [outcome] = await settled;
+        if (outcome.status === 'rejected') {
+          expect((outcome.reason as Error).message).toBe(refused);
+          outcomes.push('refused');
+        } else {
+          expect(outcome.value).toEqual(expected);
+          outcomes.push('ran');
+        }
+        await adapter.close();
+      }
+      expect(outcomes).toContain('refused');
+      expect(outcomes).toContain('ran');
+    },
+  );
+
   it('keeps a busy timeout set by SQL', async () => {
     const { second } = await openCounters();
     expect(await second.get('SELECT timeout FROM pragma_busy_timeout')).toEqual({ timeout: 2_000 });
